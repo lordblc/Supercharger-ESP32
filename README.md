@@ -1,4 +1,5 @@
 Ok, so.. I set out to build upon the work skonk made that is referred to in this thread:
+
 https://www.electricmotorcycleforum.com/boards/index.php?topic=13489.0
 
 My goal was to achieve some additional abilities.
@@ -8,6 +9,7 @@ Anyway.. I also wanted to include HomeAssistant control as i already have that o
 
 I tried to do the easy approach first, and simply employed CoPilot to just adapt the original code from Arduino to ESP32. This yielded a somewhat result but had issues.
 I referred to that result in the same forumthread as well as here:
+
 https://www.electricmotorcycleforum.com/boards/index.php?topic=13748.0
 
 Having kept at it and starting from scratch, I formulated an approach as a project manager and set out to make something with Claude as my assistant. I startet using the Sonnet 4.5 model, but eventually moved on to Haiku 4.6.
@@ -22,9 +24,13 @@ The controller sits between the bike's CAN bus and the charger's CAN bus and man
 Hardware
 
 LilyGo T-2CAN (ESP32-S3) (https://lilygo.cc/products/t-2can)
+
 Charger CAN bus: MCP2515 via SPI at 250 kbps
+
 Bike CAN bus: ESP32-S3 native TWAI peripheral at 500 kbps
+
 Tested with Elcon TC HK-J 3300W chargers; multiple units can run in parallel
+
 Bike CAN Bus Interface
 
 The firmware decodes the following from the Zero CAN bus:
@@ -43,7 +49,7 @@ The charger is commanded over CAN with a target voltage ceiling and a current li
 CC / Absorption: Constant current up to the configured power limit. Current ramps up gradually from zero at a configurable rate in W/s. Charge power is reduced as the pack voltage approaches the target through a lookup table (see below).
 CV / Float: Once the pack voltage reaches the target, the firmware holds the voltage ceiling and monitors actual charger output current. The charger self-regulates in this region.
 Complete: CV phase ends when actual charger current drops below 2 A (after a minimum 2-minute settle period) or after a 20-minute timeout, whichever comes first. The charger is then stopped and the session is marked complete.
-The charger voltage ceiling is always set to the configured target, not the present pack voltage. This is important — setting it to the present pack voltage would leave the charger with no headroom and it would not regulate correctly.
+The charger voltage ceiling is always set to the configured target, not the present pack voltage. This is important â€” setting it to the present pack voltage would leave the charger with no headroom and it would not regulate correctly.
 
 Protection and Cutback
 
@@ -68,7 +74,7 @@ Web Dashboard
 The firmware runs a web server on the ESP32. No external server is required. The dashboard shows:
 
 Charging card: actual power, target power, charge current, charge mode (Absorption / Float / Complete)
-Per-pack data: voltage, current, Ah capacity, min and max temperature — separately for Monolith and PowerTank
+Per-pack data: voltage, current, Ah capacity, min and max temperature â€” separately for Monolith and PowerTank
 Session Wh and Ah totals
 Configurable parameters: target voltage (V), power limit (W), ramp rate (W/s), number of chargers, C+ mode
 Status data is delivered via a JSON API endpoint and the page auto-refreshes without a full reload.
@@ -96,12 +102,12 @@ charge mode / phase
 
 Controllable entities:
 
-Target voltage (V) — number slider
-Target power (W) — number slider
-Ramp rate (W/s) — number slider
-Number of chargers — number slider
-C+ mode — switch
-Charging enabled — switch
+Target voltage (V) â€” number slider
+Target power (W) â€” number slider
+Ramp rate (W/s) â€” number slider
+Number of chargers â€” number slider
+C+ mode â€” switch
+Charging enabled â€” switch
 Architecture
 
 The firmware uses FreeRTOS on the ESP32-S3 dual core:
