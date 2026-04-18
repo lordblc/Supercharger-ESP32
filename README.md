@@ -21,7 +21,7 @@ The controller sits between the bike's CAN bus and the charger's CAN bus and man
 
 Hardware
 
-LilyGo T-2CAN (ESP32-S3)
+LilyGo T-2CAN (ESP32-S3) (https://lilygo.cc/products/t-2can)
 Charger CAN bus: MCP2515 via SPI at 250 kbps
 Bike CAN bus: ESP32-S3 native TWAI peripheral at 500 kbps
 Tested with Elcon TC HK-J 3300W chargers; multiple units can run in parallel
@@ -118,3 +118,8 @@ ArduinoJson by Benoit Blanchon (v6)
 ESP32 Arduino core (includes TWAI driver, ESPmDNS, Update)
 
 At current stage it should compile to ~1MB large binary file. I track changes through the VERSION tag that is also visible as reference on the dashboard.
+
+And if you managed to read this far:
+using arduino_secrets.h is the quickest way to set everything up, but is not required. First boot without configured secrets will default to a welcome page to set everything up with a wlan ap that has the default password set to "12345678" and the AP SSID set to "Supercharger".
+
+I plan to add more detail here..
