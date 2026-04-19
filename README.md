@@ -119,9 +119,13 @@ Shared state between cores is protected with mutexes. A 4 KB ring buffer log is 
 Required Libraries
 
 mcp_can by coryjfowler
+
 PubSubClient by Nick O'Leary
+
 ArduinoJson by Benoit Blanchon (v6)
+
 ESP32 Arduino core (includes TWAI driver, ESPmDNS, Update)
+
 
 At current stage it should compile to ~1MB large binary file. I track changes through the VERSION tag that is also visible as reference on the dashboard.
 
