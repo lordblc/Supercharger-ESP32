@@ -12,8 +12,8 @@ I referred to that result in the same forumthread as well as here:
 
 https://www.electricmotorcycleforum.com/boards/index.php?topic=13748.0
 
-Having kept at it and starting from scratch, I formulated an approach as a project manager and set out to make something with Claude as my assistant. I startet using the Sonnet 4.5 model, but eventually moved on to Haiku 4.6.
-My approach was to always be in control of what was created, and dividing the codebase into smaller chunks where I was able to keep up with what was suggested from the AI.
+Having kept at it and starting from scratch, I formulated an approach as a project manager and set out to make something with Claude as my assistant. I started using the Sonnet 4.5 model, but eventually moved on to Opus 4.6.
+My approach was to always be in control of what was created and dividing the codebase into smaller chunks where I was able to keep up with what was suggested from the AI.
 
 So, the details are as follows:
 I based this on the LilyGo T-2CAN which has 2 onboard, isolated CAN transceivers ready to go.
