@@ -76,8 +76,9 @@ Only Home Assistant integration and OTA updates need internet.
 Once the controller joins your home WiFi, the easiest way in is mDNS:
 
 - **mDNS**: open **http://supercharger.local** in any browser on the same network. Works on Windows 10+, macOS, iOS, Android (most), and any Linux box running Avahi. No IP guessing required. Also works in AP mode — connect to the controller's AP and the same URL resolves to 192.168.4.1.
+- **Router-assigned hostname**: the controller now identifies itself as `supercharger` in its DHCP request. If your router auto-registers DHCP client names into your local DNS (OpenWRT, pfSense, UniFi, MikroTik, etc.), the unit will also appear as `supercharger.<your-domain>` — e.g. `supercharger.iotnet` or `supercharger.lan`. This is a separate path from mDNS and works for any client on the network, including ones that don't speak mDNS.
 
-If mDNS doesn't resolve (some corporate or guest networks block multicast), fall back to:
+If neither resolves (some corporate or guest networks block multicast and don't auto-register DHCP names), fall back to:
 
 - **Serial log**: connect USB-C and open a serial monitor at 115200 baud. Look for a line like `[WIFI] Connected (prefs). IP: 192.168.1.42`.
 - **Router**: log into your router's admin page and check the DHCP client list. The controller usually shows up as "espressif" or similar.

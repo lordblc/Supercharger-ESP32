@@ -38,7 +38,7 @@
 //   driver/twai.h    } built into Espressif ESP32 Arduino core - no install needed
 // ==========================================================================
 
-#define VERSION 202604210930
+#define VERSION 202604210958
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -1953,6 +1953,9 @@ static void startMdns() {
 
 void startAPMode() {
   WiFi.disconnect(true);
+  // Hostname must be set BEFORE softAP() so it goes into the AP DHCP server's
+  // client-name advertisement (clients that join the AP see this name).
+  WiFi.softAPsetHostname(MDNS_HOSTNAME);
   WiFi.softAP(apSSID, apPass);
   LOG("[AP] Started \"%s\" — IP: %s\n", apSSID, WiFi.softAPIP().toString().c_str());
   startMdns();
@@ -1973,6 +1976,8 @@ void trySecretsConnect() {
   }
   LOG("[WIFI] No saved credentials. Trying secrets SSID \"%s\"...\n", ssid);
   WiFi.disconnect(true);
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname(MDNS_HOSTNAME);
   WiFi.begin(ssid, pass);
   wifiSource         = WIFI_SRC_SECRETS;
   wifiConnectStartMs = millis();
@@ -2090,6 +2095,12 @@ void setup() {
   if (savedSSID.length() > 0) {
     // Priority 1: saved preferences
     LOG("[WIFI] Connecting to saved SSID \"%s\"...\n", savedSSID.c_str());
+    // Hostname must be set BEFORE begin() so it's included in the DHCP DISCOVER.
+    // Routers that auto-register DHCP client names into local DNS (OpenWRT,
+    // pfSense, UniFi, etc.) will then expose the controller as
+    // supercharger.<your-domain> — independent of mDNS / .local resolution.
+    WiFi.mode(WIFI_STA);
+    WiFi.setHostname(MDNS_HOSTNAME);
     WiFi.begin(savedSSID.c_str(), savedPass.c_str());
     wifiSource         = WIFI_SRC_PREFS;
     wifiConnectStartMs = millis();
