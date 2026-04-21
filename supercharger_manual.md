@@ -55,7 +55,7 @@ Credentials are stored in non-volatile memory, so you only do this once per netw
 
 If the saved network is gone (moved house, router changed, etc), the controller will try the saved one for 15 seconds, fail, then fall back to AP mode on its own. From there, just redo the setup above with the new credentials.
 
-If the old network is still around and you want to force setup mode anyway, you'll need to reflash the firmware to clear the saved credentials. A proper reset button is on the list for a future version. 
+If the old network is still around and you want to force setup mode anyway, hold the **BOOT** button on the controller for 5 seconds (see the next section). This wipes the saved WiFi credentials and reboots straight into AP mode.
 
 ### Using the Controller Without Home WiFi
 
@@ -68,6 +68,29 @@ The controller works fine without internet. It'll sit in AP mode and you can use
 - Live log viewer
 
 Only Home Assistant integration and OTA updates need internet.
+
+---
+
+## The Buttons on the Controller
+
+The LilyGo board has two small side-mounted buttons: **RST** and **BOOT**.
+
+### RST (Reset)
+
+Hardware reset, wired straight to the chip's enable pin. Pressing it cold-boots the controller — equivalent to cycling the 12 V supply from the chargers, just without unplugging anything. The firmware doesn't see the press; the chip simply restarts. Useful when the dashboard is unreachable and you want a clean restart without pulling cables.
+
+### BOOT (User Reset / Recovery)
+
+This is the one to remember. Two hold patterns are recognised:
+
+| Hold time | Action | What it does |
+| --- | --- | --- |
+| **5 seconds** (release after 5 s, before 10 s) | Clear WiFi & restart into AP mode | Wipes saved WiFi SSID/password only. AP credentials, MQTT settings, charger count, ramp rate, and target voltage all stay intact. Use this when you need to switch the controller to a new network. |
+| **10 seconds** (just keep holding) | Factory reset | Wipes the entire NVS configuration namespace — WiFi credentials, AP credentials, MQTT settings, charger count, ramp rate, target voltage. The controller reboots immediately when the 10 s threshold is hit (you don't need to release), so you'll feel the reset rather than wonder if it took. Use this when re-homing the controller to another bike or troubleshooting a stuck configuration. |
+
+Releases under 1 second are ignored entirely (no accidental triggers from packaging knocks during shipping). Releases between 1 and 5 seconds are logged but take no action.
+
+The BOOT button still doubles as the chip's bootloader entry button if you happen to hold it while pressing RST — that puts the ESP32-S3 into USB download mode, which only matters if you're flashing over USB.
 
 ---
 

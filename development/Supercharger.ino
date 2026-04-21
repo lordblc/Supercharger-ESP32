@@ -38,7 +38,7 @@
 //   driver/twai.h    } built into Espressif ESP32 Arduino core - no install needed
 // ==========================================================================
 
-#define VERSION 202604210958
+#define VERSION 202604211048
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -441,6 +441,13 @@ static char     mqttBrokerPass[65] = "";
 #define MCP_MOSI_PIN  11
 #define MCP_MISO_PIN  13
 #define MCP_RST_PIN    9
+
+// BOOT button on the LilyGo T-2CAN (GPIO 0). Strapping pin — must read HIGH
+// at boot for normal mode, so leave INPUT_PULLUP and only sample after setup().
+// Pressed = LOW (button shorts to GND).
+#define BOOT_BUTTON_PIN 0
+#define BTN_HOLD_AP_RESET_MS    5000UL   // 5 s : clear WiFi creds → AP mode on next boot
+#define BTN_HOLD_FACTORY_MS    10000UL   // 10 s: wipe entire NVS namespace
 
 // ---------------------------------------------------------------------------
 // WiFi setup page — only served in AP / setup mode
@@ -1931,6 +1938,67 @@ void handleOTAUpload() {
 }
 
 // ---------------------------------------------------------------------------
+// BOOT button (GPIO 0) handler
+//
+// Polled from loop(). Two recognised hold patterns:
+//   ≥ 5 s   on release  → wipe saved WiFi credentials only, restart into AP
+//                         mode for re-provisioning. Keeps AP/MQTT/charger-count
+//                         settings intact.
+//   ≥ 10 s  on threshold → factory reset: clear the entire "wifi-config" NVS
+//                          namespace and restart. Acts immediately so the
+//                          user gets a reboot as feedback without releasing.
+//
+// Releasing before 5 s does nothing (the < 1 s "toggle charging" pattern was
+// intentionally skipped to avoid accidental triggers from packaging knocks).
+// ---------------------------------------------------------------------------
+
+static unsigned long bootBtnPressedAt   = 0;     // millis() when press began, 0 = idle
+static bool          bootBtnFactoryDone = false; // latched after 10 s threshold to suppress release-handler
+
+void checkBootButton() {
+  bool pressed = (digitalRead(BOOT_BUTTON_PIN) == LOW);
+  unsigned long now = millis();
+
+  if (pressed && bootBtnPressedAt == 0) {
+    // Press started
+    bootBtnPressedAt   = now;
+    bootBtnFactoryDone = false;
+    return;
+  }
+
+  if (pressed && bootBtnPressedAt > 0) {
+    // Still held — check 10 s threshold and act immediately if reached
+    if (!bootBtnFactoryDone && (now - bootBtnPressedAt) >= BTN_HOLD_FACTORY_MS) {
+      bootBtnFactoryDone = true;
+      LOG("[BTN] BOOT held %lus → FACTORY RESET (clearing NVS)\n",
+          (now - bootBtnPressedAt) / 1000UL);
+      preferences.clear();   // wipes the entire "wifi-config" namespace
+      delay(300);            // give the log line time to flush over serial / SSE
+      ESP.restart();
+    }
+    return;
+  }
+
+  if (!pressed && bootBtnPressedAt > 0) {
+    // Released — decide based on hold duration
+    unsigned long heldMs = now - bootBtnPressedAt;
+    bootBtnPressedAt = 0;
+    if (bootBtnFactoryDone) return;  // already restarted; can't actually reach here
+    if (heldMs >= BTN_HOLD_AP_RESET_MS) {
+      LOG("[BTN] BOOT held %lus → clearing WiFi creds, restarting into AP mode\n",
+          heldMs / 1000UL);
+      preferences.remove("ssid");
+      preferences.remove("pass");
+      delay(300);
+      ESP.restart();
+    } else if (heldMs >= 1000UL) {
+      // 1–5 s window: log it so the user sees their press registered, but no action.
+      LOG("[BTN] BOOT pressed %lums (no action — hold ≥5s for AP reset, ≥10s for factory)\n", heldMs);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // WiFi helpers
 // ---------------------------------------------------------------------------
 
@@ -2035,6 +2103,10 @@ void setup() {
 
   logBegin(115200);
   LOG("\n[BOOT] Supercharger firmware %lld\n", (long long)VERSION);
+
+  // BOOT button (GPIO 0). Strapping pin — safe to configure as input AFTER
+  // boot completes. Internal pullup is enough; the button shorts to GND.
+  pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
 
   preferences.begin("wifi-config", false);
   String savedSSID = preferences.getString("ssid", "");
@@ -2160,6 +2232,7 @@ void loop() {
   server.handleClient();
   sseFlush();
   handleCANBusTask();
+  checkBootButton();
 }
 
 // ---------------------------------------------------------------------------
