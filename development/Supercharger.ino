@@ -38,7 +38,7 @@
 //   driver/twai.h    } built into Espressif ESP32 Arduino core - no install needed
 // ==========================================================================
 
-#define VERSION 202604211048
+#define VERSION 202604211434
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -133,9 +133,10 @@ uint32_t logReadFrom(uint32_t fromSeq, char* out, size_t maxLen) {
 // ---------------------------------------------------------------------------
 
 enum DeviceState {
-  STATE_CONNECTING,
-  STATE_CONNECTED,
-  STATE_SETUP_MODE
+  STATE_CONNECTING,    // STA-only, waiting for initial association
+  STATE_CONNECTED,     // STA-only, associated with home WiFi
+  STATE_AP_RETRYING,   // AP+STA, AP up, STA reconnects in background (may be up or down)
+  STATE_SETUP_MODE     // AP-only, no STA credentials available to retry
 };
 
 DeviceState currentState = STATE_CONNECTING;
@@ -147,7 +148,7 @@ const unsigned long wifiCheckInterval = 5000;
 
 // Tracks which credential source is currently being attempted, so
 // monitorWifiStatus() knows whether to try the secrets fallback next
-// or go straight to AP mode.
+// or go straight to AP+STA retry mode.
 enum WifiSource { WIFI_SRC_NONE, WIFI_SRC_PREFS, WIFI_SRC_SECRETS };
 WifiSource wifiSource = WIFI_SRC_NONE;
 
@@ -155,6 +156,16 @@ WifiSource wifiSource = WIFI_SRC_NONE;
 // connect timeout before declaring failure and moving to the next source.
 unsigned long wifiConnectStartMs    = 0;
 const unsigned long wifiConnectTimeoutMs = 15000; // 15 s per attempt
+
+// STATE_AP_RETRYING bookkeeping. retryStaSsid/Pass hold the credentials we're
+// continuously trying to reach; populated when entering the state from either
+// a failed boot connect or a runtime drop. The driver's auto-reconnect handles
+// most of the work, but we explicitly nudge it every staRetryIntervalMs as a
+// belt-and-braces measure for cases where the driver gives up.
+static char retryStaSsid[33] = "";
+static char retryStaPass[65] = "";
+const unsigned long staRetryIntervalMs = 30000UL;
+static unsigned long lastStaRetryAt    = 0;
 
 // ---------------------------------------------------------------------------
 // Live data — written by bikeBusTask() on Core 0, read by /api/status on Core 1
@@ -1518,7 +1529,7 @@ void handleApiSettingsGet() {
     "{\"ap_mode\":%s,\"wifi_ssid\":\"%s\",\"ap_ssid\":\"%s\",\"ap_pass_set\":%s,"
     "\"mqtt_host\":\"%s\",\"mqtt_port\":%d,\"mqtt_user\":\"%s\","
     "\"charger_count\":%d,\"ramp_rate_wps\":%d}",
-    (currentState == STATE_SETUP_MODE) ? "true" : "false",
+    apIsBroadcasting() ? "true" : "false",
     jSsid.c_str(), jAps.c_str(), hasApPass ? "true" : "false",
     jMh.c_str(), (int)mqttPort, jMu.c_str(), (int)cc,
     (int)ctrl.rampStepW
@@ -1730,7 +1741,7 @@ void handleApiStatus() {
       "\"current_power_w\":%d,"
       "\"chargers\":[",
     liveSnap.dataFresh         ? "true" : "false",
-    (currentState == STATE_SETUP_MODE) ? "true" : "false",
+    apIsBroadcasting()         ? "true" : "false",
     liveSnap.monolithVoltageDv  / 10.0f,
     (float)liveSnap.monolithAmps,
     (float)liveSnap.monolithAH,
@@ -2052,7 +2063,45 @@ void trySecretsConnect() {
   currentState       = STATE_CONNECTING;
 }
 
+// Bring up AP+STA mode and start the background STA retry loop.
+// Pulls credentials from NVS first, then SECRET_MQTT_SSID/PASS as fallback.
+// If neither is available there's nothing to retry — drop to AP-only setup mode.
+void enterApRetrying() {
+  String s = preferences.getString("ssid", "");
+  String p = preferences.getString("pass", "");
+  if (s.length() == 0 && strlen(SECRET_MQTT_SSID) > 0) {
+    s = SECRET_MQTT_SSID;
+    p = SECRET_MQTT_PASS;
+  }
+  if (s.length() == 0) {
+    LOG("[WIFI] No STA creds to retry — staying in AP-only setup mode\n");
+    startAPMode();
+    currentState = STATE_SETUP_MODE;
+    return;
+  }
+  s.toCharArray(retryStaSsid, sizeof(retryStaSsid));
+  p.toCharArray(retryStaPass, sizeof(retryStaPass));
+
+  // AP+STA: both interfaces share the radio. When STA associates, the SoftAP
+  // is force-moved to the STA's channel (clients on the AP may briefly drop).
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAPsetHostname(MDNS_HOSTNAME);
+  WiFi.softAP(apSSID, apPass);
+  WiFi.setHostname(MDNS_HOSTNAME);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);
+  WiFi.begin(retryStaSsid, retryStaPass);
+  startMdns();
+  lastStaRetryAt = millis();
+  currentState = STATE_AP_RETRYING;
+  LOG("[WIFI] AP+STA retry mode — AP \"%s\" up at %s, STA → \"%s\"\n",
+      apSSID, WiFi.softAPIP().toString().c_str(), retryStaSsid);
+}
+
 void monitorWifiStatus() {
+  unsigned long now = millis();
+
   if (currentState == STATE_CONNECTING) {
     if (WiFi.status() == WL_CONNECTED) {
       LOG("[WIFI] Connected (%s). IP: %s\n",
@@ -2067,28 +2116,65 @@ void monitorWifiStatus() {
       return;
     }
     // Not yet connected — check whether we've exceeded the timeout.
-    if (millis() - wifiConnectStartMs >= wifiConnectTimeoutMs) {
-      WiFi.disconnect(true);
+    if (now - wifiConnectStartMs >= wifiConnectTimeoutMs) {
       if (wifiSource == WIFI_SRC_PREFS) {
-        // Preferences failed — try secrets if available, else AP mode.
+        // Preferences failed — try secrets if available, else AP+STA retry.
         LOG("[WIFI] Prefs connect timed out.\n");
         trySecretsConnect();
       } else {
-        // Secrets also failed (or were never available) — go to AP mode.
-        LOG("[WIFI] Secrets connect timed out. Starting AP mode.\n");
-        startAPMode();
-        currentState = STATE_SETUP_MODE;
+        // Both prefs and secrets failed (or only secrets were tried).
+        // If we still have credentials anywhere, switch to AP+STA retry so
+        // the user can reach the dashboard via the AP while STA keeps trying.
+        LOG("[WIFI] Initial STA connect timed out — entering AP+STA retry\n");
+        enterApRetrying();
       }
     }
     // Still within timeout window — keep waiting, do nothing.
 
   } else if (currentState == STATE_CONNECTED) {
     if (WiFi.status() != WL_CONNECTED) {
-      LOG("[WIFI] Lost connection. Falling back to AP mode.\n");
-      startAPMode();
-      currentState = STATE_SETUP_MODE;
+      // STA dropped after a previously successful connection. Bring up AP so
+      // the dashboard stays reachable while the driver works on reconnecting.
+      LOG("[WIFI] STA dropped — switching to AP+STA retry mode\n");
+      enterApRetrying();
+    }
+
+  } else if (currentState == STATE_AP_RETRYING) {
+    // Track STA up/down transitions; AP stays up regardless.
+    static bool lastStaUp = false;
+    bool staUp = (WiFi.status() == WL_CONNECTED);
+
+    if (staUp && !lastStaUp) {
+      LOG("[WIFI] STA reconnected. IP: %s (AP stays up)\n",
+          WiFi.localIP().toString().c_str());
+      const char* hn = WiFi.getHostname();
+      if (hn && strlen(hn) > 0)
+        snprintf(mqttHostname, sizeof(mqttHostname), "%s", hn);
+      // Re-bind mDNS — STA-side service registration needs the new IP.
+      startMdns();
+    } else if (!staUp && lastStaUp) {
+      LOG("[WIFI] STA dropped again — driver auto-reconnect will retry\n");
+    }
+    lastStaUp = staUp;
+
+    // Belt-and-braces: nudge the driver every staRetryIntervalMs while STA is down.
+    // Arduino-ESP32 auto-reconnects on its own, but some failure modes leave the
+    // STA stuck disconnected. WiFi.reconnect() kicks it again with the same creds.
+    if (!staUp && (now - lastStaRetryAt) >= staRetryIntervalMs) {
+      LOG("[WIFI] Nudging STA reconnect to \"%s\"...\n", retryStaSsid);
+      WiFi.reconnect();
+      lastStaRetryAt = now;
     }
   }
+  // STATE_SETUP_MODE: nothing to do — wait for /save to write creds and restart.
+}
+
+// True whenever the SoftAP is currently broadcasting (covers both the
+// "no creds" setup mode and the "creds present, retrying" recovery mode).
+// Used by the dashboard's ap_mode JSON field so the UI can hint that the
+// AP fallback is reachable.
+static inline bool apIsBroadcasting() {
+  return currentState == STATE_SETUP_MODE || currentState == STATE_AP_RETRYING;
 }
 
 // ---------------------------------------------------------------------------
@@ -3586,8 +3672,9 @@ void mqttTask(void* /*pvParameters*/) {
   const unsigned long KEEPALIVE_INTERVAL = 10000; // ms between forced republish
 
   for (;;) {
-    // Only attempt MQTT when WiFi is up
-    if (currentState != STATE_CONNECTED) {
+    // Only attempt MQTT when STA is actually associated. Works in both
+    // STATE_CONNECTED (STA-only) and STATE_AP_RETRYING (AP+STA, STA up).
+    if (WiFi.status() != WL_CONNECTED) {
       vTaskDelay(pdMS_TO_TICKS(1000));
       continue;
     }

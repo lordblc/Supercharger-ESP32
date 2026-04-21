@@ -20,6 +20,7 @@ A WiFi connected CAN bus controller for charging a Zero motorcycle with up to 4 
 
 ** The LilyPad T-2CAN Connections**
 ![LilyPad_Board_Connections](pics/LilyGo_Board_Connections.png)
+
 In the **Red Square** you connect the **red** wire from the chargers to the screw-terminal closest to the USB-C connector. You then connect the **black** wire from the same connector to the other terminal, furthest away from the USB-C connector, at the board end.
 **Yellow square:** This is the reset button. No connections here, just FYI to where you find it.
 **Green square:** You connect the WLAN antenna here. 
@@ -350,8 +351,9 @@ Check the bike CAN wiring (GPIO 6 RX, GPIO 7 TX on the ESP32-S3). The bike bus r
 Default password is exactly `12345678`, eight characters (or whatever the builder set in `SECRET_PASS`). Some phones cache old passwords, so forget the network and reconnect. The AP broadcasts on 2.4 GHz only.
 
 **Lost WiFi during use**
-If the home WiFi drops out while the controller is running, it falls back to AP mode automatically. It won't retry the home WiFi on its own. Power cycle the controller to make it try again.
-**NOTE:** This might change in a future release. The author has spotty WiFi coverage where the bike is parked and fixing this point was not of priority.
+The controller switches into **AP+STA** mode automatically: it brings up the **Supercharger** AP so the dashboard stays reachable, *and* keeps trying to reconnect to the home network in the background. No power cycle needed. When the home WiFi comes back, STA reassociates on its own and MQTT/Home Assistant resumes. The AP stays up for the rest of the session so you can always reach the unit even if the home network is flaky — power cycle (or the RST button) to drop the AP and go back to STA-only.
+
+Note on channels: when STA reconnects, the SoftAP gets force-moved to the home WiFi's channel (single radio, can't straddle two channels). Phones already connected to the AP on the old channel may briefly drop and reassociate.
 
 **Forgot the IP address**
 Try **http://supercharger.local** first — that's mDNS and works on most modern OSes. If that fails (corporate network, multicast disabled, ancient phone), plug in USB-C and check the serial log, or look at your router's DHCP client list.
@@ -363,13 +365,29 @@ Reload the page. If that doesn't help, check `/log` for errors. You can also pow
 
 ## Technical Reference
 
-### WiFi Boot Priority
+### WiFi Boot Priority and Recovery
 
-1. Saved credentials (set via the setup page)
-2. Compile time secrets (`SECRET_MQTT_SSID` / `SECRET_MQTT_PASS`)
-3. AP mode (`ESP32_Setup` / `12345678`)
+**Boot-time STA priority:**
 
-Each attempt has a 15 second timeout before falling through. Maximum worst case fallback time is about 30 seconds (prefs fail, then secrets fail, then AP starts).
+1. Saved credentials (set via the setup page, stored in NVS)
+2. Compile-time secrets (`SECRET_MQTT_SSID` / `SECRET_MQTT_PASS`)
+
+Each attempt has a 15 second timeout before falling through.
+
+**If both fail (or STA drops at runtime):** the controller switches to **AP+STA** mode. The SoftAP comes up immediately so the dashboard stays reachable on the local hotspot, while the STA continues retrying the saved/secret credentials in the background. The Arduino-ESP32 driver auto-reconnects on its own; the firmware also nudges it every 30 s as a safety net.
+
+**If no STA credentials exist anywhere** (fresh unit, no NVS, blank `SECRET_MQTT_SSID`): the controller goes straight to AP-only setup mode. There's nothing to retry until you provide credentials via the setup page.
+
+**Worst-case time to a usable AP:** about 30 seconds on first boot (prefs fail → secrets fail → AP+STA comes up). Subsequent retries happen in the background without blocking the dashboard.
+
+**State summary:**
+
+| State | STA | AP | When |
+| --- | --- | --- | --- |
+| `STATE_CONNECTING` | trying | off | Initial boot, attempting STA |
+| `STATE_CONNECTED` | up | off | STA succeeded, no fallback needed |
+| `STATE_AP_RETRYING` | retrying / up | up | STA failed or dropped; AP visible, STA reconnects in background |
+| `STATE_SETUP_MODE` | n/a | up | No credentials anywhere; waiting for user provisioning |
 
 ### CAN Buses
 
