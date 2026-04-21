@@ -18,15 +18,23 @@ A WiFi connected CAN bus controller for charging a Zero motorcycle with up to 4 
 
 ## Connecting the Hardware
 
-** The LilyPad T-2CAN Connections**
+**The LilyPad T-2CAN Connections**
 ![LilyPad_Board_Connections](pics/LilyGo_Board_Connections.png)
 
-In the **Red Square** you connect the **red** wire from the chargers to the screw-terminal closest to the USB-C connector. You then connect the **black** wire from the same connector to the other terminal, furthest away from the USB-C connector, at the board end.
+In the **Red square** you connect the **red** wire from the chargers to the screw-terminal closest to the USB-C connector. 
+You then connect the **black** wire from the same connector to the other terminal, furthest away from the USB-C connector, at the board end.
 **Yellow square:** This is the reset button. No connections here, just FYI to where you find it.
 **Green square:** You connect the WLAN antenna here. 
 **Turqoise square:** You connect the chargers CAN bus here, see seperate image for details.
 **Purple square:** You connect the bike's CAN bus here, see seperate image for details.
 
+**The LilyPad CAN Connections**
+![Lilypad_Board_CAN_Connections](pics/LilyGo_Board_CAN_Connections.png)
+
+In the **Turqoise square** you connect the **CANL to the CANLB port** and the **CANH to the CANHB port**. (color code will come later once i have defined the other PCB)
+You connect the **GND** cable that is also connected to the **12V-GND** power supply terminals to the **DGNDB** port. 
+
+In the **Purple square** you connect the **CANL -> CANLA port** and the **CANH -> CANHA port** from the bike's CAN bus. Here you will also connect the **separated GND** from bike cable to the **DGNDA port**.
 
 *[MORE TO BE WRITTEN]*
 
