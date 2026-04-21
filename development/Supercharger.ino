@@ -38,10 +38,11 @@
 //   driver/twai.h    } built into Espressif ESP32 Arduino core - no install needed
 // ==========================================================================
 
-#define VERSION 202604171632
+#define VERSION 202604210930
 
 #include <WiFi.h>
 #include <WebServer.h>
+#include <ESPmDNS.h>
 #include <Preferences.h>
 #include <arduino_secrets.h>
 #include "supercharger.h"
@@ -1933,10 +1934,28 @@ void handleOTAUpload() {
 // WiFi helpers
 // ---------------------------------------------------------------------------
 
+// mDNS hostname — controller is reachable at http://supercharger.local/
+// from any machine on the same L2 segment that supports mDNS / Bonjour.
+// Works in both STA and AP mode (clients joined to the AP can use it too).
+static const char MDNS_HOSTNAME[] = "supercharger";
+
+static void startMdns() {
+  // MDNS.begin() is safe to call repeatedly only after MDNS.end(); without
+  // the end() the second begin() leaks the prior service registration.
+  MDNS.end();
+  if (MDNS.begin(MDNS_HOSTNAME)) {
+    MDNS.addService("http", "tcp", 80);
+    LOG("[MDNS] Started: http://%s.local/\n", MDNS_HOSTNAME);
+  } else {
+    LOG("[MDNS] Failed to start\n");
+  }
+}
+
 void startAPMode() {
   WiFi.disconnect(true);
   WiFi.softAP(apSSID, apPass);
   LOG("[AP] Started \"%s\" — IP: %s\n", apSSID, WiFi.softAPIP().toString().c_str());
+  startMdns();
 }
 
 // Attempt connection using SECRET_MQTT_SSID / SECRET_MQTT_PASS.
@@ -1970,6 +1989,7 @@ void monitorWifiStatus() {
       const char* hn = WiFi.getHostname();
       if (hn && strlen(hn) > 0)
         snprintf(mqttHostname, sizeof(mqttHostname), "%s", hn);
+      startMdns();
       currentState = STATE_CONNECTED;
       return;
     }
