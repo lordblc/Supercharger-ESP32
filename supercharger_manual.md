@@ -13,12 +13,13 @@ A WiFi connected CAN bus controller for charging a Zero motorcycle with up to 4 
 - Zero motorcycle with CAN bus access to the BMS
 - A 2.4 GHz WiFi network (optional, but recommended)
 - A phone, tablet, or laptop with a browser for setup
-- A 5VDC Isolated PSU
-- A prototype board
-- A JAI Electronics MX23A18NF1 connector for the Bike connections
-- Some cables (i have used various.. the inter-board connections i could solve with a screened ethernet patch cord)
-- 2 male SuperSeal connectors:
-![Dashboard Screenshot](pics/202604231420-ChargeConnectors_480.png)
+-- A 5VDC Isolated PSU
+-- A prototype board
+-- A JAI Electronics MX23A18NF1 connector for the Bike connections
+-- Some cables (i have used various.. the inter-board connections i could solve with a screened ethernet patch cord)
+-- 2 male SuperSeal connectors:
+
+![Charge Connectors](pics/202604231420-ChargeConnectors_480.png)
 
 ---
 
