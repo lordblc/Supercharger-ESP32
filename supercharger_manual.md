@@ -216,8 +216,10 @@ Screenshot from my HomeAssistant Power monitor. This monitor is in front of my 2
 
 **Recovery transitions** — the controller doesn't just sit in DONE forever:
 
-- **CV → CC** if pack voltage drops more than 1 V below the limit after switching to CV, it switches back to CC. 
-- **DONE → CC** if pack voltage drops more than 2 V below the limit, th controller will start a new charge cycle automatically.
+- **CV → CC** if pack voltage drops more than 1 V below the limit after switching to CV, it switches back to CC.
+- **DONE → CC** the threshold depends on the preset you've chosen:
+  - **70 % or 80 %**: pack must drop more than **2 V** below the target before a new cycle starts. Frequent small top-offs are fine in this gentle SoC range.
+  - **90 %, 100 %**, or any custom target above 110.0 V: the controller waits for the pack to sag all the way down to the **80 % level (110.0 V)** before re-engaging. The cycle is wider (more voltage sag per top-off), but the pack spends far less time hovering near full charge — which is what actually wears Li-ion cells. The trade-off is deliberate: at 100 %, you'll see the pack discharge from 116.4 V down to 110.0 V before the chargers kick back in.
 
 **Practical implication of the % presets**: choosing 70 % doesn't just mean "stop earlier" — it also means a much shorter CV phase (or none at all if the ceiling is below where the pack would naturally taper). That's why low presets feel quick: the bulk of cell stress in a Li-ion charge is during CV at high voltage, and you're skipping most of it.
 

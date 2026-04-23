@@ -38,7 +38,7 @@
 //   driver/twai.h    } built into Espressif ESP32 Arduino core - no install needed
 // ==========================================================================
 
-#define VERSION 202604211434
+#define VERSION 202604231613
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -1879,6 +1879,7 @@ void handleApiControl() {
     }
     if (tvd >= TARGET_VOLT_PRESETS[0].dv && tvd <= (int)MAX_CHARGE_VOLTAGE_DV) {
       ctrl.targetVoltDv = (uint16_t)tvd;
+      preferences.putUShort("target_volt_dv", (uint16_t)tvd);
     }
     xSemaphoreGive(controlMutex);
   }
@@ -2915,11 +2916,23 @@ void rampTask(void* /*pvParameters*/) {
     const long hyst = 10; // 1.0 V in dV
 
     // ── Phase transitions ─────────────────────────────────────────────────────
-    // DONE → CC : pack has discharged ≥ 2 V below ceiling (e.g., bike ridden)
+    // DONE → CC re-engage threshold depends on the user's target voltage:
+    //   target ≤ 80 % preset (≤ 1100 dV): re-engage at target − 2 V
+    //       (frequent top-off is fine in the gentle SoC range)
+    //   target  > 80 % preset (> 1100 dV): re-engage only when pack sags
+    //       all the way to the 80 % preset voltage (1100 dV)
+    //       (wider hysteresis trades more voltage sag per cycle for
+    //        far fewer cycles in the high-SoC band — Li-ion lives
+    //        longer if it doesn't repeatedly hover near 100 %)
+    const long DONE_REENGAGE_FLOOR_DV = (long)TARGET_VOLT_PRESETS[1].dv; // 80 %
+    long doneReengageDv = ((long)voltCeiling <= DONE_REENGAGE_FLOOR_DV)
+                            ? ((long)voltCeiling - hyst * 2)
+                            : DONE_REENGAGE_FLOOR_DV;
     if (phase == PHASE_DONE && rawPackDv > 0 &&
-        rawPackDv <= (long)(voltCeiling - hyst * 2)) {
+        rawPackDv <= doneReengageDv) {
       phase = PHASE_CC;
-      LOG("[RAMP] DONE→CC: pack dropped to %ld dV\n", rawPackDv);
+      LOG("[RAMP] DONE→CC: pack at %ld dV ≤ floor %ld dV (ceil %d dV)\n",
+          rawPackDv, doneReengageDv, voltCeiling);
     }
     // CV → CC : voltage sag under load (bike in use) — re-enter CC to top up
     if (phase == PHASE_CV && rawPackDv > 0 &&
@@ -3097,8 +3110,21 @@ void rampInit() {
   ctrl.rampStepW = preferences.getUShort("ramp_step_w", DEFAULT_RAMP_STEP_W);
   if (ctrl.rampStepW < 10 || ctrl.rampStepW > 500) ctrl.rampStepW = DEFAULT_RAMP_STEP_W;
 
-  // Target voltage defaults to 100% (highest preset) on boot
-  ctrl.targetVoltDv = TARGET_VOLT_PRESETS[TARGET_VOLT_PRESET_COUNT - 1].dv;
+  // Restore persisted target voltage; default to 100 % (highest preset) if
+  // never saved. Survives reboots and OTA / serial-flash firmware updates
+  // (NVS partition is preserved unless the flasher does --erase_all).
+  {
+    uint16_t defaultTgt = TARGET_VOLT_PRESETS[TARGET_VOLT_PRESET_COUNT - 1].dv;
+    uint16_t savedTgt   = preferences.getUShort("target_volt_dv", defaultTgt);
+    // Sanity-clamp in case the saved value is out of the valid range.
+    if (savedTgt < TARGET_VOLT_PRESETS[0].dv ||
+        savedTgt > MAX_CHARGE_VOLTAGE_DV) {
+      savedTgt = defaultTgt;
+    }
+    ctrl.targetVoltDv = savedTgt;
+    LOG("[BOOT] target_volt_dv restored: %u dV (default %u dV)\n",
+        savedTgt, defaultTgt);
+  }
 
   xTaskCreatePinnedToCore(
     rampTask,         // task function
@@ -3532,6 +3558,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         ctrl.targetVoltDv = (uint16_t)tvd;
         xSemaphoreGive(controlMutex);
       }
+      preferences.putUShort("target_volt_dv", (uint16_t)tvd);
       LOG("[MQTT] cmd target_volt_v = %.1f V (%d dV)\n", tvV, tvd);
     }
 
