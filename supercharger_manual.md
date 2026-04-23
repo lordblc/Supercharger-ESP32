@@ -13,6 +13,12 @@ A WiFi connected CAN bus controller for charging a Zero motorcycle with up to 4 
 - Zero motorcycle with CAN bus access to the BMS
 - A 2.4 GHz WiFi network (optional, but recommended)
 - A phone, tablet, or laptop with a browser for setup
+- A 5VDC Isolated PSU
+- A prototype board
+- A JAI Electronics MX23A18NF1 connector for the Bike connections
+- Some cables (i have used various.. the inter-board connections i could solve with a screened ethernet patch cord)
+- 2 male SuperSeal connectors:
+![Dashboard Screenshot](pics/202604231420-ChargeConnectors_480.png)
 
 ---
 
@@ -126,6 +132,8 @@ If neither resolves (some corporate or guest networks block multicast and don't 
 
 Type the IP into any browser on the same network and the dashboard loads.
 
+![Dashboard Screenshot](pics/202604231420-Dashboard_Charging_Absorption_768.jpg)
+
 ---
 
 ## Using the Dashboard
@@ -181,10 +189,14 @@ The dashboard remembers your last selection across reboots. The same setting is 
 
 The controller runs a three-phase charge cycle modelled on what a "smart" Li-ion charger does. You don't need to interact with it; it's automatic. But understanding the phases makes the dashboard a lot less mysterious.
 
+![Dashboard Screenshot](pics/202604231420-Dashboard_Charging_Absorption_768.jpg)
+
 **Phase 1 — CC (Constant Current)**
 This is the bulk of the charge. The controller commands the chargers to deliver the power you've set on the slider, ramping up at 50 W/s. Pack voltage rises gradually as the cells absorb energy. The dashboard phase indicator reads **CC**. Voltage and temperature cutbacks (see `battery_tables.h`) only apply in this phase — they trim power back automatically as the pack gets close to full or warm.
 
-**Phase 2 — CV (Constant Voltage / Absorption)**
+![Dashboard Screenshot](pics/202604231420-Dashboard_Charging_Float_768.jpg)
+
+**Phase 2 — CV (Constant Voltage / Float)**
 When the pack reaches the voltage ceiling you picked with the % preset, the controller switches to **CV**. It now holds the pack at that exact voltage and lets the chargers reduce current naturally as the cells finish topping up. The current target ramps down on the dashboard, but actual charger output continues — usually at a few amps total. This phase finishes when one of two things happens, whichever comes first:
 
 - Actual delivered current drops below **2 A total** (after a 2 minute settling window).
@@ -192,12 +204,18 @@ When the pack reaches the voltage ceiling you picked with the % preset, the cont
 
 CV is short for the lower presets (70 / 80 %) and longer for 90 / 100 %, where there's more energy left to absorb at the ceiling.
 
+![Dashboard Screenshot](pics/202604231420-Dashboard_Charging_Complete_768.jpg)
+
 **Phase 3 — DONE**
 Charging stops. Heartbeat to the chargers ends, the relay drops, and the dashboard shows **DONE**. The session totals (Wh, Ah) freeze at their final values.
 
+![Dashboard Screenshot](pics/202604231420-Monitor_Charging_PowerCurve_768.jpg)
+
+Screenshot from my HomeAssistant Power monitor. This monitor is in front of my 230V -> 400V transformer, so it's not precise. It just shows the ramp-up, absorption, float and complete stages.
+
 **Recovery transitions** — the controller doesn't just sit in DONE forever:
 
-- **CV → CC** if pack voltage sags more than 1 V below the ceiling (e.g. you start riding with the bike still plugged in). It re-enters CC to top up.
+- **CV → CC** if pack voltage sags more than 1 V below the ceiling (e.g. you start riding with the bike still plugged in). It re-enters CC to top up. (Highly unlikely scenario considering the chargers are powered from the charging cable)
 - **DONE → CC** if pack voltage drops at least 2 V below the ceiling (e.g. you've ridden the bike). The next time it sees the bike, it'll start a fresh charge cycle without you doing anything.
 
 **Practical implication of the % presets**: choosing 70 % doesn't just mean "stop earlier" — it also means a much shorter CV phase (or none at all if the ceiling is below where the pack would naturally taper). That's why low presets feel quick: the bulk of cell stress in a Li-ion charge is during CV at high voltage, and you're skipping most of it.
@@ -209,6 +227,8 @@ At the bottom: uptime, WiFi signal, firmware version, CPU load per core, free he
 ### Log Viewer
 
 Click the Log link, or go to **/log**. Live serial log in your browser, updated in real time. Good for diagnosing CAN bus issues without needing a USB cable.
+
+![Dashboard Screenshot](pics/202604231420-Log_768.jpg)
 
 ---
 
