@@ -188,27 +188,27 @@ The dashboard remembers your last selection across reboots. The same setting is 
 
 ### CC / CV / DONE — How the Controller Stops Charging
 
-The controller runs a three-phase charge cycle modelled on what a "smart" Li-ion charger does. You don't need to interact with it; it's automatic. But understanding the phases makes the dashboard a lot less mysterious.
+The controller runs a three stage automatic charge cycle.
 
 ![Dashboard Screenshot](pics/202604231420-Dashboard_Charging_Absorption_768.jpg)
 
-**Phase 1 — CC (Constant Current)**
-This is the bulk of the charge. The controller commands the chargers to deliver the power you've set on the slider, ramping up at 50 W/s. Pack voltage rises gradually as the cells absorb energy. The dashboard phase indicator reads **CC**. Voltage and temperature cutbacks (see `battery_tables.h`) only apply in this phase — they trim power back automatically as the pack gets close to full or warm.
+**Stage 1 — CC (Constant Current)**
+This is the main charging phase. The controller commands the chargers to deliver the power you've set on the slider, ramping up at 50 W/s (Adjustable). Battery Pack voltage rises gradually as the cells absorb energy. The dashboard phase indicator reads **CC**. Voltage and temperature limits (see `battery_tables.h`) only apply in this phase — they trim power back as the pack gets close to full or warm.
 
 ![Dashboard Screenshot](pics/202604231420-Dashboard_Charging_Float_768.jpg)
 
-**Phase 2 — CV (Constant Voltage / Float)**
-When the pack reaches the voltage ceiling you picked with the % preset, the controller switches to **CV**. It now holds the pack at that exact voltage and lets the chargers reduce current naturally as the cells finish topping up. The current target ramps down on the dashboard, but actual charger output continues — usually at a few amps total. This phase finishes when one of two things happens, whichever comes first:
+**Stage 2 — CV (Constant Voltage / Float)**
+When the battery pack reaches the set voltage charge level, the controller switches to **CV**. It holds the battery pack at that voltage and lets the chargers reduce current as the cells finish topping up. You’ll see the current target falling on the dashboard, but charging continues at a lower level. This stage finishes when one of two things happens, whichever comes first:
 
 - Actual delivered current drops below **2 A total** (after a 2 minute settling window).
-- A **20 minute safety timeout** elapses.
+- **20 minute safety timeout** finishes.
 
-CV is short for the lower presets (70 / 80 %) and longer for 90 / 100 %, where there's more energy left to absorb at the ceiling.
+CV stage is short at 70-80% and longer for 90-100%, because higher charge levels need more time to equalize. Lower presets shorten or eliminate the CV stage. That's why 70% or 80% charges takes proportionally less time. Most battery stress happens during CV at over 90% charge. Lower presets avoid ost of that stress.
 
 ![Dashboard Screenshot](pics/202604231420-Dashboard_Charging_Complete_768.jpg)
 
-**Phase 3 — DONE**
-Charging stops. Heartbeat to the chargers ends, the relay drops, and the dashboard shows **DONE**. The session totals (Wh, Ah) freeze at their final values.
+**Stage 3 — DONE**
+Charging stops. The dashboard shows DONE. The relay opens. The controller stops talking to the chargers. Energy totals (Wh, Ah) stop updating.
 
 ![Dashboard Screenshot](pics/202604231420-Monitor_Charging_PowerCurve_768.jpg)
 
@@ -216,8 +216,8 @@ Screenshot from my HomeAssistant Power monitor. This monitor is in front of my 2
 
 **Recovery transitions** — the controller doesn't just sit in DONE forever:
 
-- **CV → CC** if pack voltage sags more than 1 V below the ceiling (e.g. you start riding with the bike still plugged in). It re-enters CC to top up. (Highly unlikely scenario considering the chargers are powered from the charging cable)
-- **DONE → CC** if pack voltage drops at least 2 V below the ceiling (e.g. you've ridden the bike). The next time it sees the bike, it'll start a fresh charge cycle without you doing anything.
+- **CV → CC** if pack voltage drops more than 1 V below the limit after switching to CV, it switches back to CC. 
+- **DONE → CC** if pack voltage drops more than 2 V below the limit, th controller will start a new charge cycle automatically.
 
 **Practical implication of the % presets**: choosing 70 % doesn't just mean "stop earlier" — it also means a much shorter CV phase (or none at all if the ceiling is below where the pack would naturally taper). That's why low presets feel quick: the bulk of cell stress in a Li-ion charge is during CV at high voltage, and you're skipping most of it.
 
