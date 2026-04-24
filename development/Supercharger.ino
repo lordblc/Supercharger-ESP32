@@ -38,7 +38,7 @@
 //   driver/twai.h    } built into Espressif ESP32 Arduino core - no install needed
 // ==========================================================================
 
-#define VERSION 202604231613
+#define VERSION 202604241651
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -167,6 +167,13 @@ static char retryStaPass[65] = "";
 const unsigned long staRetryIntervalMs = 30000UL;
 static unsigned long lastStaRetryAt    = 0;
 
+// AP grace period: once STA has been continuously up for AP_GRACE_MS while we
+// were in STATE_AP_RETRYING, tear down the SoftAP and return to STA-only.
+// Any STA drop during the grace window resets the timer (and AP keeps serving
+// the dashboard). 0 == not currently stable.
+const unsigned long AP_GRACE_MS = 90000UL;       // 90 s of stable STA
+static unsigned long apStaStableSinceMs = 0;
+
 // ---------------------------------------------------------------------------
 // Live data — written by bikeBusTask() on Core 0, read by /api/status on Core 1
 // Protected by liveMutex. All raw values follow Zero CAN library scaling:
@@ -271,6 +278,9 @@ struct ChargerBusData {
 // Charge phase exposed to the API without a mutex (uint8_t write is atomic on ARM).
 // 0 = CC / Absorption,  1 = CV / Float,  2 = Done / Complete
 static volatile uint8_t g_rampPhase = 0;
+// True while CC-phase power is being clamped by the hot-temperature cutback.
+// Read by the dashboard to display a "thermal throttling" banner.
+static volatile bool    g_thermalThrottle = false;
 
 // Charger is considered gone if no status frame received within this window
 static const unsigned long CHARGER_TIMEOUT_MS = 10000;
@@ -429,6 +439,9 @@ struct MqttSnapshot {
   float   sessionAh          = -1;
   uint16_t rampStepW         = 65535;
   float    targetVoltDv      = -1.0f;  // stored as V (dV/10) for float comparison
+  bool     thermalThrottle   = false;
+  bool     thermalThrottleForced = true; // guarantee one publish after boot
+  uint8_t  targetPresetPct   = 255;     // 255 = sentinel, forces first publish
 } mqttLast;
 
 static WiFiClient   mqttWifiClient;
@@ -748,6 +761,12 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
     <a href="/settings" style="color:#e94560;margin-left:8px">Configure WiFi &#8594;</a>
   </div>
 
+  <div id="thermalBanner" style="display:none;background:#3a1f0a;border:1px solid #ff8c00;
+       border-radius:8px;padding:12px 16px;margin-top:12px;text-align:center">
+    <span style="color:#ff8c00;font-weight:bold">&#127777; Thermal throttling</span>
+    <span style="color:#aaa"> — pack temperature high, charge power reduced. Charging continues at a safe rate.</span>
+  </div>
+
   <div class="section">Monolith Pack</div>
   <div class="grid">
     <div class="card"><div class="label">Voltage</div>
@@ -761,8 +780,6 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
       <div class="soc-bar-wrap"><div class="soc-bar" id="mSOCBar"></div></div></div>
     <div class="card"><div class="label">Temp Min / Max</div>
       <span class="val" id="mT">—</span></div>
-    <div class="card"><div class="label">Max C-Rate</div>
-      <span class="val" id="mC">—</span></div>
   </div>
 
   <div id="ptSection" style="display:none">
@@ -776,8 +793,6 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
         <span class="val" id="pAH">—</span></div>
       <div class="card"><div class="label">Temp Min / Max</div>
         <span class="val" id="pT">—</span></div>
-      <div class="card"><div class="label">Max C-Rate</div>
-        <span class="val" id="pC">—</span></div>
     </div>
   </div>
 
@@ -1073,12 +1088,14 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
           // AP mode banner
           document.getElementById('apBanner').style.display = d.ap_mode ? 'block' : 'none';
 
+          // Thermal throttling banner (hot-cutback active in CC phase)
+          document.getElementById('thermalBanner').style.display = d.thermal_throttle ? 'block' : 'none';
+
           document.getElementById('mV').textContent  = fmt(d.monolith_v,  1) + ' V';
           document.getElementById('mA').textContent  = d.monolith_a + ' A';
           document.getElementById('mAH').textContent = d.monolith_ah + ' Ah';
           document.getElementById('mT').textContent  = fmt(d.monolith_tmin, 0)
                                                + ' / ' + fmt(d.monolith_tmax, 0) + ' \u00B0C';
-          document.getElementById('mC').textContent  = fmt(d.monolith_crate, 3) + ' C';
 
           // SOC card
           var soc = d.monolith_soc !== undefined ? d.monolith_soc : null;
@@ -1107,7 +1124,6 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
             document.getElementById('pAH').textContent = d.powertank_ah + ' Ah';
             document.getElementById('pT').textContent  = fmt(d.powertank_tmin, 0)
                                                  + ' / ' + fmt(d.powertank_tmax, 0) + ' \u00B0C';
-            document.getElementById('pC').textContent  = fmt(d.powertank_crate, 3) + ' C';
           } else if (d.powertank_decided && !d.powertank_present) {
             ptSec.style.display = 'none';
           }
@@ -1739,6 +1755,7 @@ void handleApiStatus() {
       "\"charging_enabled\":%s,"
       "\"target_power_w\":%d,"
       "\"current_power_w\":%d,"
+      "\"thermal_throttle\":%s,"
       "\"chargers\":[",
     liveSnap.dataFresh         ? "true" : "false",
     apIsBroadcasting()         ? "true" : "false",
@@ -1772,7 +1789,8 @@ void handleApiStatus() {
     (int)ctrl.chargerCount,
     ctrl.enabled ? "true" : "false",
     (int)ctrl.targetPowerW,
-    (int)ctrl.currentPowerW
+    (int)ctrl.currentPowerW,
+    g_thermalThrottle ? "true" : "false"
   );
 
   // Build the charger array dynamically — one entry per present charger
@@ -2094,7 +2112,8 @@ void enterApRetrying() {
   WiFi.persistent(false);
   WiFi.begin(retryStaSsid, retryStaPass);
   startMdns();
-  lastStaRetryAt = millis();
+  lastStaRetryAt     = millis();
+  apStaStableSinceMs = 0;          // grace window starts only after STA is up
   currentState = STATE_AP_RETRYING;
   LOG("[WIFI] AP+STA retry mode — AP \"%s\" up at %s, STA → \"%s\"\n",
       apSSID, WiFi.softAPIP().toString().c_str(), retryStaSsid);
@@ -2141,22 +2160,41 @@ void monitorWifiStatus() {
     }
 
   } else if (currentState == STATE_AP_RETRYING) {
-    // Track STA up/down transitions; AP stays up regardless.
+    // Track STA up/down transitions; AP keeps serving the dashboard until
+    // STA has been stable for AP_GRACE_MS, at which point we drop AP and
+    // return to STA-only (STATE_CONNECTED).
     static bool lastStaUp = false;
     bool staUp = (WiFi.status() == WL_CONNECTED);
 
     if (staUp && !lastStaUp) {
-      LOG("[WIFI] STA reconnected. IP: %s (AP stays up)\n",
+      LOG("[WIFI] STA reconnected. IP: %s (AP stays up; grace window started)\n",
           WiFi.localIP().toString().c_str());
       const char* hn = WiFi.getHostname();
       if (hn && strlen(hn) > 0)
         snprintf(mqttHostname, sizeof(mqttHostname), "%s", hn);
       // Re-bind mDNS — STA-side service registration needs the new IP.
       startMdns();
+      apStaStableSinceMs = now;    // begin counting toward AP teardown
     } else if (!staUp && lastStaUp) {
-      LOG("[WIFI] STA dropped again — driver auto-reconnect will retry\n");
+      LOG("[WIFI] STA dropped again — grace timer reset, driver will retry\n");
+      apStaStableSinceMs = 0;      // reset: must be continuously up
     }
     lastStaUp = staUp;
+
+    // AP teardown: STA has been continuously up for the full grace window.
+    if (staUp && apStaStableSinceMs != 0 &&
+        (now - apStaStableSinceMs) >= AP_GRACE_MS) {
+      LOG("[WIFI] STA stable for %lu ms — tearing down SoftAP, returning to STA-only\n",
+          (unsigned long)(now - apStaStableSinceMs));
+      WiFi.softAPdisconnect(true);
+      WiFi.mode(WIFI_STA);
+      apStaStableSinceMs = 0;
+      currentState = STATE_CONNECTED;
+      // Re-register mDNS now that the AP-side iface is gone, so service
+      // records advertise only the STA IP. Safe to call repeatedly.
+      startMdns();
+      return;
+    }
 
     // Belt-and-braces: nudge the driver every staRetryIntervalMs while STA is down.
     // Arduino-ESP32 auto-reconnects on its own, but some failure modes leave the
@@ -2850,6 +2888,7 @@ void rampTask(void* /*pvParameters*/) {
   static RampPhase phase      = PHASE_CC;
   static unsigned long cvMs   = 0;   // millis() when CV phase was entered
   static uint16_t cvAmpsDa    = 0;   // per-charger amps ceiling during CV
+  static bool prevEnabled     = false; // for rising-edge detection on `enabled`
 
   const unsigned long CV_HOLD_MS = 20UL * 60UL * 1000UL; // 20 min timeout
   const unsigned long CV_MIN_MS  = 120000UL;              // don't terminate CV before 2 min
@@ -2877,9 +2916,16 @@ void rampTask(void* /*pvParameters*/) {
       xSemaphoreGive(controlMutex);
     }
 
+    // Detect rising edge of `enabled` (off → on). Used to decide whether
+    // the user just kicked off a fresh charge session, so we can skip
+    // straight to DONE if the pack is already at/above the target.
+    bool justEnabled = enabled && !prevEnabled;
+    prevEnabled = enabled;
+
     // Disabled: reset to CC, stop charger, skip rest of tick
     if (!enabled) {
       phase = PHASE_CC;
+      g_thermalThrottle = false;
       if (xSemaphoreTake(chargerMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
         chargerBus.cmdVoltDv = 0;
         chargerBus.cmdAmpsDa = 0;
@@ -2914,6 +2960,19 @@ void rampTask(void* /*pvParameters*/) {
 
     uint16_t voltCeiling = min(targetVolt, MAX_CHARGE_VOLTAGE_DV);
     const long hyst = 10; // 1.0 V in dV
+
+    // ── Skip charge if pack is already at or above target ────────────────────
+    // Triggered only on the rising edge of `enabled` so a fresh start with a
+    // pack already above the chosen preset (e.g. preset = 80 %, bike at 81 %)
+    // jumps straight to DONE instead of running CC→CV→DONE through the chargers.
+    // Once in DONE, the existing re-engage logic waits for the pack to sag
+    // below the appropriate floor before starting a new cycle.
+    if (justEnabled && rawPackDv > 0 &&
+        rawPackDv >= (long)voltCeiling) {
+      phase = PHASE_DONE;
+      LOG("[RAMP] Skip charge: pack at %ld dV ≥ ceil %d dV (already at target)\n",
+          rawPackDv, voltCeiling);
+    }
 
     // ── Phase transitions ─────────────────────────────────────────────────────
     // DONE → CC re-engage threshold depends on the user's target voltage:
@@ -2978,6 +3037,12 @@ void rampTask(void* /*pvParameters*/) {
     } else {
       powerLimit = 0; // CV/DONE: ramp CC current display to 0
     }
+
+    // Update thermal-throttle indicator: true only when the hot cutback is
+    // the active limiter in CC phase (drops the requested target below `target`).
+    g_thermalThrottle = (phase == PHASE_CC) &&
+                        (hotPwrW != UINT32_MAX) &&
+                        (hotPwrW <  (uint32_t)target);
     uint16_t effectiveTarget = (uint16_t)min(powerLimit, (uint32_t)UINT16_MAX);
 
     // ── Ramp step ─────────────────────────────────────────────────────────────
@@ -3490,8 +3555,22 @@ static void mqttPublishDiscovery() {
   mqttDiscoverNumber("ramp_rate_wps",   "Ramp Rate",              10, 500, 10, "W");
   mqttDiscoverNumber("target_volt_v",   "Target Voltage",         106.0f, 116.4f, 0.1f, "V");
   mqttDiscoverSwitch("charging_enabled","Charging Enabled");
-  // Button
+  // Buttons — one per voltage preset, generated from TARGET_VOLT_PRESETS so
+  // adding a new preset to that table automatically exposes a new HA button.
+  for (int i = 0; i < TARGET_VOLT_PRESET_COUNT; i++) {
+    char btnName[20], btnFriendly[40];
+    snprintf(btnName,     sizeof(btnName),     "preset_%u",
+             TARGET_VOLT_PRESETS[i].pct);
+    snprintf(btnFriendly, sizeof(btnFriendly), "Set %u %% (%.1f V)",
+             TARGET_VOLT_PRESETS[i].pct,
+             TARGET_VOLT_PRESETS[i].dv / 10.0f);
+    mqttDiscoverButton(btnName, btnFriendly);
+  }
   mqttDiscoverButton("reset_session",   "Reset Charge Session");
+  // Active preset readout (0 if current target voltage doesn't match any preset)
+  mqttDiscoverSensor("target_preset_pct", "Target Preset", "%", "", "");
+  // Thermal-throttle banner state (text "true"/"false")
+  mqttDiscoverSensor("thermal_throttle",  "Thermal Throttling", "", "", "");
 
   LOG("[MQTT] Discovery published\n");
 }
@@ -3560,6 +3639,24 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       }
       preferences.putUShort("target_volt_dv", (uint16_t)tvd);
       LOG("[MQTT] cmd target_volt_v = %.1f V (%d dV)\n", tvV, tvd);
+    }
+
+  } else if (strncmp(cmd, "preset_", 7) == 0) {
+    // preset_70, preset_80, preset_90, preset_100 — set target voltage to the
+    // preset's voltage and persist to NVS (button entities ignore payload).
+    int pct = atoi(cmd + 7);
+    for (int i = 0; i < TARGET_VOLT_PRESET_COUNT; i++) {
+      if (TARGET_VOLT_PRESETS[i].pct == pct) {
+        uint16_t dv = TARGET_VOLT_PRESETS[i].dv;
+        if (xSemaphoreTake(controlMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+          ctrl.targetVoltDv = dv;
+          xSemaphoreGive(controlMutex);
+        }
+        preferences.putUShort("target_volt_dv", dv);
+        LOG("[MQTT] cmd preset_%d → target_volt_v = %.1f V (%u dV)\n",
+            pct, dv / 10.0f, dv);
+        break;
+      }
     }
 
   } else if (strcmp(cmd, "reset_session") == 0) {
@@ -3660,10 +3757,35 @@ static bool mqttPublishChanges() {
   PUB_IF_CHANGED_I(rampStepW,     "ramp_rate_wps",   ks.rampStepW)
   PUB_IF_CHANGED_F(targetVoltDv,  "target_volt_v",   ks.targetVoltDv / 10.0f, 1)
 
+  // Active preset percentage (0 if current target voltage doesn't match a preset)
+  uint8_t presetPct = 0;
+  for (int i = 0; i < TARGET_VOLT_PRESET_COUNT; i++) {
+    if (TARGET_VOLT_PRESETS[i].dv == ks.targetVoltDv) {
+      presetPct = TARGET_VOLT_PRESETS[i].pct;
+      break;
+    }
+  }
+  if (presetPct != mqttLast.targetPresetPct) {
+    char tmp[6];
+    snprintf(tmp, sizeof(tmp), "%u", presetPct);
+    mqttPublishSensor("target_preset_pct", tmp);
+    mqttLast.targetPresetPct = presetPct;
+    published = true;
+  }
+
   if (mqttLast.enabledForced || ks.enabled != mqttLast.enabled) {
     mqttPublishSensor("charging_enabled", ks.enabled ? "true" : "false");
     mqttLast.enabled       = ks.enabled;
     mqttLast.enabledForced = false;
+    published = true;
+  }
+
+  // Thermal throttling state — published as "true"/"false" string for HA
+  bool thermal = g_thermalThrottle;
+  if (mqttLast.thermalThrottleForced || thermal != mqttLast.thermalThrottle) {
+    mqttPublishSensor("thermal_throttle", thermal ? "true" : "false");
+    mqttLast.thermalThrottle       = thermal;
+    mqttLast.thermalThrottleForced = false;
     published = true;
   }
 

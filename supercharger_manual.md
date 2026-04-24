@@ -143,9 +143,16 @@ The dashboard auto refreshes every 2 seconds.
 
 ### Battery Sections
 
-**Monolith Pack** shows voltage, current, capacity, temperature, and max C rate. Always visible.
+**Monolith Pack** shows voltage, current, capacity, state of charge, and temperature. Always visible.
 
 **PowerTank Pack** shows the same if a PowerTank is present. It's auto detected within 10 seconds of the first bike CAN frame. If it doesn't show up in that window, the section stays hidden.
+
+### Status Banners
+
+A coloured banner across the top of the dashboard tells you when something needs your attention:
+
+- **Red — "No WiFi"**: the controller can't reach your home WiFi and is running its own AP. Reach the dashboard via `http://<ap-ip>` or `http://supercharger.local`. Reconnects automatically when home WiFi comes back.
+- **Orange — "Thermal throttling"**: the pack temperature has crossed the hot-cutback threshold and the controller is reducing charging power to keep the cells safe. Charging continues, just slower. The banner clears on its own when the pack cools below the threshold.
 
 ### Chargers
 
@@ -220,6 +227,8 @@ Screenshot from my HomeAssistant Power monitor. This monitor is in front of my 2
 - **DONE → CC** the threshold depends on the preset you've chosen:
   - **70 % or 80 %**: pack must drop more than **2 V** below the target before a new cycle starts. Frequent small top-offs are fine in this gentle SoC range.
   - **90 %, 100 %**, or any custom target above 110.0 V: the controller waits for the pack to sag all the way down to the **80 % level (110.0 V)** before re-engaging. The cycle is wider (more voltage sag per top-off), but the pack spends far less time hovering near full charge — which is what actually wears Li-ion cells. The trade-off is deliberate: at 100 %, you'll see the pack discharge from 116.4 V down to 110.0 V before the chargers kick back in.
+
+**Already at target when you start**: if you turn charging on and the pack is already at or above the chosen preset's voltage (e.g. you set 80 % but the bike is at 81 %), the controller skips CC and CV entirely and goes straight to **DONE** without ever sending a start command to the chargers. You'll see DONE on the dashboard within one tick. The same DONE → CC re-engage rules above then decide when (if ever) to start a new cycle. No wasted brief charge bursts at the top of the SoC range.
 
 **Practical implication of the % presets**: choosing 70 % doesn't just mean "stop earlier" — it also means a much shorter CV phase (or none at all if the ceiling is below where the pack would naturally taper). That's why low presets feel quick: the bulk of cell stress in a Li-ion charge is during CV at high voltage, and you're skipping most of it.
 
@@ -356,13 +365,45 @@ If the update fails mid way, the old firmware is kept. You won't brick the contr
 
 ## Home Assistant Integration
 
-With MQTT credentials set, the controller auto publishes HA discovery topics under `homeassistant/` whenever it connects. A "Supercharger" device shows up in your HA integrations with:
+With MQTT credentials set, the controller auto publishes HA discovery topics under `homeassistant/` whenever it connects. A **Supercharger** device shows up in your HA integrations with the following entities (all auto-created — no YAML required):
 
-**Sensors** (read only): pack voltages, currents, temperatures, Ah, C rate, charging power, target power, charger count, heartbeat status.
+### Sensors (read only)
 
-**Controls** (read / write): target power (0 to 13200 W), charging on / off switch.
+| Entity | Unit | What it is |
+| --- | --- | --- |
+| `monolith_v` / `monolith_a` | V / A | Monolith pack voltage and current |
+| `monolith_tmin` / `monolith_tmax` | °C | Monolith pack min/max cell temperature |
+| `monolith_soc` | % | Calculated state of charge (from voltage curve) |
+| `powertank_v` / `powertank_a` | V / A | PowerTank pack voltage and current (only published while a PowerTank is detected) |
+| `powertank_tmin` / `powertank_tmax` | °C | PowerTank min/max cell temperature |
+| `current_power_w` | W | Actual charging power right now |
+| `session_wh` / `session_ah` | Wh / Ah | Energy and charge delivered since the last session reset |
+| `target_preset_pct` | % | Active preset percentage (`70`, `80`, `90`, `100`, or `0` if a non-preset custom voltage is set) |
+| `thermal_throttle` | — | `"true"` while the hot-cutback is reducing charging power, `"false"` otherwise. Use as a binary template sensor for HA notifications |
 
-Device base topic: `supercharger/<hostname>/`. Hostname is whatever the ESP32 assigns by default.
+### Controls (read / write)
+
+| Entity | Type | Range / behavior |
+| --- | --- | --- |
+| `charging_enabled` | switch | On/off master switch (same as the dashboard ON/OFF button) |
+| `target_power_w` | number | Target charging power in watts (0 – 13200) |
+| `target_volt_v` | number | Target pack voltage in volts (106.0 – 116.4, 0.1 V steps) — for fine-grained control outside the four presets |
+| `charger_count` | number | How many chargers the controller should expect (1 – 4) |
+| `ramp_rate_wps` | number | Power ramp rate in W per second (10 – 500) |
+
+### Buttons
+
+| Entity | What it does |
+| --- | --- |
+| `preset_70` | Set target voltage to the **70 %** preset (106.0 V) |
+| `preset_80` | Set target voltage to the **80 %** preset (110.0 V) |
+| `preset_90` | Set target voltage to the **90 %** preset (113.2 V) |
+| `preset_100` | Set target voltage to the **100 %** preset (116.4 V) |
+| `reset_session` | Zero the session Wh and Ah counters |
+
+The preset buttons mirror the four buttons on the web dashboard — tap one and the active preset is persisted to NVS, so it survives reboots and OTA updates. `target_preset_pct` updates within ~1 s of the press so you can pin it to a Lovelace card to confirm the new setting.
+
+Device base topic: `supercharger/<hostname>/`. Hostname is the mDNS name (`supercharger` by default).
 
 ---
 
@@ -407,6 +448,8 @@ Each attempt has a 15 second timeout before falling through.
 
 **If both fail (or STA drops at runtime):** the controller switches to **AP+STA** mode. The SoftAP comes up immediately so the dashboard stays reachable on the local hotspot, while the STA continues retrying the saved/secret credentials in the background. The Arduino-ESP32 driver auto-reconnects on its own; the firmware also nudges it every 30 s as a safety net.
 
+**AP teardown:** once the STA reconnects and stays up for **90 s continuously**, the controller drops the SoftAP and returns to STA-only (`STATE_CONNECTED`). The "No WiFi" banner clears at that point. If the STA drops again inside the 90 s grace window, the timer resets and the AP keeps serving until the next stable window. This prevents the AP from staying broadcast forever after a brief outage, while still giving you a window to finish whatever you were doing on the hotspot.
+
 **If no STA credentials exist anywhere** (fresh unit, no NVS, blank `SECRET_MQTT_SSID`): the controller goes straight to AP-only setup mode. There's nothing to retry until you provide credentials via the setup page.
 
 **Worst-case time to a usable AP:** about 30 seconds on first boot (prefs fail → secrets fail → AP+STA comes up). Subsequent retries happen in the background without blocking the dashboard.
@@ -417,7 +460,7 @@ Each attempt has a 15 second timeout before falling through.
 | --- | --- | --- | --- |
 | `STATE_CONNECTING` | trying | off | Initial boot, attempting STA |
 | `STATE_CONNECTED` | up | off | STA succeeded, no fallback needed |
-| `STATE_AP_RETRYING` | retrying / up | up | STA failed or dropped; AP visible, STA reconnects in background |
+| `STATE_AP_RETRYING` | retrying / up | up | STA failed or dropped; AP visible, STA reconnects in background. AP is torn down automatically after STA has been continuously up for 90 s, returning to `STATE_CONNECTED` |
 | `STATE_SETUP_MODE` | n/a | up | No credentials anywhere; waiting for user provisioning |
 
 ### CAN Buses
