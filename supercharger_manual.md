@@ -143,7 +143,7 @@ The dashboard auto refreshes every 2 seconds.
 
 ### Battery Sections
 
-**Monolith Pack** shows voltage, current, capacity, state of charge, and temperature. Always visible. The State of Charge value is read straight from the BMS (CAN frame `0x188` byte 0) — the same coulomb-counted number the bike's own dashboard uses, so the two should agree closely. If the BMS hasn't broadcast a status frame yet (typically the first few seconds after the bike wakes), the card falls back to a voltage-curve estimate and is labelled `(est.)` until the BMS catches up.
+**Monolith Pack** shows voltage, current, capacity, state of charge, and temperature. Always visible. The State of Charge value is read straight from the BMS (CAN frame `0x188` byte 0) — the same coulomb-counted number the bike's own dashboard uses, so the two should agree closely. If the BMS hasn't broadcast a status frame yet (typically the first few seconds after the bike wakes), the card falls back to a voltage-curve estimate and is labelled `(est.)` until the BMS catches up. The Capacity card shows `available / total Ah` — the available number is the nominal pack AH multiplied by the current SoC, so it tracks how much charge is actually left in the pack right now (e.g. `57.0 / 114 Ah` at 50%) rather than just printing the constant nameplate value.
 
 **PowerTank Pack** shows the same if a PowerTank is present. It's auto detected within 10 seconds of the first bike CAN frame. If it doesn't show up in that window, the section stays hidden.
 
@@ -378,6 +378,7 @@ With MQTT credentials set, the controller auto publishes HA discovery topics und
 | `monolith_v` / `monolith_a` | V / A | Monolith pack voltage and current |
 | `monolith_tmin` / `monolith_tmax` | °C | Monolith pack min/max cell temperature |
 | `monolith_soc` | % | State of charge. Reads directly from the BMS (`0x188` byte 0) once the first status frame arrives — same value as the bike's own dashboard. Falls back to a voltage-curve estimate during the first few seconds after wake-up before any 0x188 has been seen |
+| `monolith_ah_avail` | Ah | Available capacity right now: nominal pack AH × current SoC. Tracks "how much charge is actually in the pack" rather than the constant nameplate value. Republishes when it changes by ≥0.5 Ah |
 | `powertank_v` / `powertank_a` | V / A | PowerTank pack voltage and current (only published while a PowerTank is detected) |
 | `powertank_tmin` / `powertank_tmax` | °C | PowerTank min/max cell temperature |
 | `current_power_w` | W | Actual charging power right now |

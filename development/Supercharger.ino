@@ -38,7 +38,7 @@
 //   driver/twai.h    } built into Espressif ESP32 Arduino core - no install needed
 // ==========================================================================
 
-#define VERSION 202604251330
+#define VERSION 202604251205
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -453,6 +453,7 @@ struct MqttSnapshot {
   uint8_t  targetPresetPct   = 255;     // 255 = sentinel, forces first publish
   uint8_t  rampPhase         = 255;     // 255 = sentinel, forces first publish
   int16_t  etaMinutes        = -2;      // -2 = sentinel (firmware uses -1 for "unknown"); forces first publish
+  float    monolithAhAvail   = -1.0f;   // forces first publish
 } mqttLast;
 
 static WiFiClient   mqttWifiClient;
@@ -784,7 +785,7 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
       <span class="val" id="mV">—</span></div>
     <div class="card"><div class="label">Current</div>
       <span class="val" id="mA">—</span></div>
-    <div class="card"><div class="label">Capacity</div>
+    <div class="card"><div class="label">Capacity <span style="font-size:0.7em;color:#888;font-weight:normal">avail / total</span></div>
       <span class="val" id="mAH">—</span></div>
     <div class="card soc-card"><div class="label">State of Charge <span id="mSOCSrc" style="font-size:0.7em;color:#888;font-weight:normal"></span></div>
       <span class="val" id="mSOC">—</span>
@@ -800,7 +801,7 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
         <span class="val" id="pV">—</span></div>
       <div class="card"><div class="label">Current</div>
         <span class="val" id="pA">—</span></div>
-      <div class="card"><div class="label">Capacity</div>
+      <div class="card"><div class="label">Capacity <span style="font-size:0.7em;color:#888;font-weight:normal">avail / total</span></div>
         <span class="val" id="pAH">—</span></div>
       <div class="card"><div class="label">Temp Min / Max</div>
         <span class="val" id="pT">—</span></div>
@@ -1106,7 +1107,13 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
 
           document.getElementById('mV').textContent  = fmt(d.monolith_v,  1) + ' V';
           document.getElementById('mA').textContent  = d.monolith_a + ' A';
-          document.getElementById('mAH').textContent = d.monolith_ah + ' Ah';
+          // Capacity card: shows "available / total Ah" so the user sees both
+          // how much is actually left in the pack right now (avail = total × SoC)
+          // and the BMS's nominal capacity constant.
+          var mAvail = (d.monolith_ah_avail !== undefined) ? d.monolith_ah_avail : null;
+          document.getElementById('mAH').textContent = (mAvail !== null)
+            ? (fmt(mAvail, 1) + ' / ' + d.monolith_ah + ' Ah')
+            : (d.monolith_ah + ' Ah');
           document.getElementById('mT').textContent  = fmt(d.monolith_tmin, 0)
                                                + ' / ' + fmt(d.monolith_tmax, 0) + ' \u00B0C';
 
@@ -1152,7 +1159,10 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
             ptSec.style.display = 'block';
             document.getElementById('pV').textContent  = fmt(d.powertank_v,  1) + ' V';
             document.getElementById('pA').textContent  = d.powertank_a + ' A';
-            document.getElementById('pAH').textContent = d.powertank_ah + ' Ah';
+            var pAvail = (d.powertank_ah_avail !== undefined) ? d.powertank_ah_avail : null;
+            document.getElementById('pAH').textContent = (pAvail !== null)
+              ? (fmt(pAvail, 1) + ' / ' + d.powertank_ah + ' Ah')
+              : (d.powertank_ah + ' Ah');
             document.getElementById('pT').textContent  = fmt(d.powertank_tmin, 0)
                                                  + ' / ' + fmt(d.powertank_tmax, 0) + ' \u00B0C';
           } else if (d.powertank_decided && !d.powertank_present) {
@@ -1752,6 +1762,22 @@ void handleApiStatus() {
                                     : calcSocFromVoltage(liveSnap.monolithVoltageDv);
   const char* monolithSocSource = (liveSnap.monolithBmsSoc <= 100) ? "bms" : "voltage";
 
+  // Available Ah: how much capacity is actually left in the pack right now.
+  // Nominal pack-AH (114 on the monolith) × current SoC %. Updates in lockstep
+  // with the SoC card; gives the user a "real Ah remaining" feel-good number.
+  float monolithAhAvail = (liveSnap.monolithAH > 0)
+                            ? (float)liveSnap.monolithAH * monolithSoc / 100.0f
+                            : 0.0f;
+
+  // Same for the optional PowerTank pack — uses the BMS1 SoC if available,
+  // otherwise the voltage estimate from the secondary pack voltage.
+  int   powerTankSoc      = (liveSnap.powerTankBmsSoc <= 100)
+                              ? (int)liveSnap.powerTankBmsSoc
+                              : calcSocFromVoltage(liveSnap.powerTankVoltageDv);
+  float powerTankAhAvail  = (liveSnap.powerTankAH > 0)
+                              ? (float)liveSnap.powerTankAH * powerTankSoc / 100.0f
+                              : 0.0f;
+
   // Snapshot session data
   float sessWh = session.energyWh;
   float sessAh = session.chargeAh;
@@ -1765,6 +1791,7 @@ void handleApiStatus() {
       "\"monolith_v\":%.1f,"
       "\"monolith_a\":%.0f,"
       "\"monolith_ah\":%.0f,"
+      "\"monolith_ah_avail\":%.1f,"
       "\"monolith_tmin\":%d,"
       "\"monolith_tmax\":%d,"
       "\"monolith_crate\":%.3f,"
@@ -1775,6 +1802,7 @@ void handleApiStatus() {
       "\"powertank_v\":%.1f,"
       "\"powertank_a\":%.0f,"
       "\"powertank_ah\":%.0f,"
+      "\"powertank_ah_avail\":%.1f,"
       "\"powertank_tmin\":%d,"
       "\"powertank_tmax\":%d,"
       "\"powertank_crate\":%.3f,"
@@ -1802,6 +1830,7 @@ void handleApiStatus() {
     liveSnap.monolithVoltageDv  / 10.0f,
     (float)liveSnap.monolithAmps,
     (float)liveSnap.monolithAH,
+    monolithAhAvail,
     (int)liveSnap.monolithMinTemp,
     (int)liveSnap.monolithMaxTemp,
     liveSnap.monolithMaxCRate   / 10.0f,
@@ -1812,6 +1841,7 @@ void handleApiStatus() {
     liveSnap.powerTankVoltageDv / 10.0f,
     (float)liveSnap.powerTankAmps,
     (float)liveSnap.powerTankAH,
+    powerTankAhAvail,
     (int)liveSnap.powerTankMinTemp,
     (int)liveSnap.powerTankMaxTemp,
     liveSnap.powerTankMaxCRate  / 10.0f,
@@ -3680,6 +3710,9 @@ static void mqttPublishDiscovery() {
   mqttDiscoverSensor("monolith_tmin",   "Monolith Temp Min",      "\xB0""C",  "temperature", "measurement");
   mqttDiscoverSensor("monolith_tmax",   "Monolith Temp Max",      "\xB0""C",  "temperature", "measurement");
   mqttDiscoverSensor("monolith_soc",    "Monolith State of Charge", "%",      "battery",     "measurement");
+  // Available pack capacity right now: nominal AH × SoC. Tracks "how much is
+  // actually left in the pack" rather than the constant nominal value.
+  mqttDiscoverSensor("monolith_ah_avail","Monolith Capacity Available","Ah",   "",            "measurement");
   mqttDiscoverSensor("powertank_v",     "PowerTank Voltage",      "V",        "voltage",     "measurement");
   mqttDiscoverSensor("powertank_a",     "PowerTank Current",      "A",        "current",     "measurement");
   mqttDiscoverSensor("powertank_tmin",  "PowerTank Temp Min",     "\xB0""C",  "temperature", "measurement");
@@ -3886,9 +3919,17 @@ static bool mqttPublishChanges() {
   // Prefer the BMS-reported SoC (0x188 byte 0) — same source as the bike's
   // dashboard. Fall back to the voltage-curve estimate only until the first
   // 0x188 frame arrives.
-  PUB_IF_CHANGED_I(monolithSoc,       "monolith_soc",
-    (ls.monolithBmsSoc <= 100) ? (int)ls.monolithBmsSoc
-                               : calcSocFromVoltage(ls.monolithVoltageDv))
+  int curSoc = (ls.monolithBmsSoc <= 100) ? (int)ls.monolithBmsSoc
+                                          : calcSocFromVoltage(ls.monolithVoltageDv);
+  PUB_IF_CHANGED_I(monolithSoc,       "monolith_soc",  curSoc)
+  // Available capacity right now (nominal AH × SoC). Republish only on
+  // ≥ 0.5 Ah change so HA isn't spammed every tick during charging.
+  float curAhAvail = (ls.monolithAH > 0) ? (float)ls.monolithAH * curSoc / 100.0f : 0.0f;
+  if (fabsf(curAhAvail - mqttLast.monolithAhAvail) >= 0.5f) {
+    mqttPublishSensorF("monolith_ah_avail", curAhAvail, 1);
+    mqttLast.monolithAhAvail = curAhAvail;
+    published = true;
+  }
 
   // PowerTank pack (only publish while present or during the cycle it disappears)
   if (ls.powerTankPresent || mqttLast.powerTankPresent) {
