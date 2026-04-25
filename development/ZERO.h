@@ -37,6 +37,19 @@ class Zero {
     byte hasMonolithPackActiveData(short &canId);
     byte hasPowerTankPackActiveData(short &canId);
 
+    // BMS_PACK_STATUS (0x188 / 0x189) carries the BMS's own SoC % at byte 0.
+    // Decoded byte layout (verified against the EMF-thread reverse engineering):
+    //   byte 0: SoC %, uint8 (0..100)
+    //   byte 1: always 0
+    //   byte 2: 66 = riding / 3 = charging
+    //   byte 3-4: charge cycles, uint16 LE
+    //   byte 5: cell-balance flags
+    //   byte 6: always 0
+    //   byte 7: brick count (?)
+    byte hasPackStatus(short &canId);
+    byte hasMonolithPackStatus(short &canId);
+    byte hasPowerTankPackStatus(short &canId);
+
     byte hasThrottle(short &canId);
 
     long voltage(byte &len,byte buf[]);
@@ -52,6 +65,9 @@ class Zero {
 
     short highestTemp(byte &len,byte buf[]);
     short lowestTemp(byte &len,byte buf[]);
+
+    // BMS-reported state of charge as a 0..100 percentage (255 = bad/unknown frame)
+    byte stateOfCharge(byte &len,byte buf[]);
 
     void logInit();
     void logRaw(byte &len,byte buf[],short &canId);

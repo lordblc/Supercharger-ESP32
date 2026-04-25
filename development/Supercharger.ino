@@ -38,7 +38,7 @@
 //   driver/twai.h    } built into Espressif ESP32 Arduino core - no install needed
 // ==========================================================================
 
-#define VERSION 202604251104
+#define VERSION 202604251330
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -195,6 +195,9 @@ struct LiveData {
   short monolithMinTemp     = 0;
   short monolithMaxTemp     = 0;
   short monolithMaxCRate    = 0;
+  // BMS-reported SoC % from BMS_PACK_STATUS (0x188 byte 0). 255 = no frame
+  // received yet; falls back to voltage-curve estimate in that case.
+  byte  monolithBmsSoc      = 255;
 
   // PowerTank (BMS1)
   long  powerTankVoltageDv  = 0;
@@ -204,6 +207,7 @@ struct LiveData {
   short powerTankMinTemp    = 0;
   short powerTankMaxTemp    = 0;
   short powerTankMaxCRate   = 0;
+  byte  powerTankBmsSoc     = 255;  // BMS1_PACK_STATUS (0x189 byte 0)
 
   // Presence / freshness flags
   bool  dataFresh           = false; // true once first BMS0 frame received
@@ -782,7 +786,7 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
       <span class="val" id="mA">—</span></div>
     <div class="card"><div class="label">Capacity</div>
       <span class="val" id="mAH">—</span></div>
-    <div class="card soc-card"><div class="label">State of Charge</div>
+    <div class="card soc-card"><div class="label">State of Charge <span id="mSOCSrc" style="font-size:0.7em;color:#888;font-weight:normal"></span></div>
       <span class="val" id="mSOC">—</span>
       <div class="soc-bar-wrap"><div class="soc-bar" id="mSOCBar"></div></div></div>
     <div class="card"><div class="label">Temp Min / Max</div>
@@ -1115,6 +1119,11 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
             socBar.style.width = soc + '%';
             socBar.style.background = socColour(soc);
           }
+          // SOC source label: blank when reading the BMS (the truth — same number
+          // the bike's dashboard uses), "(est.)" while we're still falling back
+          // to the voltage-curve estimate.
+          var srcEl = document.getElementById('mSOCSrc');
+          if (srcEl) srcEl.textContent = (d.monolith_soc_source === 'voltage') ? '(est.)' : '';
 
           // Session data
           document.getElementById('sessWh').textContent   = fmt(d.session_wh, 1);
@@ -1733,8 +1742,15 @@ void handleApiStatus() {
     xSemaphoreGive(sysStatsMutex);
   }
 
-  // Calculate SOC from monolith voltage
-  int monolithSoc = calcSocFromVoltage(liveSnap.monolithVoltageDv);
+  // State of charge: prefer the BMS's own value (BMS_PACK_STATUS 0x188 byte 0)
+  // because it's coulomb-counted inside the BMS — same number the bike's
+  // dashboard derives from. Fall back to a voltage-curve estimate until the
+  // first 0x188 frame arrives. soc_source is exposed in the JSON so the
+  // dashboard / HA can show whether we're reading the truth or the estimate.
+  int         monolithSoc       = (liveSnap.monolithBmsSoc <= 100)
+                                    ? (int)liveSnap.monolithBmsSoc
+                                    : calcSocFromVoltage(liveSnap.monolithVoltageDv);
+  const char* monolithSocSource = (liveSnap.monolithBmsSoc <= 100) ? "bms" : "voltage";
 
   // Snapshot session data
   float sessWh = session.energyWh;
@@ -1753,6 +1769,7 @@ void handleApiStatus() {
       "\"monolith_tmax\":%d,"
       "\"monolith_crate\":%.3f,"
       "\"monolith_soc\":%d,"
+      "\"monolith_soc_source\":\"%s\","
       "\"powertank_present\":%s,"
       "\"powertank_decided\":%s,"
       "\"powertank_v\":%.1f,"
@@ -1789,6 +1806,7 @@ void handleApiStatus() {
     (int)liveSnap.monolithMaxTemp,
     liveSnap.monolithMaxCRate   / 10.0f,
     monolithSoc,
+    monolithSocSource,
     liveSnap.powerTankPresent  ? "true" : "false",
     liveSnap.powerTankDecided  ? "true" : "false",
     liveSnap.powerTankVoltageDv / 10.0f,
@@ -2462,6 +2480,7 @@ void processBikeFrame(const twai_message_t &msg) {
     static unsigned long lastLog388  = 0, lastLog288  = 0, lastLog488  = 0, lastLog508  = 0;
     static unsigned long lastLog389  = 0, lastLog289  = 0, lastLog489  = 0, lastLog509  = 0;
     static unsigned long lastLog308  = 0;
+    static unsigned long lastLog188  = 0, lastLog189  = 0;
     unsigned long* slot = nullptr;
     const char*    name = nullptr;
 
@@ -2469,10 +2488,12 @@ void processBikeFrame(const twai_message_t &msg) {
     else if (id == 0x288) { slot = &lastLog288; name = "BMS_PACK_CONFIG   (0x288)"; }
     else if (id == 0x488) { slot = &lastLog488; name = "BMS_PACK_TEMP_DATA(0x488)"; }
     else if (id == 0x508) { slot = &lastLog508; name = "BMS_PACK_TIME     (0x508)"; }
+    else if (id == 0x188) { slot = &lastLog188; name = "BMS_PACK_STATUS   (0x188)"; }
     else if (id == 0x389) { slot = &lastLog389; name = "BMS1_CELL_VOLTAGE (0x389)"; }
     else if (id == 0x289) { slot = &lastLog289; name = "BMS1_PACK_CONFIG  (0x289)"; }
     else if (id == 0x489) { slot = &lastLog489; name = "BMS1_PACK_TEMP    (0x489)"; }
     else if (id == 0x509) { slot = &lastLog509; name = "BMS1_PACK_TIME    (0x509)"; }
+    else if (id == 0x189) { slot = &lastLog189; name = "BMS1_PACK_STATUS  (0x189)"; }
     else if (id == BMS_PACK_STATS.id)    { slot = &lastLog308; name = "BMS_PACK_STATS"; }
 
     unsigned long nowMs = millis();
@@ -2522,6 +2543,14 @@ void processBikeFrame(const twai_message_t &msg) {
     // BMS_PACK_TIME (0x508) — C-rate assumed bytes 4-5; verify via raw log
     live.monolithMaxCRate = zeroDecoder.maxCRate(len, buf);
   }
+  else if (zeroDecoder.hasMonolithPackStatus(id)) {
+    // BMS_PACK_STATUS (0x188): byte 0 is the BMS-reported State of Charge in
+    // percent (0..100).  Mirrors what the BMS hands the MBB before the MBB
+    // applies its own dashboard filter.  Reverse-engineered from EMF thread
+    // 8799 (https://www.electricmotorcycleforum.com/boards/index.php?topic=8799.0).
+    byte soc = zeroDecoder.stateOfCharge(len, buf);
+    if (soc != 255) live.monolithBmsSoc = soc;  // 255 = bad/short frame, keep last good
+  }
   // 0x488 (BMS_PACK_TEMP_DATA) intentionally NOT decoded for temps — see note above.
 
   // --- PowerTank (BMS1) ---
@@ -2549,6 +2578,11 @@ void processBikeFrame(const twai_message_t &msg) {
   else if (zeroDecoder.hasPowerTankMaxCRate(id)) {
     // BMS1_PACK_TIME (0x509) — C-rate assumed bytes 4-5; verify via raw log
     live.powerTankMaxCRate = zeroDecoder.maxCRate(len, buf);
+  }
+  else if (zeroDecoder.hasPowerTankPackStatus(id)) {
+    // BMS1_PACK_STATUS (0x189): same byte-0 SoC layout as the monolith 0x188.
+    byte soc = zeroDecoder.stateOfCharge(len, buf);
+    if (soc != 255) live.powerTankBmsSoc = soc;
   }
   // 0x489 (BMS1_PACK_TEMP_DATA) intentionally NOT decoded for temps — see 0x408 note.
 
@@ -3196,8 +3230,20 @@ void rampTask(void* /*pvParameters*/) {
     int16_t etaOut = -1;
 
     if (phase == PHASE_CC) {
+      // Target SoC is voltage-derived (user picks a voltage preset). Current
+      // SoC: prefer the BMS's coulomb-counted value; fall back to the voltage
+      // curve only until the first 0x188 frame arrives.
+      byte bmsSoc;
+      if (xSemaphoreTake(liveMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        bmsSoc = live.monolithBmsSoc;
+        xSemaphoreGive(liveMutex);
+      } else {
+        bmsSoc = 255;
+      }
       int   targetSoc = calcSocFromVoltage((long)voltCeiling);
-      int   nowSoc    = (rawPackDv > 0) ? calcSocFromVoltage(rawPackDv) : 0;
+      int   nowSoc    = (bmsSoc <= 100)        ? (int)bmsSoc
+                       : (rawPackDv > 0)       ? calcSocFromVoltage(rawPackDv)
+                                               : 0;
       float ahNeeded  = (float)(targetSoc - nowSoc) / 100.0f * (float)monolithAH;
       // Use the actual delivered current if we have it, else fall back to the
       // commanded total (cmdAmpsDa is per-charger × 10).
@@ -3837,7 +3883,12 @@ static bool mqttPublishChanges() {
   PUB_IF_CHANGED_I(monolithAmps,      "monolith_a",    ls.monolithAmps)
   PUB_IF_CHANGED_I(monolithMinTemp,   "monolith_tmin", ls.monolithMinTemp)
   PUB_IF_CHANGED_I(monolithMaxTemp,   "monolith_tmax", ls.monolithMaxTemp)
-  PUB_IF_CHANGED_I(monolithSoc,       "monolith_soc",  calcSocFromVoltage(ls.monolithVoltageDv))
+  // Prefer the BMS-reported SoC (0x188 byte 0) — same source as the bike's
+  // dashboard. Fall back to the voltage-curve estimate only until the first
+  // 0x188 frame arrives.
+  PUB_IF_CHANGED_I(monolithSoc,       "monolith_soc",
+    (ls.monolithBmsSoc <= 100) ? (int)ls.monolithBmsSoc
+                               : calcSocFromVoltage(ls.monolithVoltageDv))
 
   // PowerTank pack (only publish while present or during the cycle it disappears)
   if (ls.powerTankPresent || mqttLast.powerTankPresent) {

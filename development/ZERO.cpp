@@ -188,6 +188,37 @@ byte Zero::hasThrottle(short &canId){
     return 0;
 }
 
+// BMS_PACK_STATUS (0x188 / 0x189) — SoC % at byte 0 (uint8 0..100).
+// See ZERO.h for the full byte layout.  The matching frame from the
+// secondary "PowerTank" pack uses ID 0x189.
+byte Zero::hasPackStatus(short &canId){
+  if(canId == BMS_PACK_STATUS.id
+    || canId == BMS1_PACK_STATUS.id ) {
+
+      return 1;
+
+  }
+    return 0;
+}
+
+byte Zero::hasMonolithPackStatus(short &canId){
+  if(canId == BMS_PACK_STATUS.id) {
+
+      return 1;
+
+  }
+    return 0;
+}
+
+byte Zero::hasPowerTankPackStatus(short &canId){
+  if(canId == BMS1_PACK_STATUS.id) {
+
+      return 1;
+
+  }
+    return 0;
+}
+
 short Zero::throttle(byte &len,byte buf[ZERO_MESSAGE_LENGTH]){
   ByteToShort throttleVoltage;
 
@@ -285,6 +316,17 @@ short Zero::lowestTemp(byte &len, byte buf[ZERO_MESSAGE_LENGTH]) {
   if (len < 3) return 0;
   if ((uint8_t)buf[2] == 0x7F) return 0;   // disconnected sensor
   return (short)(int8_t)buf[2];
+}
+
+// Pull the BMS-reported State of Charge out of a BMS_PACK_STATUS (0x188 / 0x189)
+// frame.  Byte 0 is the SoC as a uint8 percent (0..100).  Returns 255 as a
+// "bad / unknown frame" sentinel so callers can distinguish "no data yet"
+// from a real 0 % reading on a fully-discharged pack.
+byte Zero::stateOfCharge(byte &len, byte buf[ZERO_MESSAGE_LENGTH]) {
+  if (len < 1) return 255;
+  uint8_t soc = (uint8_t)buf[0];
+  if (soc > 100) return 255;
+  return (byte)soc;
 }
 
 void Zero::logInit(){
