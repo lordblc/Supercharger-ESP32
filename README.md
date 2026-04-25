@@ -23,32 +23,27 @@ The controller sits between the bike's CAN bus and the charger's CAN bus and man
 
 Hardware
 
-LilyGo T-2CAN (ESP32-S3) (https://lilygo.cc/products/t-2can)
-
-Charger CAN bus: MCP2515 via SPI at 250 kbps
-
-Bike CAN bus: ESP32-S3 native TWAI peripheral at 500 kbps
-
-Tested with Elcon TC HK-J 3300W chargers; multiple units can run in parallel
+* LilyGo T-2CAN (ESP32-S3) (https://lilygo.cc/products/t-2can)
+* Charger CAN bus: MCP2515 via SPI at 250 kbps
+* Bike CAN bus: ESP32-S3 native TWAI peripheral at 500 kbps
+' Tested with Elcon TC HK-J 3300W chargers; multiple units can run in parallel
 
 Bike CAN Bus Interface
 
 The firmware decodes the following from the Zero CAN bus:
 
-Pack voltage from both the Monolith (BMS 0x388) and PowerTank (BMS1 0x389)
-Pack current from both BMS units (0x408 / 0x409)
-Min and max battery temperatures from both BMS units (0x488 / 0x489), with a range filter to reject the non-thermocouple bytes that the Zero BMS puts in the same CAN frame
-Rated pack capacity in Ah from BMS pack config (0x288 / 0x289)
+* Pack voltage from both the Monolith (BMS 0x388) and PowerTank (BMS1 0x389)
+* Pack current from both BMS units (0x408 / 0x409)
+* Min and max battery temperatures from both BMS units (0x488 / 0x489), with a range filter to reject the non-thermocouple bytes that the Zero BMS puts in the same CAN frame
+* Rated pack capacity in Ah from BMS pack config (0x288 / 0x289)
 
 Charge Control
 
 The charger is commanded over CAN with a target voltage ceiling and a current limit. The firmware implements a three-phase state machine:
 
-CC / Bulk: Constant current up to the configured power limit. Current ramps up gradually from zero at a configurable rate in W/s. Charge power is reduced as the pack voltage approaches the target through a lookup table (see below).
-
-CV / Absorption: Once the pack voltage reaches the target, the firmware holds the voltage ceiling and monitors actual charger output current. The charger self-regulates in this region.
-
-Float / Complete: CV phase ends when actual charger current drops below 2 A (after a minimum 2-minute settle period) or after a 20-minute timeout, whichever comes first. The charger is then stopped and the session is marked complete.
+* CC / Bulk: Constant current up to the configured power limit. Current ramps up gradually from zero at a configurable rate in W/s. Charge power is reduced as the pack voltage approaches the target through a lookup table (see below).
+* CV / Absorption: Once the pack voltage reaches the target, the firmware holds the voltage ceiling and monitors actual charger output current. The charger self-regulates in this region.
+* Float / Complete: CV phase ends when actual charger current drops below 2 A (after a minimum 2-minute settle period) or after a 20-minute timeout, whichever comes first. The charger is then stopped and the session is marked complete.
 
 The charger voltage ceiling is always set to the configured target, not the present pack voltage. This is important — setting it to the present pack voltage would leave the charger with no headroom and it would not regulate correctly.
 
@@ -56,16 +51,15 @@ Protection and Cutback
 
 Three lookup tables apply independent power cutbacks. All three are evaluated every cycle and the most restrictive limit wins:
 
-Voltage cutback: Reduces charge current progressively as the pack voltage approaches the target. The curve is intentionally aggressive toward the top end to avoid voltage overshoot. Thresholds are in decivolts of lifted (under-charge) pack voltage.
-
-Cold temperature cutback: Reduces charge rate based on the lowest thermocouple reading across both BMS units. Keeps the cells within safe charge rates when cold.
-Hot temperature cutback: Reduces and ultimately stops charging based on the highest thermocouple reading. Charging is stopped completely above 75 C.
+* Voltage cutback: Reduces charge current progressively as the pack voltage approaches the target. The curve is intentionally aggressive toward the top end to avoid voltage overshoot. Thresholds are in decivolts of lifted (under-charge) pack voltage.
+* Cold temperature cutback: Reduces charge rate based on the lowest thermocouple reading across both BMS units. Keeps the cells within safe charge rates when cold.
+* Hot temperature cutback: Reduces and ultimately stops charging based on the highest thermocouple reading. Charging is stopped completely above 75 C.
 
 Additional guards:
 
-The charger will not be commanded to start unless a valid pack voltage is present on the CAN bus, preventing phantom starts at boot or after CAN loss.
- Session Wh and Ah counters only accumulate when voltage, current, and a non-zero commanded current are all present simultaneously.
- The charger will throttle the current if the pack is too hot. It will go all the way to zero amps if the temp is too high. This protection also warns the user in the Dashboard.
+* The charger will not be commanded to start unless a valid pack voltage is present on the CAN bus, preventing phantom starts at boot or after CAN loss.
+* Session Wh and Ah counters only accumulate when voltage, current, and a non-zero commanded current are all present simultaneously.
+* The charger will throttle the current if the pack is too hot. It will go all the way to zero amps if the temp is too high. This protection also warns the user in the Dashboard.
 
 Session Tracking
 
@@ -94,14 +88,14 @@ Full MQTT discovery is included. The controller publishes itself to Home Assista
 
 Read-only sensors published:
 
-actual_volts, target_volts
-monolith_volts, powertank_volts
-charge_amps, monolith_amps, powertank_amps
-monolith_ah, powertank_ah
-monolith_min_temp, monolith_max_temp, powertank_min_temp, powertank_max_temp
-charge_power, target_power_w, max_power_w
-watt_hours, coulombs
-charge mode / phase
+* actual_volts, target_volts
+* monolith_volts, powertank_volts
+* charge_amps, monolith_amps, powertank_amps
+* monolith_ah, powertank_ah
+* monolith_min_temp, monolith_max_temp, powertank_min_temp, powertank_max_temp
+* charge_power, target_power_w, max_power_w
+* watt_hours, coulombs
+* charge mode / phase
 
 Controllable entities:
 
