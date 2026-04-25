@@ -217,6 +217,8 @@ The 1 hour timeout is generous on purpose — better to give all cells a long, w
 **Stage 3 — Float** *(internally DONE)*
 Charging stops, the chargers go silent, and the cells rest. The dashboard shows **Float**. Energy totals (Wh, Ah) stop updating. The controller stays in this stage indefinitely until either the user turns charging off, or the pack sags below the re-engage threshold (see below) and a new cycle starts.
 
+**Time Remaining card** (Session row): a coulomb-counting estimate of how much longer charging will take to reach the active **target preset** (not 100 %). It's the same idea as the bike's own dashboard timer, but it tracks the user-chosen ceiling. During Bulk it divides the remaining Ah by the present pack current and smooths the result with a small EMA filter so a brief current dip doesn't jump the readout. During Absorption it shows the remainder of the 1 hour safety countdown — that's the upper bound; the stage usually ends earlier on the current taper. Reads "—" when the controller has no useful number to show (e.g. before current settles, or once the pack is already at/above the target).
+
 Note that this isn't "float" in the lead-acid sense of holding a maintenance voltage on the pack — Li-ion doesn't want that. It's a *resting* float: the chargers are off and the BMS is left alone. The name keeps the dashboard consistent with what most users already know from solar / RV setups.
 
 ![Dashboard Screenshot](pics/202604231420-Monitor_Charging_PowerCurve_768.jpg)
@@ -383,6 +385,7 @@ With MQTT credentials set, the controller auto publishes HA discovery topics und
 | `target_preset_pct` | % | Active preset percentage (`70`, `80`, `90`, `100`, or `0` if a non-preset custom voltage is set) |
 | `thermal_throttle` | — | `"true"` while the hot-cutback is reducing charging power, `"false"` otherwise. Use as a binary template sensor for HA notifications |
 | `ramp_phase` | — | Current charging stage: `"bulk"`, `"absorption"`, or `"float"`. Pin to a Lovelace card or use as the trigger for "charging finished" automations (`ramp_phase` transitions to `"float"`) |
+| `eta_minutes` | min | Estimated time remaining until the pack reaches the active target voltage. Coulomb-counting estimate during Bulk (smoothed with a 0.2 EMA), absorption-timer countdown during Absorption, `-1` when not charging or the value can't be computed yet (current too low / pack already above target) |
 
 ### Controls (read / write)
 

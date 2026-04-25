@@ -38,7 +38,7 @@
 //   driver/twai.h    } built into Espressif ESP32 Arduino core - no install needed
 // ==========================================================================
 
-#define VERSION 202604251032
+#define VERSION 202604251104
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -281,6 +281,11 @@ static volatile uint8_t g_rampPhase = 0;
 // True while CC-phase power is being clamped by the hot-temperature cutback.
 // Read by the dashboard to display a "thermal throttling" banner.
 static volatile bool    g_thermalThrottle = false;
+// Estimated minutes remaining to reach the user's chosen target voltage.
+// Updated by rampTask each tick using a coulomb-counting estimate plus EMA
+// smoothing.  -1 = unknown / not charging / target already reached.
+// 16-bit so the dashboard can display "—" when negative; capped at 24 h.
+static volatile int16_t g_etaMinutes = -1;
 
 // Charger is considered gone if no status frame received within this window
 static const unsigned long CHARGER_TIMEOUT_MS = 10000;
@@ -443,6 +448,7 @@ struct MqttSnapshot {
   bool     thermalThrottleForced = true; // guarantee one publish after boot
   uint8_t  targetPresetPct   = 255;     // 255 = sentinel, forces first publish
   uint8_t  rampPhase         = 255;     // 255 = sentinel, forces first publish
+  int16_t  etaMinutes        = -2;      // -2 = sentinel (firmware uses -1 for "unknown"); forces first publish
 } mqttLast;
 
 static WiFiClient   mqttWifiClient;
@@ -808,6 +814,8 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
       <span class="val" id="sessWh">—</span><span class="unit">Wh</span></div>
     <div class="card"><div class="label">Charge Delivered</div>
       <span class="val" id="sessAh">—</span><span class="unit">Ah</span></div>
+    <div class="card"><div class="label">Time Remaining</div>
+      <span class="val" id="etaTime">—</span></div>
     <div class="card"><div class="label">Ramp Rate</div>
       <span class="val" id="rampRate">—</span><span class="unit">W/s</span></div>
     <div class="card" style="cursor:pointer" onclick="resetSession()" title="Click to reset session">
@@ -1111,6 +1119,19 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
           // Session data
           document.getElementById('sessWh').textContent   = fmt(d.session_wh, 1);
           document.getElementById('sessAh').textContent   = fmt(d.session_ah, 2);
+          // Time remaining: -1 = unknown / not charging, render as "—".
+          // Otherwise format minutes as "Xh Ym" (or just "Ym" under an hour).
+          var etaMin = d.eta_minutes;
+          var etaEl  = document.getElementById('etaTime');
+          if (etaMin === undefined || etaMin === null || etaMin < 0) {
+            etaEl.textContent = '—';
+          } else if (etaMin < 60) {
+            etaEl.textContent = etaMin + ' min';
+          } else {
+            var h = Math.floor(etaMin / 60);
+            var m = etaMin % 60;
+            etaEl.textContent = h + 'h ' + (m < 10 ? '0' + m : m) + 'm';
+          }
           document.getElementById('rampRate').textContent = d.ramp_rate_wps !== undefined
                                                             ? d.ramp_rate_wps : '—';
 
@@ -1720,7 +1741,7 @@ void handleApiStatus() {
   float sessAh = session.chargeAh;
 
   // Fixed fields — use a stack buffer for the bulk of the response
-  char buf[950];
+  char buf[1024];
   snprintf(buf, sizeof(buf),
     "{"
       "\"fresh\":%s,"
@@ -1752,6 +1773,7 @@ void handleApiStatus() {
       "\"free_heap_kb\":%.1f,"
       "\"heartbeat_ok\":%s,"
       "\"ramp_phase\":\"%s\","
+      "\"eta_minutes\":%d,"
       "\"charger_count\":%d,"
       "\"charging_enabled\":%s,"
       "\"target_power_w\":%d,"
@@ -1787,6 +1809,7 @@ void handleApiStatus() {
     statsSnap.freeHeap / 1024.0f,
     chargerSnap.heartbeatOk ? "true" : "false",
     g_rampPhase == 1 ? "absorption" : g_rampPhase == 2 ? "float" : "bulk",
+    (int)g_etaMinutes,
     (int)ctrl.chargerCount,
     ctrl.enabled ? "true" : "false",
     (int)ctrl.targetPowerW,
@@ -3151,6 +3174,65 @@ void rampTask(void* /*pvParameters*/) {
     // Expose phase to API/dashboard (atomic uint8_t write, no mutex needed)
     g_rampPhase = (uint8_t)phase;
 
+    // ── Time-to-target estimate ───────────────────────────────────────────────
+    // Mirrors the "time remaining" timer the bike's dashboard shows during
+    // charging, but extrapolates toward the user's chosen target voltage
+    // (e.g. 70 / 80 / 90 / 100 % preset) instead of always 100 %.
+    //
+    // Bulk (CC):    coulomb estimate using the present pack current —
+    //               minutes = (target_SoC - now_SoC)/100 * monolithAH * 60 / ampsNow
+    //               where ampsNow is the magnitude of the current flowing into
+    //               the pack (positive while charging).  Suppressed while
+    //               current draw is below ~5 A (still ramping or settling) so
+    //               the early figure doesn't read in the days.
+    // Absorption:   we don't know how long until the cells equalize, but the
+    //               CV_HOLD_MS safety timer is the upper bound — show the
+    //               remainder of that countdown so the dashboard never says
+    //               "0 min" while the charger is still on.
+    // Float / off:  -1 sentinel → dashboard shows "—".
+    //
+    // EMA smoothing (α = 0.2) damps tick-to-tick jitter from current jumps.
+    static float etaEmaMin = -1.0f;
+    int16_t etaOut = -1;
+
+    if (phase == PHASE_CC) {
+      int   targetSoc = calcSocFromVoltage((long)voltCeiling);
+      int   nowSoc    = (rawPackDv > 0) ? calcSocFromVoltage(rawPackDv) : 0;
+      float ahNeeded  = (float)(targetSoc - nowSoc) / 100.0f * (float)monolithAH;
+      // Use the actual delivered current if we have it, else fall back to the
+      // commanded total (cmdAmpsDa is per-charger × 10).
+      float ampsNow   = 0.0f;
+      if (xSemaphoreTake(chargerMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        unsigned long now = millis();
+        for (int i = 0; i < MAX_CHARGERS; i++) {
+          if (chargerBus.chargers[i].present &&
+              (now - chargerBus.chargers[i].lastSeenMs) < CHARGER_TIMEOUT_MS)
+            ampsNow += chargerBus.chargers[i].ampsDa / 10.0f;
+        }
+        xSemaphoreGive(chargerMutex);
+      }
+      // Sanity floor — below ~2 A into a 100 Ah pack the ETA blows up.
+      if (ahNeeded > 0.0f && ampsNow > 2.0f) {
+        float minutesRaw = ahNeeded / ampsNow * 60.0f;
+        if (minutesRaw > 24.0f * 60.0f) minutesRaw = 24.0f * 60.0f;
+        etaEmaMin = (etaEmaMin < 0.0f) ? minutesRaw
+                                       : (etaEmaMin * 0.8f + minutesRaw * 0.2f);
+        etaOut = (int16_t)(etaEmaMin + 0.5f);
+      } else {
+        etaEmaMin = -1.0f; // not enough current to estimate yet
+      }
+    } else if (phase == PHASE_CV) {
+      unsigned long elapsed = millis() - cvMs;
+      long remMs = (long)CV_HOLD_MS - (long)elapsed;
+      if (remMs < 0) remMs = 0;
+      etaOut = (int16_t)(remMs / 60000L);
+      etaEmaMin = -1.0f; // reset bulk EMA so a CV→CC sag restarts cleanly
+    } else {
+      etaEmaMin = -1.0f;
+      etaOut = -1; // float / done / disabled
+    }
+    g_etaMinutes = etaOut;
+
     // ── Log ───────────────────────────────────────────────────────────────────
     const char* ps = (phase==PHASE_CC) ? "BULK"
                   : (phase==PHASE_CV) ? "ABSORPTION"
@@ -3585,6 +3667,8 @@ static void mqttPublishDiscovery() {
   mqttDiscoverSensor("thermal_throttle",  "Thermal Throttling", "", "", "");
   // Charging stage — published as "bulk" / "absorption" / "float"
   mqttDiscoverSensor("ramp_phase",        "Charging Stage", "", "", "");
+  // Estimated minutes until target voltage is reached (-1 when unknown / not charging)
+  mqttDiscoverSensor("eta_minutes",       "Charging Time Remaining", "min", "duration", "measurement");
 
   LOG("[MQTT] Discovery published\n");
 }
@@ -3811,6 +3895,16 @@ static bool mqttPublishChanges() {
                                 : "bulk";
     mqttPublishSensor("ramp_phase", rps);
     mqttLast.rampPhase = rp;
+    published = true;
+  }
+
+  // Time-to-target estimate (minutes). -1 = unknown / not charging.
+  // Republish only when the value actually changes — otherwise the broker
+  // sees a "min" tick every second.
+  int16_t eta = g_etaMinutes;
+  if (eta != mqttLast.etaMinutes) {
+    mqttPublishSensorI("eta_minutes", (int)eta);
+    mqttLast.etaMinutes = eta;
     published = true;
   }
 
