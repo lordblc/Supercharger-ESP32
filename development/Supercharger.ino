@@ -1,6 +1,12 @@
 // ==========================================================================
 // Supercharger controller for Zero bike based on LilyGo T-2CAN (ESP32-S3)
 //
+// Thanks to RIEvangelist, Skonk and BrianTRice. 
+// Without the work these people have done, i would not be able to put
+// together this controller. Their openly available work online is the 
+// basis for a lot of what this controller does. I just put it togheter
+// and added some other features.
+// 
 // Hardware info:
 //  CAN:
 //   Charger: MCP2515 via SPI  (CS=10, SCLK=12, MOSI=11, MISO=13, RST=9)
