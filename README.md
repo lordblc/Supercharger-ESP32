@@ -1,29 +1,25 @@
-Ok, so.. I set out to build upon the work skonk made that is referred to in this thread:
+Ok, so.. I set out to build upon the work [skonk made that is referred to in this thread](https://www.electricmotorcycleforum.com/boards/index.php?topic=13489.0 "Electric Motorcycle Forum").
 
-https://www.electricmotorcycleforum.com/boards/index.php?topic=13489.0
+My goal was to achieve some additional abilities.  
+I wanted to use better hardware. I found his approach to be very clunky and i could not see how I would make it fit on the bike.  
+It didn't help that the CAN cable on the bike was very short and limitting me to basically place it close to the fusebox underneath the seat. An area that is already quite space limitted.  
+Anyway.. I also wanted to include HomeAssistant control as i already have that on my other chargeable vehicles.  
 
-My goal was to achieve some additional abilities.
-I wanted to use better hardware. I found his approach to be very clunky and i could not see how I would make it fit on the bike.
-It didn't help that the CAN cable on the bike was very short and limitting me to basically place it close to the fusebox underneath the seat. An area that is already quite space limitted.
-Anyway.. I also wanted to include HomeAssistant control as i already have that on my other chargeable vehicles.
+I tried to do the easy approach first, and simply employed CoPilot to just adapt the original code from Arduino to ESP32. This yielded a somewhat result but had issues.  
+I referred to that result in the [same forumthread](https://www.electricmotorcycleforum.com/boards/index.php?topic=13748.0 "Electric Motorcycle Forum") as well as here.
 
-I tried to do the easy approach first, and simply employed CoPilot to just adapt the original code from Arduino to ESP32. This yielded a somewhat result but had issues.
-I referred to that result in the same forumthread as well as here:
-
-https://www.electricmotorcycleforum.com/boards/index.php?topic=13748.0
-
-Having kept at it and starting from scratch, I formulated an approach as a project manager and set out to make something with Claude as my assistant. I started using the Sonnet 4.5 model, but eventually moved on to Opus 4.6.
+Having kept at it and starting from scratch, I formulated an approach as a project manager and set out to make something with Claude as my assistant. I started using the Sonnet 4.5 model, but eventually moved on to Opus 4.6, and later Opus 4.7.  
 My approach was to always be in control of what was created and dividing the codebase into smaller chunks where I was able to keep up with what was suggested from the AI.
 
-So, the details are as follows:
-I based this on the LilyGo T-2CAN which has 2 onboard, isolated CAN transceivers ready to go.
-It has 12-24VDC input so can be connected directly to the DC output from the chargers, eliminating one of the PSU's from the original. (I would still highly recommend using an isolated 5VDC for the bike connector to keep these as separate as possible.)
+So, the details are as follows:  
+I based this on the LilyGo T-2CAN which has 2 onboard, isolated CAN transceivers ready to go.  
+It has 12-24VDC input so can be connected directly to the DC output from the chargers, eliminating one of the PSU's from the original. (I would still highly recommend using an isolated 5VDC for the bike connector to keep these as separate as possible.)  
 
 The controller sits between the bike's CAN bus and the charger's CAN bus and manages the full charge cycle automatically.
 
 Hardware
 
-* LilyGo T-2CAN (ESP32-S3) (https://lilygo.cc/products/t-2can)
+* [LilyGo T-2CAN (ESP32-S3)] (https://lilygo.cc/products/t-2can "LilyGo Website")
 * Charger CAN bus: MCP2515 via SPI at 250 kbps
 * Bike CAN bus: ESP32-S3 native TWAI peripheral at 500 kbps
 ' Tested with Elcon TC HK-J 3300W chargers; multiple units can run in parallel
@@ -43,8 +39,7 @@ The charger is commanded over CAN with a target voltage ceiling and a current li
 
 * CC / Bulk: Constant current up to the configured power limit. Current ramps up gradually from zero at a configurable rate in W/s. Charge power is reduced as the pack voltage approaches the target through a lookup table (see below).
 * CV / Absorption: Once the pack voltage reaches the target, the firmware holds the voltage ceiling and monitors actual charger output current. The charger self-regulates in this region.
-* Float / Complete: CV phase ends when actual charger current drops below 2 A (after a minimum 2-minute settle period) or after a 20-minute timeout, whichever comes first. The charger is then stopped and the session is marked complete.
-
+* Float / Complete: CV phase ends when actual charger current drops below 2 A (after a minimum 2-minute settle period) or after a 20-minute timeout, whichever comes first. The charger is then stopped and the session is marked complete.  
 The charger voltage ceiling is always set to the configured target, not the present pack voltage. This is important — setting it to the present pack voltage would leave the charger with no headroom and it would not regulate correctly.
 
 Protection and Cutback
@@ -78,11 +73,11 @@ Status data is delivered via a JSON API endpoint and the page auto-refreshes wit
 
 WiFi and OTA
 
-Connects to a saved WiFi network on boot
-Falls back to access point mode if no saved credentials, allowing initial setup via browser
-mDNS hostname for easy access on the local network
-OTA firmware update via browser at /update, protected with HTTP Basic Auth
-MQTT and Home Assistant
+* Connects to a saved WiFi network on boot
+* Falls back to access point mode if no saved credentials, allowing initial setup via browser
+* mDNS hostname for easy access on the local network
+* OTA firmware update via browser at /update, protected with HTTP Basic Auth
+* MQTT and Home Assistant
 
 Full MQTT discovery is included. The controller publishes itself to Home Assistant automatically with no manual YAML needed. (Tested with EMQX as MQTT server, should also work with mosquitto)
 
@@ -108,8 +103,8 @@ Controllable entities:
 
 The firmware uses FreeRTOS on the ESP32-S3 dual core:
 
-Core 0 handles the bike CAN listener and charger CAN output to makes sure the heartbeat is never interrupted by web/mqtt handling clogging the cpu
-Core 1 handles the web server, charge ramp/control logic, and MQTT
+Core 0 handles the bike CAN listener and charger CAN output to makes sure the heartbeat is never interrupted by web/mqtt handling clogging the cpu  
+Core 1 handles the web server, charge ramp/control logic, and MQTT  
 Shared state between cores is protected with mutexes. A 4 KB ring buffer log is available over serial and as a server-sent event stream in the browser.
 
 Required Libraries
@@ -119,10 +114,9 @@ Required Libraries
 * ArduinoJson by Benoit Blanchon (v6)
 * ESP32 Arduino core (includes TWAI driver, ESPmDNS, Update)
 
-
 At current stage it should compile to ~1MB large binary file. I track changes through the VERSION tag that is also visible as reference on the dashboard.
 
-And if you managed to read this far:
+And if you managed to read this far:  
 using arduino_secrets.h is the quickest way to set everything up, but is not required. First boot without configured secrets will default to a welcome page to set everything up with a wlan ap that has the default password set to "12345678" and the AP SSID set to "Supercharger".
 
 I plan to add more detail here..
