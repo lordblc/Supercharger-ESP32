@@ -193,44 +193,46 @@ The percentages are based on the Zero monolith pack open-circuit voltage curve (
 
 The dashboard remembers your last selection across reboots. The same setting is exposed over MQTT (`target_volt_v`) for Home Assistant automations — e.g. set 100 % only the night before a trip.
 
-### CC / CV / DONE — How the Controller Stops Charging
+### Bulk / Absorption / Float — How the Controller Stops Charging
 
-The controller runs a three stage automatic charge cycle.
+The controller runs a three stage automatic charge cycle, named after the standard solar/battery-charging convention so what's happening on the bike maps to what you'd expect from any other smart charger.
 
 ![Dashboard Screenshot](pics/202604231420-Dashboard_Charging_Absorption_768.jpg)
 
-**Stage 1 — CC (Constant Current)**
-This is the main charging phase. The controller commands the chargers to deliver the power you've set on the slider, ramping up at 50 W/s (Adjustable). Battery Pack voltage rises gradually as the cells absorb energy. The dashboard phase indicator reads **CC**. Voltage and temperature limits (see `battery_tables.h`) only apply in this phase — they trim power back as the pack gets close to full or warm.
+**Stage 1 — Bulk** *(internally CC, "Constant Current")*
+This is the main charging phase where most of the energy goes in. The controller commands the chargers to deliver the power you've set on the slider, ramping up at 50 W/s (adjustable). Pack voltage rises gradually as the cells absorb energy. The dashboard phase indicator reads **Bulk**. Voltage and temperature limits (see `battery_tables.h`) only apply in this phase — they trim power back as the pack gets close to full or warm.
 
 ![Dashboard Screenshot](pics/202604231420-Dashboard_Charging_Float_768.jpg)
 
-**Stage 2 — CV (Constant Voltage / Float)**
-When the battery pack reaches the set voltage charge level, the controller switches to **CV**. It holds the battery pack at that voltage and lets the chargers reduce current as the cells finish topping up. You’ll see the current target falling on the dashboard, but charging continues at a lower level. This stage finishes when one of two things happens, whichever comes first:
+**Stage 2 — Absorption** *(internally CV, "Constant Voltage")*
+When the pack reaches the target voltage, the controller switches to **Absorption**. It holds the pack at that voltage and lets the chargers reduce current as the cells equalize and finish topping up. You'll see the current target falling on the dashboard while charging continues at a lower level. This stage finishes when one of two things happens, whichever comes first:
 
 - Actual delivered current drops below **2 A total** (after a 2 minute settling window).
-- **20 minute safety timeout** finishes.
+- **1 hour safety timeout** finishes.
 
-CV stage is short at 70-80% and longer for 90-100%, because higher charge levels need more time to equalize. Lower presets shorten or eliminate the CV stage. That's why 70% or 80% charges takes proportionally less time. Most battery stress happens during CV at over 90% charge. Lower presets avoid ost of that stress.
+The 1 hour timeout is generous on purpose — better to give all cells a long, well-paced equalization than to cut absorption short. The absorption stage is short at 70–80 % targets and longer at 90–100 %, because higher charge levels need more time to equalize across the pack. Lower presets shorten or eliminate this stage entirely. That's why 70 % or 80 % charges take proportionally less time. Most cell stress happens during absorption at over 90 % charge — lower presets avoid most of it.
 
 ![Dashboard Screenshot](pics/202604231420-Dashboard_Charging_Complete_768.jpg)
 
-**Stage 3 — DONE**
-Charging stops. The dashboard shows DONE. The relay opens. The controller stops talking to the chargers. Energy totals (Wh, Ah) stop updating.
+**Stage 3 — Float** *(internally DONE)*
+Charging stops, the chargers go silent, and the cells rest. The dashboard shows **Float**. Energy totals (Wh, Ah) stop updating. The controller stays in this stage indefinitely until either the user turns charging off, or the pack sags below the re-engage threshold (see below) and a new cycle starts.
+
+Note that this isn't "float" in the lead-acid sense of holding a maintenance voltage on the pack — Li-ion doesn't want that. It's a *resting* float: the chargers are off and the BMS is left alone. The name keeps the dashboard consistent with what most users already know from solar / RV setups.
 
 ![Dashboard Screenshot](pics/202604231420-Monitor_Charging_PowerCurve_768.jpg)
 
-Screenshot from my HomeAssistant Power monitor. This monitor is in front of my 230V -> 400V transformer, so it's not precise. It just shows the ramp-up, absorption, float and complete stages.
+Screenshot from my Home Assistant power monitor. This monitor sits in front of the 230 V → 400 V transformer, so the absolute watts aren't precise — but it does cleanly show the bulk ramp-up, absorption taper, and float (charger off) stages.
 
-**Recovery transitions** — the controller doesn't just sit in DONE forever:
+**Recovery transitions** — the controller doesn't just sit in Float forever:
 
-- **CV → CC** if pack voltage drops more than 1 V below the limit after switching to CV, it switches back to CC.
-- **DONE → CC** the threshold depends on the preset you've chosen:
+- **Absorption → Bulk** if pack voltage drops more than 1 V below the limit after switching to Absorption, it switches back to Bulk.
+- **Float → Bulk** the threshold depends on the preset you've chosen:
   - **70 % or 80 %**: pack must drop more than **2 V** below the target before a new cycle starts. Frequent small top-offs are fine in this gentle SoC range.
   - **90 %, 100 %**, or any custom target above 110.0 V: the controller waits for the pack to sag all the way down to the **80 % level (110.0 V)** before re-engaging. The cycle is wider (more voltage sag per top-off), but the pack spends far less time hovering near full charge — which is what actually wears Li-ion cells. The trade-off is deliberate: at 100 %, you'll see the pack discharge from 116.4 V down to 110.0 V before the chargers kick back in.
 
-**Already at target when you start**: if you turn charging on and the pack is already at or above the chosen preset's voltage (e.g. you set 80 % but the bike is at 81 %), the controller skips CC and CV entirely and goes straight to **DONE** without ever sending a start command to the chargers. You'll see DONE on the dashboard within one tick. The same DONE → CC re-engage rules above then decide when (if ever) to start a new cycle. No wasted brief charge bursts at the top of the SoC range.
+**Already at target when you start**: if you turn charging on and the pack is already at or above the chosen preset's voltage (e.g. you set 80 % but the bike is at 81 %), the controller skips Bulk and Absorption entirely and goes straight to **Float** without ever sending a start command to the chargers. You'll see Float on the dashboard within one tick. The same Float → Bulk re-engage rules above then decide when (if ever) to start a new cycle. No wasted brief charge bursts at the top of the SoC range.
 
-**Practical implication of the % presets**: choosing 70 % doesn't just mean "stop earlier" — it also means a much shorter CV phase (or none at all if the ceiling is below where the pack would naturally taper). That's why low presets feel quick: the bulk of cell stress in a Li-ion charge is during CV at high voltage, and you're skipping most of it.
+**Practical implication of the % presets**: choosing 70 % doesn't just mean "stop earlier" — it also means a much shorter Absorption phase (or none at all if the ceiling is below where the pack would naturally taper). That's why low presets feel quick: the bulk of cell stress in a Li-ion charge is during Absorption at high voltage, and you're skipping most of it.
 
 ### System Info
 
@@ -380,6 +382,7 @@ With MQTT credentials set, the controller auto publishes HA discovery topics und
 | `session_wh` / `session_ah` | Wh / Ah | Energy and charge delivered since the last session reset |
 | `target_preset_pct` | % | Active preset percentage (`70`, `80`, `90`, `100`, or `0` if a non-preset custom voltage is set) |
 | `thermal_throttle` | — | `"true"` while the hot-cutback is reducing charging power, `"false"` otherwise. Use as a binary template sensor for HA notifications |
+| `ramp_phase` | — | Current charging stage: `"bulk"`, `"absorption"`, or `"float"`. Pin to a Lovelace card or use as the trigger for "charging finished" automations (`ramp_phase` transitions to `"float"`) |
 
 ### Controls (read / write)
 

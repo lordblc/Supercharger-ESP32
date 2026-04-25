@@ -256,38 +256,35 @@ short Zero::AH(byte &len,byte buf[ZERO_MESSAGE_LENGTH]){
   return AH.value;
 }
 
-// BMS_PACK_TEMP_DATA (0x488) carries up to 8 bytes. Most are signed °C
-// thermocouple readings, but live data shows bytes [2] and [3] carry other
-// BMS data (they produce values like −84°C, 125°C that are physically
-// impossible for a battery pack). Two sentinel values are used:
-//   0x7F (127) — disconnected / invalid sensor (BMS standard)
-//   Range filter: anything outside [−20, 85]°C is also rejected.
-// The range filter cleans up the non-thermocouple bytes without hard-coding
-// byte indices, so it still works if the BMS frame layout changes.
-static inline bool tempValid(uint8_t raw) {
-  if (raw == 0x7F) return false;       // BMS disconnected sentinel
-  int8_t t = (int8_t)raw;
-  return (t >= -20 && t <= 85);        // physically plausible battery range
+// Cell-temperature decoders for BMS_PACK_ACTIVE_DATA (0x408) and the BMS1
+// equivalent (0x409). Layout, confirmed against the SCv2 reference sketches
+// (v2.5 / v2.6 / v3 / 13kw_force) and the original Arduino library:
+//
+//   byte 1: highest cell temp (signed int8, °C)
+//   byte 2: lowest  cell temp (signed int8, °C)
+//   byte 3-4: pack amps (signed int16, centiamps) — handled by amps()
+//
+// The previous "scan all 8 bytes and filter by [-20, 85]" approach was a
+// workaround for decoding the wrong CAN ID — 0x488 BMS_PACK_TEMP_DATA, which
+// on real bikes carries other BMS internals (cell-balance flags, individual
+// sensor positions with 0x7F sentinels, etc.). That filter let random
+// non-temperature bytes through (e.g. byte 0xF5 reads as -11°C as int8) and
+// produced bogus min readings down around -11..0 °C. Temps now come straight
+// off the ACTIVE_DATA frame, same place the working SCv2 sketches use.
+//
+// 0x7F (127) is the BMS "sensor disconnected" sentinel — guarded against so
+// a single dead thermistor doesn't push the max to +127°C.
+
+short Zero::highestTemp(byte &len, byte buf[ZERO_MESSAGE_LENGTH]) {
+  if (len < 2) return 0;
+  if ((uint8_t)buf[1] == 0x7F) return 0;   // disconnected sensor
+  return (short)(int8_t)buf[1];
 }
 
-short Zero::highestTemp(byte &len,byte buf[ZERO_MESSAGE_LENGTH]){
-  int8_t best = -127;
-  for (int i = 0; i < (int)len && i < ZERO_MESSAGE_LENGTH; i++) {
-    if (!tempValid(buf[i])) continue;
-    int8_t t = (int8_t)buf[i];
-    if (t > best) best = t;
-  }
-  return (short)best;
-}
-
-short Zero::lowestTemp(byte &len,byte buf[ZERO_MESSAGE_LENGTH]){
-  int8_t best = 127;
-  for (int i = 0; i < (int)len && i < ZERO_MESSAGE_LENGTH; i++) {
-    if (!tempValid(buf[i])) continue;
-    int8_t t = (int8_t)buf[i];
-    if (t < best) best = t;
-  }
-  return (short)best;
+short Zero::lowestTemp(byte &len, byte buf[ZERO_MESSAGE_LENGTH]) {
+  if (len < 3) return 0;
+  if ((uint8_t)buf[2] == 0x7F) return 0;   // disconnected sensor
+  return (short)(int8_t)buf[2];
 }
 
 void Zero::logInit(){

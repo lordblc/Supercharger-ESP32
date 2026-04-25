@@ -38,7 +38,7 @@
 //   driver/twai.h    } built into Espressif ESP32 Arduino core - no install needed
 // ==========================================================================
 
-#define VERSION 202604241651
+#define VERSION 202604251032
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -442,6 +442,7 @@ struct MqttSnapshot {
   bool     thermalThrottle   = false;
   bool     thermalThrottleForced = true; // guarantee one publish after boot
   uint8_t  targetPresetPct   = 255;     // 255 = sentinel, forces first publish
+  uint8_t  rampPhase         = 255;     // 255 = sentinel, forces first publish
 } mqttLast;
 
 static WiFiClient   mqttWifiClient;
@@ -711,9 +712,9 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
     .pwr-unit{font-size:0.72em;color:#aaa;margin-left:2px}
     .phase-badge{font-size:1em;font-weight:bold;padding:2px 10px;border-radius:4px;
                  border:1px solid currentColor;white-space:nowrap;line-height:1.4}
-    .phase-cc  {color:#e9a020;border-color:#e9a020}
-    .phase-cv  {color:#4ab4f8;border-color:#4ab4f8}
-    .phase-done{color:#4caf82;border-color:#4caf82}
+    .phase-bulk      {color:#e9a020;border-color:#e9a020}
+    .phase-absorption{color:#4ab4f8;border-color:#4ab4f8}
+    .phase-float     {color:#4caf82;border-color:#4caf82}
     .preset-label{font-size:0.70em;color:#888;text-transform:uppercase;
                   letter-spacing:.05em;margin-bottom:6px}
     .preset-row{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px}
@@ -829,7 +830,7 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
       </div>
       <div class="pwr-display">
         <div class="pwr-label">Mode</div>
-        <span id="chgMode" class="phase-badge phase-cc">—</span>
+        <span id="chgMode" class="phase-badge phase-bulk">—</span>
       </div>
     </div>
 
@@ -1170,9 +1171,9 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
 
           document.getElementById('curPwr').textContent = d.current_power_w || 0;
           document.getElementById('tgtPwr').textContent = d.target_power_w  || 0;
-          var phase = d.ramp_phase || 'cc';
+          var phase = d.ramp_phase || 'bulk';
           var modeEl = document.getElementById('chgMode');
-          var modeLabels = {cc:'Absorption', cv:'Float', done:'Complete'};
+          var modeLabels = {bulk:'Bulk', absorption:'Absorption', float:'Float'};
           modeEl.textContent  = modeLabels[phase] || phase;
           modeEl.className    = 'phase-badge phase-' + phase;
           // Only update slider from server if user isn't dragging
@@ -1785,7 +1786,7 @@ void handleApiStatus() {
     (int)statsSnap.load1,
     statsSnap.freeHeap / 1024.0f,
     chargerSnap.heartbeatOk ? "true" : "false",
-    g_rampPhase == 1 ? "cv" : g_rampPhase == 2 ? "done" : "cc",
+    g_rampPhase == 1 ? "absorption" : g_rampPhase == 2 ? "float" : "bulk",
     (int)ctrl.chargerCount,
     ctrl.enabled ? "true" : "false",
     (int)ctrl.targetPowerW,
@@ -2477,7 +2478,17 @@ void processBikeFrame(const twai_message_t &msg) {
     }
   }
   else if (zeroDecoder.hasMonolithAmps(id)) {
-    live.monolithAmps = zeroDecoder.amps(len, buf);
+    // BMS_PACK_ACTIVE_DATA (0x408): one frame carries multiple fields:
+    //   byte 1: highest cell temp (signed °C)
+    //   byte 2: lowest cell temp  (signed °C)
+    //   byte 3-4: pack amps (signed int16 centiamps)
+    // This is the layout used by every working SCv2 sketch (v2.5 / v2.6 / v3 /
+    // 13kw_force). The 0x488 "BMS_PACK_TEMP_DATA" frame appears to carry other
+    // BMS internals (cell-balance flags, individual sensor positions with 0x7F
+    // sentinels) and is NOT a reliable source for high/low cell temps.
+    live.monolithAmps    = zeroDecoder.amps(len, buf);
+    live.monolithMaxTemp = zeroDecoder.highestTemp(len, buf);
+    live.monolithMinTemp = zeroDecoder.lowestTemp(len, buf);
   }
   else if (zeroDecoder.hasMonolithPackConfig(id)) {
     // BMS_PACK_CONFIG (0x288): sagAdjust in bytes 0-1, AH candidate in bytes 5-6
@@ -2488,11 +2499,7 @@ void processBikeFrame(const twai_message_t &msg) {
     // BMS_PACK_TIME (0x508) — C-rate assumed bytes 4-5; verify via raw log
     live.monolithMaxCRate = zeroDecoder.maxCRate(len, buf);
   }
-  else if (id == BMS_PACK_TEMP_DATA.id) {
-    // BMS_PACK_TEMP_DATA (0x488) — lowestTemp byte 0, highestTemp byte 1; verify via raw log
-    live.monolithMaxTemp = zeroDecoder.highestTemp(len, buf);
-    live.monolithMinTemp = zeroDecoder.lowestTemp(len, buf);
-  }
+  // 0x488 (BMS_PACK_TEMP_DATA) intentionally NOT decoded for temps — see note above.
 
   // --- PowerTank (BMS1) ---
   else if (zeroDecoder.hasPowerTankVoltage(id)) {
@@ -2505,7 +2512,11 @@ void processBikeFrame(const twai_message_t &msg) {
     }
   }
   else if (zeroDecoder.hasPowerTankAmps(id)) {
-    live.powerTankAmps = zeroDecoder.amps(len, buf);
+    // BMS1_PACK_ACTIVE_DATA (0x409): same layout as BMS0 0x408 — temps in
+    // bytes 1/2, amps in bytes 3-4.
+    live.powerTankAmps    = zeroDecoder.amps(len, buf);
+    live.powerTankMaxTemp = zeroDecoder.highestTemp(len, buf);
+    live.powerTankMinTemp = zeroDecoder.lowestTemp(len, buf);
   }
   else if (zeroDecoder.hasPowerTankPackConfig(id)) {
     // BMS1_PACK_CONFIG (0x289): sagAdjust bytes 0-1, AH bytes 5-6
@@ -2516,11 +2527,7 @@ void processBikeFrame(const twai_message_t &msg) {
     // BMS1_PACK_TIME (0x509) — C-rate assumed bytes 4-5; verify via raw log
     live.powerTankMaxCRate = zeroDecoder.maxCRate(len, buf);
   }
-  else if (id == BMS1_PACK_TEMP_DATA.id) {
-    // BMS1_PACK_TEMP_DATA (0x489) — same layout as BMS0
-    live.powerTankMaxTemp = zeroDecoder.highestTemp(len, buf);
-    live.powerTankMinTemp = zeroDecoder.lowestTemp(len, buf);
-  }
+  // 0x489 (BMS1_PACK_TEMP_DATA) intentionally NOT decoded for temps — see 0x408 note.
 
   // --- PowerTank detection window close ---
   // Once BMS0 data is fresh and the window has elapsed without any BMS1
@@ -2875,22 +2882,25 @@ void rampTask(void* /*pvParameters*/) {
   LOG("[RAMP] rampTask running on core %d\n", xPortGetCoreID());
   session.startMs = millis();
 
-  // CC / CV / DONE state machine
-  // ─────────────────────────────
-  // PHASE_CC  : Constant-current charge; voltage-based and hot cutbacks applied.
-  // PHASE_CV  : Pack voltage has reached the ceiling; charger stays on at the
-  //             ceiling voltage to fully absorb charge.  Transitions to DONE
-  //             when actual delivered current drops below CV_TERM_A (≈ C/20)
-  //             OR after CV_HOLD_MS elapses (safety timeout).
-  // PHASE_DONE: Fully charged; charger stopped.  Resets to CC only after the
-  //             pack has discharged at least 2 V below the ceiling.
+  // CC / CV / DONE state machine — exposed to users as "Bulk / Absorption / Float"
+  // ──────────────────────────────────────────────────────────────────────────────
+  // PHASE_CC   ("Bulk"):       Constant-current bulk charge; voltage-based and
+  //                            hot cutbacks applied.
+  // PHASE_CV   ("Absorption"): Pack voltage has reached the ceiling; charger
+  //                            stays on at the ceiling voltage to equalize the
+  //                            cells. Transitions to DONE when actual delivered
+  //                            current drops below CV_TERM_A (≈ C/20) OR after
+  //                            CV_HOLD_MS elapses (safety timeout, 1 h).
+  // PHASE_DONE ("Float"):      Cycle complete; charger stopped, cells resting.
+  //                            Resets to CC only after the pack has discharged
+  //                            below the re-engage floor (see DONE→CC logic).
   enum RampPhase : uint8_t { PHASE_CC = 0, PHASE_CV = 1, PHASE_DONE = 2 };
   static RampPhase phase      = PHASE_CC;
   static unsigned long cvMs   = 0;   // millis() when CV phase was entered
   static uint16_t cvAmpsDa    = 0;   // per-charger amps ceiling during CV
   static bool prevEnabled     = false; // for rising-edge detection on `enabled`
 
-  const unsigned long CV_HOLD_MS = 20UL * 60UL * 1000UL; // 20 min timeout
+  const unsigned long CV_HOLD_MS = 60UL * 60UL * 1000UL; // 1 h absorption safety timeout
   const unsigned long CV_MIN_MS  = 120000UL;              // don't terminate CV before 2 min
   const float         CV_TERM_A  = 2.0f;                  // stop CV when total amps < 2 A
 
@@ -3142,7 +3152,9 @@ void rampTask(void* /*pvParameters*/) {
     g_rampPhase = (uint8_t)phase;
 
     // ── Log ───────────────────────────────────────────────────────────────────
-    const char* ps = (phase==PHASE_CC) ? "CC" : (phase==PHASE_CV) ? "CV" : "DONE";
+    const char* ps = (phase==PHASE_CC) ? "BULK"
+                  : (phase==PHASE_CV) ? "ABSORPTION"
+                                      : "FLOAT";
     if (phase == PHASE_CV) {
       LOG("[RAMP] %s +%lus | %ddV %ddA/ch | raw %lddV ceil %ddV\n",
           ps, (millis()-cvMs)/1000UL, voltCeiling, (int)cvAmpsDa, rawPackDv, voltCeiling);
@@ -3571,6 +3583,8 @@ static void mqttPublishDiscovery() {
   mqttDiscoverSensor("target_preset_pct", "Target Preset", "%", "", "");
   // Thermal-throttle banner state (text "true"/"false")
   mqttDiscoverSensor("thermal_throttle",  "Thermal Throttling", "", "", "");
+  // Charging stage — published as "bulk" / "absorption" / "float"
+  mqttDiscoverSensor("ramp_phase",        "Charging Stage", "", "", "");
 
   LOG("[MQTT] Discovery published\n");
 }
@@ -3786,6 +3800,17 @@ static bool mqttPublishChanges() {
     mqttPublishSensor("thermal_throttle", thermal ? "true" : "false");
     mqttLast.thermalThrottle       = thermal;
     mqttLast.thermalThrottleForced = false;
+    published = true;
+  }
+
+  // Charging stage — published as "bulk" / "absorption" / "float"
+  uint8_t rp = g_rampPhase;
+  if (rp != mqttLast.rampPhase) {
+    const char* rps = (rp == 1) ? "absorption"
+                    : (rp == 2) ? "float"
+                                : "bulk";
+    mqttPublishSensor("ramp_phase", rps);
+    mqttLast.rampPhase = rp;
     published = true;
   }
 
