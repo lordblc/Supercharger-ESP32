@@ -57,14 +57,15 @@ Protection and Cutback
 Three lookup tables apply independent power cutbacks. All three are evaluated every cycle and the most restrictive limit wins:
 
 Voltage cutback: Reduces charge current progressively as the pack voltage approaches the target. The curve is intentionally aggressive toward the top end to avoid voltage overshoot. Thresholds are in decivolts of lifted (under-charge) pack voltage.
+
 Cold temperature cutback: Reduces charge rate based on the lowest thermocouple reading across both BMS units. Keeps the cells within safe charge rates when cold.
 Hot temperature cutback: Reduces and ultimately stops charging based on the highest thermocouple reading. Charging is stopped completely above 75 C.
 
 Additional guards:
 
 The charger will not be commanded to start unless a valid pack voltage is present on the CAN bus, preventing phantom starts at boot or after CAN loss.
-Session Wh and Ah counters only accumulate when voltage, current, and a non-zero commanded current are all present simultaneously.
-The charger will throttle the current if the pack is too hot. It will go all the way to zero amps if the temp is too high. This protection also warns the user in the Dashboard.
+ Session Wh and Ah counters only accumulate when voltage, current, and a non-zero commanded current are all present simultaneously.
+ The charger will throttle the current if the pack is too hot. It will go all the way to zero amps if the temp is too high. This protection also warns the user in the Dashboard.
 
 Session Tracking
 
@@ -104,12 +105,12 @@ charge mode / phase
 
 Controllable entities:
 
-Target voltage (V) — number slider
-Target power (W) — number slider
-Ramp rate (W/s) — number slider
-Number of chargers — number slider
-Charging enabled — switch
-Architecture
+-- Target voltage (V) — number slider
+-- Target power (W) — number slider
+-- Ramp rate (W/s) — number slider
+-- Number of chargers — number slider
+-- Charging enabled — switch
+-- Architecture
 
 The firmware uses FreeRTOS on the ESP32-S3 dual core:
 
@@ -119,13 +120,10 @@ Shared state between cores is protected with mutexes. A 4 KB ring buffer log is 
 
 Required Libraries
 
-mcp_can by coryjfowler
-
-PubSubClient by Nick O'Leary
-
-ArduinoJson by Benoit Blanchon (v6)
-
-ESP32 Arduino core (includes TWAI driver, ESPmDNS, Update)
+-- mcp_can by coryjfowler
+-- PubSubClient by Nick O'Leary
+-- ArduinoJson by Benoit Blanchon (v6)
+-- ESP32 Arduino core (includes TWAI driver, ESPmDNS, Update)
 
 
 At current stage it should compile to ~1MB large binary file. I track changes through the VERSION tag that is also visible as reference on the dashboard.
