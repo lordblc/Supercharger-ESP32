@@ -17,7 +17,7 @@ My approach was to always be in control of what was created and dividing the cod
 
 So, the details are as follows:
 I based this on the LilyGo T-2CAN which has 2 onboard, isolated CAN transceivers ready to go.
-It has 12-24VDC input so can be connected directly to the DC output from the chargers, eliminating one of the PSU's from the original. (I would still highly recommend using an isolated 5VDC for the bike connector to keep these as seperate as possible.)
+It has 12-24VDC input so can be connected directly to the DC output from the chargers, eliminating one of the PSU's from the original. (I would still highly recommend using an isolated 5VDC for the bike connector to keep these as separate as possible.)
 
 The controller sits between the bike's CAN bus and the charger's CAN bus and manages the full charge cycle automatically.
 
@@ -39,16 +39,14 @@ Pack voltage from both the Monolith (BMS 0x388) and PowerTank (BMS1 0x389)
 Pack current from both BMS units (0x408 / 0x409)
 Min and max battery temperatures from both BMS units (0x488 / 0x489), with a range filter to reject the non-thermocouple bytes that the Zero BMS puts in the same CAN frame
 Rated pack capacity in Ah from BMS pack config (0x288 / 0x289)
-Maximum allowed charge C-rate from the BMS (0x508 / 0x509)
-Throttle position from the motor controller, used as a presence/riding check
 
 Charge Control
 
 The charger is commanded over CAN with a target voltage ceiling and a current limit. The firmware implements a three-phase state machine:
 
-CC / Absorption: Constant current up to the configured power limit. Current ramps up gradually from zero at a configurable rate in W/s. Charge power is reduced as the pack voltage approaches the target through a lookup table (see below).
-CV / Float: Once the pack voltage reaches the target, the firmware holds the voltage ceiling and monitors actual charger output current. The charger self-regulates in this region.
-Complete: CV phase ends when actual charger current drops below 2 A (after a minimum 2-minute settle period) or after a 20-minute timeout, whichever comes first. The charger is then stopped and the session is marked complete.
+CC / Bulk: Constant current up to the configured power limit. Current ramps up gradually from zero at a configurable rate in W/s. Charge power is reduced as the pack voltage approaches the target through a lookup table (see below).
+CV / Absorption: Once the pack voltage reaches the target, the firmware holds the voltage ceiling and monitors actual charger output current. The charger self-regulates in this region.
+Float / Complete: CV phase ends when actual charger current drops below 2 A (after a minimum 2-minute settle period) or after a 20-minute timeout, whichever comes first. The charger is then stopped and the session is marked complete.
 The charger voltage ceiling is always set to the configured target, not the present pack voltage. This is important — setting it to the present pack voltage would leave the charger with no headroom and it would not regulate correctly.
 
 Protection and Cutback
@@ -63,6 +61,7 @@ Additional guards:
 
 The charger will not be commanded to start unless a valid pack voltage is present on the CAN bus, preventing phantom starts at boot or after CAN loss.
 Session Wh and Ah counters only accumulate when voltage, current, and a non-zero commanded current are all present simultaneously.
+The charger will throttle the current if the pack is too hot. It will go all the way to zero amps if the temp is too high. This protection also warns the user in the Dashboard.
 
 Session Tracking
 
@@ -106,7 +105,6 @@ Target voltage (V) — number slider
 Target power (W) — number slider
 Ramp rate (W/s) — number slider
 Number of chargers — number slider
-C+ mode — switch
 Charging enabled — switch
 Architecture
 

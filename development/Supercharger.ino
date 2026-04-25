@@ -44,7 +44,7 @@
 //   driver/twai.h    } built into Espressif ESP32 Arduino core - no install needed
 // ==========================================================================
 
-#define VERSION 202604251205
+#define VERSION 202604251515
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -1111,8 +1111,15 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
           // Thermal throttling banner (hot-cutback active in CC phase)
           document.getElementById('thermalBanner').style.display = d.thermal_throttle ? 'block' : 'none';
 
+          // In absorption, charger-reported W becomes meaningless as it tapers.
+          // Show |I| at the pack and use V*I for the "Current" power readout so
+          // the user sees what's actually flowing into the cells.
+          var phase = d.ramp_phase || 'bulk';
+          var inAbsorption = (phase === 'absorption');
+
           document.getElementById('mV').textContent  = fmt(d.monolith_v,  1) + ' V';
-          document.getElementById('mA').textContent  = d.monolith_a + ' A';
+          document.getElementById('mA').textContent  =
+            (inAbsorption ? Math.abs(d.monolith_a) : d.monolith_a) + ' A';
           // Capacity card: shows "available / total Ah" so the user sees both
           // how much is actually left in the pack right now (avail = total × SoC)
           // and the BMS's nominal capacity constant.
@@ -1164,7 +1171,8 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
           if (d.powertank_decided && d.powertank_present) {
             ptSec.style.display = 'block';
             document.getElementById('pV').textContent  = fmt(d.powertank_v,  1) + ' V';
-            document.getElementById('pA').textContent  = d.powertank_a + ' A';
+            document.getElementById('pA').textContent  =
+              (inAbsorption ? Math.abs(d.powertank_a) : d.powertank_a) + ' A';
             var pAvail = (d.powertank_ah_avail !== undefined) ? d.powertank_ah_avail : null;
             document.getElementById('pAH').textContent = (pAvail !== null)
               ? (fmt(pAvail, 1) + ' / ' + d.powertank_ah + ' Ah')
@@ -1215,9 +1223,22 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
             ccBtns[i].className = 'cc-btn' + (i + 1 === d.charger_count ? ' active' : '');
           }
 
-          document.getElementById('curPwr').textContent = d.current_power_w || 0;
+          // Current power: in absorption, derive from BMS (V*|I| at the pack)
+          // rather than the charger-reported figure, and tint it the same blue
+          // as the absorption mode badge to flag the swap.
+          var curPwrEl = document.getElementById('curPwr');
+          if (inAbsorption) {
+            var pwrW = Math.abs(d.monolith_a) * d.monolith_v;
+            if (d.powertank_decided && d.powertank_present) {
+              pwrW += Math.abs(d.powertank_a) * d.powertank_v;
+            }
+            curPwrEl.textContent = Math.round(pwrW);
+            curPwrEl.style.color = '#4ab4f8';
+          } else {
+            curPwrEl.textContent = d.current_power_w || 0;
+            curPwrEl.style.color = '';
+          }
           document.getElementById('tgtPwr').textContent = d.target_power_w  || 0;
-          var phase = d.ramp_phase || 'bulk';
           var modeEl = document.getElementById('chgMode');
           var modeLabels = {bulk:'Bulk', absorption:'Absorption', float:'Float'};
           modeEl.textContent  = modeLabels[phase] || phase;
