@@ -114,9 +114,18 @@ Required Libraries
 * ArduinoJson by Benoit Blanchon (v6)
 * ESP32 Arduino core (includes TWAI driver, ESPmDNS, Update)
 
-At current stage it should compile to ~1MB large binary file. I track changes through the VERSION tag that is also visible as reference on the dashboard.
+Required software
+
+* Arduino IDE with ESP32 board library
+* Python (I did my setup initially with python-manager-26.1 for windows)
+
+At current stage it should compile to ~1MB large binary file. I track changes through the VERSION tag that is also visible as reference on the dashboard.  
+
+YOU NEED TO READ ```development_addon -> BUILD_SETUP.md``` AND DO THAT CONFIGURATION TO GET A WORKABLE .bin FILE.  
+I cannot stress how important this is. It is directly tied to how OTA works and has been implemented as a safety feature. (stops others from uploading their own firmware)
 
 And if you managed to read this far:  
 using arduino_secrets.h is the quickest way to set everything up, but is not required. First boot without configured secrets will default to a welcome page to set everything up with a wlan ap that has the default password set to "12345678" and the AP SSID set to "Supercharger".
 
-I plan to add more detail here..
+This document gets updated whenever there are new changes and i have the time to write them in here.  
+DISCLAIMER: I might forget things by the time i get to updating here, but i am trying to keep this updated.
