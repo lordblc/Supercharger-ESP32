@@ -4,8 +4,10 @@
 // Thanks to RIEvangelist, Skonk and BrianTRice. 
 // Without the work these people have done, i would not be able to put
 // together this controller. Their openly available work online is the 
-// basis for a lot of what this controller does. I just put it togheter
+// basis for a lot of what this controller does. I just put it together
 // and added some other features.
+// (There are a lot more people involved here and I thank you all. If you
+// want your name in this list, do not hesitatet to get in contact with me)
 // 
 // Hardware info:
 //  CAN:
@@ -44,7 +46,7 @@
 //   driver/twai.h    } built into Espressif ESP32 Arduino core - no install needed
 // ==========================================================================
 
-#define VERSION 202604251515
+#define VERSION 202604261143
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -66,6 +68,10 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include <PubSubClient.h>
+#include <ArduinoJson.h>     // v6 — used by /api/settings, /api/control body parsing
+#include <WiFiClientSecure.h>// MQTT-over-TLS path (mqttTls=true)
+#include <mbedtls/md.h>      // HMAC-SHA256 for signed OTA verification
+#include "ota_secret.h"      // OTA_HMAC_SECRET[32] — gitignored, generated per build host
 
 // ---------------------------------------------------------------------------
 // Logging — ring buffer mirrored to hardware serial and SSE stream
@@ -386,12 +392,58 @@ struct ChargingControl {
   uint16_t targetVoltDv  = 1164;  // target charge voltage (dV), default 100% = 116.4V
 } ctrl;
 
-// Session energy tracking — accumulated in rampTask, reset on boot or manual reset
+// Session energy tracking — accumulated in rampTask, reset on boot or manual reset.
+// Guarded by sessionMutex: rampTask does read-modify-write `+= delta` each tick
+// while /api/control and the MQTT reset command write zero across all three
+// fields. Without a mutex, a reset can land between rampTask's load and store,
+// and a subsequent accumulator step then re-introduces a non-zero energyWh
+// while chargeAh is already zero — visibly inconsistent on the dashboard.
 struct SessionData {
   float energyWh  = 0.0f;  // cumulative Wh delivered this session
   float chargeAh  = 0.0f;  // cumulative Ah delivered this session
   unsigned long startMs = 0; // session start timestamp
 } session;
+SemaphoreHandle_t sessionMutex = nullptr;
+
+// Helpers for cross-task session access. The mutex is created in rampInit();
+// before that runs there's only setup() executing on Core 1, so a null mutex
+// means "no contention possible" — fall through to a direct read/write.
+static inline void sessionAddCC(float wh, float ah) {
+  if (sessionMutex && xSemaphoreTake(sessionMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+    session.energyWh += wh;
+    session.chargeAh += ah;
+    xSemaphoreGive(sessionMutex);
+  } else {
+    session.energyWh += wh;
+    session.chargeAh += ah;
+  }
+}
+
+static inline void sessionReset() {
+  if (sessionMutex && xSemaphoreTake(sessionMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+    session.energyWh = 0.0f;
+    session.chargeAh = 0.0f;
+    session.startMs  = millis();
+    xSemaphoreGive(sessionMutex);
+  } else {
+    session.energyWh = 0.0f;
+    session.chargeAh = 0.0f;
+    session.startMs  = millis();
+  }
+}
+
+// Atomic read of the two accumulators together — guarantees the dashboard /
+// MQTT publisher never sees a half-reset state (energy=0, charge=non-zero).
+static inline void sessionSnapshot(float& wh, float& ah) {
+  if (sessionMutex && xSemaphoreTake(sessionMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+    wh = session.energyWh;
+    ah = session.chargeAh;
+    xSemaphoreGive(sessionMutex);
+  } else {
+    wh = session.energyWh;
+    ah = session.chargeAh;
+  }
+}
 
 static TaskHandle_t rampTaskHandle = nullptr;
 
@@ -462,10 +514,16 @@ struct MqttSnapshot {
   float    monolithAhAvail   = -1.0f;   // forces first publish
 } mqttLast;
 
-static WiFiClient   mqttWifiClient;
-static PubSubClient mqttClient(mqttWifiClient);
-static TaskHandle_t mqttTaskHandle = nullptr;
-static char         mqttHostname[32] = "supercharger";
+// MQTT transport — both a plaintext and a TLS client live in BSS so we can
+// hot-swap PubSubClient's underlying transport when the user toggles SSL on
+// the settings page. Only one is "active" at a time (selected by mqttTls).
+// Memory cost of the TLS client is ~6 KB even when unused, but on ESP32-S3
+// that's not a concern.
+static WiFiClient        mqttWifiClient;
+static WiFiClientSecure  mqttTlsClient;
+static PubSubClient      mqttClient(mqttWifiClient);
+static TaskHandle_t      mqttTaskHandle = nullptr;
+static char              mqttHostname[32] = "supercharger";
 
 // Runtime-configurable AP and MQTT settings.
 // Loaded from NVS at boot, falling back to arduino_secrets.h, then defaults.
@@ -476,6 +534,19 @@ static char     mqttHost[64]       = "";
 static uint16_t mqttPort           = 1883;
 static char     mqttUser[33]       = "";
 static char     mqttBrokerPass[65] = "";
+
+// MQTT-TLS configuration. mqttTls=true requires mqttCaCert to be a valid PEM
+// blob (broker's CA cert or self-signed cert). Saved as NVS preferences
+// "mqtt_tls" (bool) and "mqtt_ca" (string blob, max ~2.5 KB). When TLS is on
+// we pass the CA cert via WiFiClientSecure::setCACert() before each connect
+// attempt; without a valid cert, mqttConnect() refuses to connect rather
+// than silently downgrading to setInsecure() — pretending to be secure is
+// worse than plaintext.
+static bool     mqttTls            = false;
+// Cert blob — sized to fit a typical X.509 CA (~1.5 KB) plus headroom.
+// Stored as a String to avoid yet another fixed-size buffer, but persisted
+// as a regular preferences string. PEM format with BEGIN/END markers.
+static String   mqttCaCert         = "";
 
 // MCP2515 SPI pins (LilyGo T-2CAN hardware)
 #define MCP_CS_PIN    10
@@ -571,6 +642,24 @@ const char HTML_SETTINGS[] PROGMEM = R"rawliteral(
       <div><label>Password</label>
         <input type="password" id="mqttPass" placeholder="(optional)"></div>
     </div>
+    <div style="margin-top:8px">
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+        <input type="checkbox" id="mqttTls" onchange="onTlsToggle()">
+        <span>Use SSL/TLS (encrypted broker connection)</span>
+      </label>
+      <div class="hint">Ticking this auto-switches the port to 8883.
+        You'll also need to upload the broker's CA certificate (PEM) below;
+        without a cert the device refuses to connect rather than disable
+        certificate verification.</div>
+    </div>
+    <div id="mqttCaWrap" style="display:none;margin-top:10px">
+      <label>Broker CA Certificate (PEM)</label>
+      <textarea id="mqttCa" rows="6"
+        style="width:100%;font-family:monospace;font-size:11px;background:#0f0f1e;
+               color:#eee;border:1px solid #0f3460;border-radius:5px;padding:8px"
+        placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"></textarea>
+      <div class="hint" id="mqttCaStatus">No certificate uploaded yet.</div>
+    </div>
     <button onclick="saveMQTT()">Save MQTT &amp; Reconnect</button>
   </div>
 
@@ -618,9 +707,29 @@ const char HTML_SETTINGS[] PROGMEM = R"rawliteral(
         document.getElementById('mqttHost').value  = d.mqtt_host || '';
         document.getElementById('mqttPort').value  = d.mqtt_port || 1883;
         document.getElementById('mqttUser').value  = d.mqtt_user || '';
+        document.getElementById('mqttTls').checked = !!d.mqtt_tls;
+        document.getElementById('mqttCaWrap').style.display = d.mqtt_tls ? 'block' : 'none';
+        // Cert blob itself is never returned (potentially large + privacy);
+        // the API just reports whether one is currently stored.
+        var s = document.getElementById('mqttCaStatus');
+        if (s) s.textContent = d.mqtt_ca_set
+          ? ('Certificate stored on device (' + d.mqtt_ca_bytes + ' bytes). Paste a new one to replace.')
+          : 'No certificate uploaded yet.';
       }
       // Passwords are never returned from the API for security
     });
+
+    // Auto-switch port when SSL is toggled. Only overwrites the port field
+    // if it currently holds the OTHER protocol's default — we don't clobber
+    // a user-customised port (e.g. 8884 for an EMQX cluster).
+    function onTlsToggle() {
+      var on = document.getElementById('mqttTls').checked;
+      document.getElementById('mqttCaWrap').style.display = on ? 'block' : 'none';
+      var portEl = document.getElementById('mqttPort');
+      var cur = parseInt(portEl.value);
+      if (on  && (cur === 1883 || isNaN(cur))) portEl.value = 8883;
+      if (!on && (cur === 8883 || isNaN(cur))) portEl.value = 1883;
+    }
 
     function postSettings(data, successMsg, restart) {
       fetch('/api/settings', {
@@ -653,12 +762,26 @@ const char HTML_SETTINGS[] PROGMEM = R"rawliteral(
       postSettings(data, 'AP settings saved', false);
     }
     function saveMQTT() {
-      postSettings({
+      var tls = document.getElementById('mqttTls').checked;
+      var ca  = document.getElementById('mqttCa').value.trim();
+      var data = {
         mqtt_host: document.getElementById('mqttHost').value.trim(),
-        mqtt_port: parseInt(document.getElementById('mqttPort').value) || 1883,
+        mqtt_port: parseInt(document.getElementById('mqttPort').value) || (tls ? 8883 : 1883),
         mqtt_user: document.getElementById('mqttUser').value.trim(),
-        mqtt_pass: document.getElementById('mqttPass').value
-      }, 'MQTT saved — reconnecting...', false);
+        mqtt_pass: document.getElementById('mqttPass').value,
+        mqtt_tls:  tls
+      };
+      // Sanity-check the PEM client-side before sending so the user gets
+      // immediate feedback on a paste error. Server re-validates anyway.
+      if (ca.length > 0) {
+        if (ca.indexOf('-----BEGIN CERTIFICATE-----') < 0 ||
+            ca.indexOf('-----END CERTIFICATE-----')   < 0) {
+          showMsg('CA cert must be PEM with BEGIN/END CERTIFICATE markers', false);
+          return;
+        }
+        data.mqtt_ca = ca;
+      }
+      postSettings(data, 'MQTT saved — reconnecting...', false);
     }
     function saveChargerCount() {
       var cc = parseInt(document.getElementById('ccCount').value);
@@ -1111,15 +1234,27 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
           // Thermal throttling banner (hot-cutback active in CC phase)
           document.getElementById('thermalBanner').style.display = d.thermal_throttle ? 'block' : 'none';
 
-          // In absorption, charger-reported W becomes meaningless as it tapers.
-          // Show |I| at the pack and use V*I for the "Current" power readout so
-          // the user sees what's actually flowing into the cells.
+          // Pack current display:
+          //  - When charging is enabled, current is flowing INTO the pack on
+          //    every phase (Bulk/Absorption/Float). Zero's BMS reports this as
+          //    a negative number (discharge convention); the negative is
+          //    confusing in a "you are charging right now" UI, so flip the
+          //    sign for display. The Mode badge already conveys phase, so no
+          //    information is lost.
+          //  - When charging is disabled (idle / bike being ridden) the sign
+          //    remains as the BMS reports — useful for seeing discharge
+          //    currents during a ride.
+          // In absorption specifically we also swap the charger-reported W on
+          // the "Current" power readout for V*I at the pack, since the
+          // charger figure becomes meaningless as it tapers.
           var phase = d.ramp_phase || 'bulk';
           var inAbsorption = (phase === 'absorption');
+          var charging     = !!d.charging_enabled;
+          var dispMonoA    = charging ? Math.abs(d.monolith_a) : d.monolith_a;
+          var dispPtA      = charging ? Math.abs(d.powertank_a) : d.powertank_a;
 
           document.getElementById('mV').textContent  = fmt(d.monolith_v,  1) + ' V';
-          document.getElementById('mA').textContent  =
-            (inAbsorption ? Math.abs(d.monolith_a) : d.monolith_a) + ' A';
+          document.getElementById('mA').textContent  = dispMonoA + ' A';
           // Capacity card: shows "available / total Ah" so the user sees both
           // how much is actually left in the pack right now (avail = total × SoC)
           // and the BMS's nominal capacity constant.
@@ -1171,8 +1306,7 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
           if (d.powertank_decided && d.powertank_present) {
             ptSec.style.display = 'block';
             document.getElementById('pV').textContent  = fmt(d.powertank_v,  1) + ' V';
-            document.getElementById('pA').textContent  =
-              (inAbsorption ? Math.abs(d.powertank_a) : d.powertank_a) + ' A';
+            document.getElementById('pA').textContent  = dispPtA + ' A';
             var pAvail = (d.powertank_ah_avail !== undefined) ? d.powertank_ah_avail : null;
             document.getElementById('pAH').textContent = (pAvail !== null)
               ? (fmt(pAvail, 1) + ' / ' + d.powertank_ah + ' Ah')
@@ -1559,18 +1693,109 @@ void sseFlush() {
 // Authentication helper.
 // Uses OTA credentials (SECRET_OTA_USER / SECRET_OTA_PASS) for all
 // protected endpoints. Returns false and sends a 401 if auth fails.
-// Dashboard (/) and /api/status are left open — they're read-only and
-// needed for the charging UI to function without friction.
+// All auth-gated routes: dashboard (/), /api/status, /save, all of
+// /api/settings, /api/control, /log, /api/log/stream, /update.
+//
+// Security properties of this gate:
+//  - **HTTP Digest** (not Basic): the password is never transmitted on the
+//    wire, only an MD5 hash of (user:realm:pass:nonce). A passive sniffer on
+//    the LAN can't lift the credential. Browser caches the challenge for
+//    the session, so the dashboard's 2 s polling reuses auth without
+//    re-prompting.
+//  - **Brute-force back-off via response delay**: after the 3rd consecutive
+//    failed attempt, every subsequent failed attempt incurs a vTaskDelay
+//    *before* the 401 response is sent — 1, 2, 4, 8, 16, then 30 s (capped),
+//    plus 0–2 s of random jitter. The delay is on the failing handler
+//    itself, not a global block window: this is what makes a brute-force
+//    feel monotonically slower, instead of mixing instant 429-rejections
+//    with the slow real failures (which is visually indistinguishable from
+//    fast successes). Counter and any pending delay reset on the first
+//    successful auth. Tracking is global (not per-IP) — single-user device,
+//    an attacker can open as many connections as they want, they all
+//    serialize through the single WebServer task.
+//  - **30 s cap per delay** stays under typical browser/curl request
+//    timeouts (~60 s) so the client connection doesn't drop mid-wait. The
+//    cumulative back-off across many attempts is still strong:
+//    3 fast + 1+2+4+8+16+30+30+30+... s sequential.
 // ---------------------------------------------------------------------------
+static const char AUTH_REALM[] = "Supercharger";
+static uint8_t       authFailCount     = 0;
+// Pending response delay in ms — accumulated as failures pile up, applied
+// to the NEXT failing request before its 401 is sent, then re-computed.
+// Held as an absolute deadline (millis) so any wall-clock time the client
+// spends getting back to us is credited against the wait.
+static unsigned long authBlockUntilMs  = 0;
+
 static bool requireAuth() {
-  if (!server.authenticate(SECRET_OTA_USER, SECRET_OTA_PASS)) {
-    server.requestAuthentication();
-    return false;
+  unsigned long now = millis();
+
+  // Pre-process delay: if the previous failure(s) set a back-off deadline,
+  // wait it out HERE before consulting the submitted credentials. The wait
+  // is honoured even if the client this time happens to send the correct
+  // password — that's intentional, because letting "correct" requests skip
+  // the wait would leak the right answer via timing.
+  // Cap each individual wait at 30 s so the client's TCP connection /
+  // browser request timer doesn't expire mid-wait.
+  if (authBlockUntilMs > now) {
+    unsigned long waitMs = authBlockUntilMs - now;
+    if (waitMs > 30000UL) waitMs = 30000UL;
+    LOG("[AUTH] Back-off active — delaying response %lu ms\n", waitMs);
+    vTaskDelay(pdMS_TO_TICKS(waitMs));
   }
-  return true;
+
+  if (server.authenticate(SECRET_OTA_USER, SECRET_OTA_PASS)) {
+    if (authFailCount > 0 || authBlockUntilMs > 0) {
+      LOG("[AUTH] Successful auth — clearing fail counter (was %d)\n",
+          (int)authFailCount);
+    }
+    authFailCount    = 0;
+    authBlockUntilMs = 0;
+    return true;
+  }
+
+  // Auth failed.
+  if (authFailCount < 255) authFailCount++;
+  LOG("[AUTH] Failed auth attempt #%d\n", (int)authFailCount);
+
+  if (authFailCount >= 3) {
+    // Exponential: 1, 2, 4, 8, 16, then 30 s cap. Plus 0-2 s jitter.
+    // Note: the wait happens at the START of the NEXT request — by the
+    // time it kicks in, anywhere from 0 to several seconds of real time
+    // may have already elapsed (browser thinking, user typing the next
+    // guess). Storing as an absolute deadline credits that elapsed time.
+    uint8_t shift = authFailCount - 3;
+    if (shift > 4) shift = 4;          // 1<<4 = 16 s; everything past caps
+    unsigned long delaySec = 1UL << shift;
+    if (delaySec > 16) delaySec = 16;
+    if (authFailCount > 7) delaySec = 30;  // cap once past 16 s
+    delaySec += (unsigned long)(esp_random() % 3);
+    authBlockUntilMs = millis() + delaySec * 1000UL;
+    LOG("[AUTH] Next failed attempt will be delayed %lu s\n", delaySec);
+  }
+
+  // Send the Digest challenge. The third arg is the realm shown in the
+  // browser's auth dialog; the fourth is a fail message embedded in the 401
+  // body for non-browser clients.
+  server.requestAuthentication(DIGEST_AUTH, AUTH_REALM,
+                               "Authentication required");
+  return false;
+}
+
+// Silent variant for upload chunk handlers (handleOTAUpload). WebServer
+// invokes those once per multipart chunk before the POST completion handler
+// runs; sending a 401 response mid-upload would corrupt the request stream.
+// Returns true iff (a) the back-off window isn't active and (b) the request
+// bears valid Digest credentials. No counter bump on failure — the parent
+// /update GET/POST has already gone through requireAuth() and accounted for
+// the attempt; we just need to keep refusing chunks if that initial pass
+// somehow didn't authenticate (or if a block window kicked in mid-upload).
+static bool authValidNoChallenge() {
+  if (authBlockUntilMs > millis()) return false;
+  return server.authenticate(SECRET_OTA_USER, SECRET_OTA_PASS);
 }
 
 void handleRoot() {
+  if (!requireAuth()) return;
   server.send_P(200, "text/html", HTML_DASHBOARD);
 }
 
@@ -1608,20 +1833,32 @@ void handleApiSettingsGet() {
   String jMh   = jsonEscape(mh);
   String jMu   = jsonEscape(mu);
 
-  char buf[550];
+  // mqtt_ca: never return the cert blob itself (it can be 1-2 KB and the
+  // dashboard doesn't need it back). Just report whether one is stored and
+  // its size, so the UI can label the textarea "Certificate stored (NNN bytes)".
+  bool   caSet   = mqttCaCert.length() > 0;
+  size_t caBytes = mqttCaCert.length();
+
+  char buf[640];
   snprintf(buf, sizeof(buf),
     "{\"ap_mode\":%s,\"wifi_ssid\":\"%s\",\"ap_ssid\":\"%s\",\"ap_pass_set\":%s,"
     "\"mqtt_host\":\"%s\",\"mqtt_port\":%d,\"mqtt_user\":\"%s\","
+    "\"mqtt_tls\":%s,\"mqtt_ca_set\":%s,\"mqtt_ca_bytes\":%u,"
     "\"charger_count\":%d,\"ramp_rate_wps\":%d}",
     apIsBroadcasting() ? "true" : "false",
     jSsid.c_str(), jAps.c_str(), hasApPass ? "true" : "false",
-    jMh.c_str(), (int)mqttPort, jMu.c_str(), (int)cc,
-    (int)ctrl.rampStepW
+    jMh.c_str(), (int)mqttPort, jMu.c_str(),
+    mqttTls ? "true" : "false", caSet ? "true" : "false", (unsigned)caBytes,
+    (int)cc, (int)ctrl.rampStepW
   );
   server.send(200, "application/json", buf);
 }
 
-// POST /api/settings — saves settings to NVS (protected)
+// POST /api/settings — saves settings to NVS (protected).
+// Body parsed via ArduinoJson (replaces a hand-rolled indexOf-based parser
+// that could match keys inside string values and silently truncate strings
+// larger than the destination buffer). All length-constrained string fields
+// now reject oversized input with a 400 instead of being silently clipped.
 void handleApiSettingsPost() {
   if (!requireAuth()) return;
   if (!server.hasArg("plain")) {
@@ -1629,60 +1866,83 @@ void handleApiSettingsPost() {
     return;
   }
   String body = server.arg("plain");
-  bool needRestart = false;
 
-  // Helper: extract string value from JSON by key
-  auto extractStr = [&](const char* key, char* out, size_t maxLen) -> bool {
-    String search = String("\"") + key + "\"";
-    int idx = body.indexOf(search);
-    if (idx < 0) return false;
-    int colon = body.indexOf(':', idx);
-    if (colon < 0) return false;
-    int q1 = body.indexOf('"', colon + 1);
-    if (q1 < 0) return false;
-    int q2 = body.indexOf('"', q1 + 1);
-    if (q2 < 0) return false;
-    String val = body.substring(q1 + 1, q2);
-    val.toCharArray(out, maxLen);
+  // Dynamic doc — sized to the body — because the optional mqtt_ca blob can
+  // be a 2 KB PEM cert, which would overflow a fixed StaticJsonDocument.
+  // Without the cert the body is a few hundred bytes and the heap cost is
+  // trivial. Cap at 8 KB so a malicious oversized POST can't OOM the device.
+  if (body.length() > 8192) {
+    server.send(413, "application/json", "{\"ok\":false,\"error\":\"Payload too large\"}");
+    return;
+  }
+  DynamicJsonDocument doc(body.length() + 1024);
+  if (deserializeJson(doc, body)) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid JSON\"}");
+    return;
+  }
+
+  // Helper: copy a JSON string into a fixed-size NUL-terminated buffer.
+  // Returns false (and sends a 400) if the source is longer than `maxLen-1`,
+  // so an over-long value is reported back to the caller instead of silently
+  // truncated. Caller checks the return and bails out on false.
+  auto copyChecked = [&](const char* src, char* dst, size_t maxLen,
+                         const char* fieldLabel) -> bool {
+    if (!src) src = "";
+    size_t l = strlen(src);
+    if (l >= maxLen) {
+      char err[96];
+      snprintf(err, sizeof(err),
+               "{\"ok\":false,\"error\":\"%s too long (max %u chars)\"}",
+               fieldLabel, (unsigned)(maxLen - 1));
+      server.send(400, "application/json", err);
+      return false;
+    }
+    strncpy(dst, src, maxLen - 1);
+    dst[maxLen - 1] = '\0';
     return true;
   };
-  auto extractInt = [&](const char* key) -> int {
-    String search = String("\"") + key + "\"";
-    int idx = body.indexOf(search);
-    if (idx < 0) return -1;
-    int colon = body.indexOf(':', idx);
-    if (colon < 0) return -1;
-    return body.substring(colon + 1).toInt();
-  };
 
-  // WiFi credentials
-  char tmp[65];
-  if (extractStr("wifi_ssid", tmp, sizeof(tmp))) {
-    if (strlen(tmp) == 0) {
+  bool needRestart = false;
+
+  // WiFi credentials. Present-but-empty SSID is an error; absent SSID just
+  // means "leave WiFi config alone".
+  if (doc.containsKey("wifi_ssid")) {
+    const char* ssid = doc["wifi_ssid"] | "";
+    if (strlen(ssid) == 0) {
       server.send(400, "application/json", "{\"ok\":false,\"error\":\"SSID empty\"}");
       return;
     }
+    char tmp[65];
+    if (!copyChecked(ssid, tmp, sizeof(tmp), "wifi_ssid")) return;
     preferences.putString("ssid", tmp);
-    char tmpPass[65] = "";
-    extractStr("wifi_pass", tmpPass, sizeof(tmpPass));
+    const char* pass = doc["wifi_pass"] | "";
+    char tmpPass[65];
+    if (!copyChecked(pass, tmpPass, sizeof(tmpPass), "wifi_pass")) return;
     preferences.putString("pass", tmpPass);
     LOG("[SETTINGS] WiFi credentials saved\n");
     needRestart = true;
   }
 
-  // AP credentials
-  if (extractStr("ap_ssid", tmp, sizeof(tmp))) {
-    if (strlen(tmp) > 0) {
+  // AP credentials.
+  if (doc.containsKey("ap_ssid")) {
+    const char* aps = doc["ap_ssid"] | "";
+    if (strlen(aps) > 0) {
+      char tmp[sizeof(apSSID)];
+      if (!copyChecked(aps, tmp, sizeof(tmp), "ap_ssid")) return;
       preferences.putString("ap_ssid", tmp);
       strncpy(apSSID, tmp, sizeof(apSSID) - 1);
       apSSID[sizeof(apSSID) - 1] = '\0';
     }
-    char tmpPass[65] = "";
-    if (extractStr("ap_pass", tmpPass, sizeof(tmpPass))) {
-      if (strlen(tmpPass) > 0 && strlen(tmpPass) < 8) {
-        server.send(400, "application/json", "{\"ok\":false,\"error\":\"AP password must be 8+ chars\"}");
+    if (doc.containsKey("ap_pass")) {
+      const char* app = doc["ap_pass"] | "";
+      size_t apl = strlen(app);
+      if (apl > 0 && apl < 8) {
+        server.send(400, "application/json",
+                    "{\"ok\":false,\"error\":\"AP password must be 8+ chars\"}");
         return;
       }
+      char tmpPass[sizeof(apPass)];
+      if (!copyChecked(app, tmpPass, sizeof(tmpPass), "ap_pass")) return;
       preferences.putString("ap_pass", tmpPass);
       strncpy(apPass, tmpPass, sizeof(apPass) - 1);
       apPass[sizeof(apPass) - 1] = '\0';
@@ -1690,26 +1950,33 @@ void handleApiSettingsPost() {
     LOG("[SETTINGS] AP credentials saved: \"%s\"\n", apSSID);
   }
 
-  // MQTT settings
-  if (extractStr("mqtt_host", tmp, sizeof(tmp))) {
+  // MQTT settings.
+  if (doc.containsKey("mqtt_host")) {
+    const char* mh = doc["mqtt_host"] | "";
+    char tmp[sizeof(mqttHost)];
+    if (!copyChecked(mh, tmp, sizeof(tmp), "mqtt_host")) return;
     preferences.putString("mqtt_host", tmp);
     strncpy(mqttHost, tmp, sizeof(mqttHost) - 1);
     mqttHost[sizeof(mqttHost) - 1] = '\0';
 
-    int port = extractInt("mqtt_port");
+    int port = doc["mqtt_port"] | 0;
     if (port > 0 && port <= 65535) {
       preferences.putUShort("mqtt_port", (uint16_t)port);
       mqttPort = (uint16_t)port;
     }
 
-    char tmpUser[33] = "";
-    if (extractStr("mqtt_user", tmpUser, sizeof(tmpUser))) {
+    if (doc.containsKey("mqtt_user")) {
+      const char* mu = doc["mqtt_user"] | "";
+      char tmpUser[sizeof(mqttUser)];
+      if (!copyChecked(mu, tmpUser, sizeof(tmpUser), "mqtt_user")) return;
       preferences.putString("mqtt_user", tmpUser);
       strncpy(mqttUser, tmpUser, sizeof(mqttUser) - 1);
       mqttUser[sizeof(mqttUser) - 1] = '\0';
     }
-    char tmpPass[65] = "";
-    if (extractStr("mqtt_pass", tmpPass, sizeof(tmpPass))) {
+    if (doc.containsKey("mqtt_pass")) {
+      const char* mp = doc["mqtt_pass"] | "";
+      char tmpPass[sizeof(mqttBrokerPass)];
+      if (!copyChecked(mp, tmpPass, sizeof(tmpPass), "mqtt_pass")) return;
       preferences.putString("mqtt_pass", tmpPass);
       strncpy(mqttBrokerPass, tmpPass, sizeof(mqttBrokerPass) - 1);
       mqttBrokerPass[sizeof(mqttBrokerPass) - 1] = '\0';
@@ -1719,15 +1986,66 @@ void handleApiSettingsPost() {
     mqttClient.disconnect();
   }
 
-  // Charger count
-  int cc = extractInt("charger_count");
-  if (cc >= 1 && cc <= 4) {
-    if (xSemaphoreTake(controlMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-      ctrl.chargerCount = (uint8_t)cc;
-      xSemaphoreGive(controlMutex);
+  // MQTT TLS toggle + CA cert blob. Both can be sent together with the
+  // mqtt_host block above or independently. The cert is validated server-side
+  // by checking for the PEM markers; if invalid we reject the whole request
+  // rather than silently dropping the field. Enabling TLS with no cert
+  // currently stored (and none in this request) is also rejected — that
+  // would leave the device in a state where it logs "refusing to connect"
+  // forever, which is confusing UX.
+  bool mqttSettingsTouched = doc.containsKey("mqtt_tls") || doc.containsKey("mqtt_ca");
+  if (doc.containsKey("mqtt_ca")) {
+    const char* ca = doc["mqtt_ca"] | "";
+    size_t calen = strlen(ca);
+    if (calen == 0) {
+      // Empty string explicitly clears the stored cert.
+      mqttCaCert = "";
+      preferences.remove("mqtt_ca");
+      LOG("[SETTINGS] MQTT CA cert cleared\n");
+    } else {
+      if (calen > 4096) {
+        server.send(400, "application/json",
+                    "{\"ok\":false,\"error\":\"CA cert too large (max 4 KB)\"}");
+        return;
+      }
+      if (!strstr(ca, "-----BEGIN CERTIFICATE-----") ||
+          !strstr(ca, "-----END CERTIFICATE-----")) {
+        server.send(400, "application/json",
+                    "{\"ok\":false,\"error\":\"CA cert must be PEM (BEGIN/END markers required)\"}");
+        return;
+      }
+      mqttCaCert = ca;
+      preferences.putString("mqtt_ca", mqttCaCert);
+      LOG("[SETTINGS] MQTT CA cert saved (%u bytes)\n", (unsigned)calen);
     }
-    preferences.putUChar("charger_count", (uint8_t)cc);
-    LOG("[SETTINGS] Charger count: %d\n", cc);
+  }
+  if (doc.containsKey("mqtt_tls")) {
+    bool tls = doc["mqtt_tls"] | false;
+    if (tls && mqttCaCert.length() == 0) {
+      server.send(400, "application/json",
+                  "{\"ok\":false,\"error\":\"Cannot enable TLS without a CA cert. Upload one first.\"}");
+      return;
+    }
+    mqttTls = tls;
+    preferences.putBool("mqtt_tls", tls);
+    LOG("[SETTINGS] MQTT TLS: %s\n", tls ? "ON" : "off");
+  }
+  if (mqttSettingsTouched) {
+    // Force the next mqttTask iteration to reconnect with the new transport.
+    mqttClient.disconnect();
+  }
+
+  // Charger count.
+  if (doc.containsKey("charger_count")) {
+    int cc = doc["charger_count"] | -1;
+    if (cc >= 1 && cc <= 4) {
+      if (xSemaphoreTake(controlMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        ctrl.chargerCount = (uint8_t)cc;
+        xSemaphoreGive(controlMutex);
+      }
+      preferences.putUChar("charger_count", (uint8_t)cc);
+      LOG("[SETTINGS] Charger count: %d\n", cc);
+    }
   }
 
   server.send(200, "application/json", "{\"ok\":true}");
@@ -1739,8 +2057,13 @@ void handleApiSettingsPost() {
   }
 }
 
-// Legacy POST /save — redirect to new settings API for backwards compatibility
+// Legacy POST /save — kept for backwards compatibility with the original
+// setup-page form. Auth-gated: without this check, any device on the LAN
+// (or any malicious page the owner visits in a tab on the same network —
+// form-encoded POSTs are CORS-simple, no preflight) could rewrite the WiFi
+// credentials and force a reboot, hijacking the controller.
 void handleSave() {
+  if (!requireAuth()) return;
   if (server.hasArg("ssid")) {
     String newSSID = server.arg("ssid");
     String newPass = server.arg("pass");
@@ -1759,8 +2082,12 @@ void handleSave() {
   server.send(400, "text/plain", "Missing SSID");
 }
 
-// GET /api/status — JSON endpoint polled by the dashboard every 2 s
+// GET /api/status — JSON endpoint polled by the dashboard every 2 s.
+// Auth-gated: pack voltage, SoC and energy figures shouldn't be readable
+// by any device on the LAN. The browser caches the Basic Auth header from
+// the dashboard load and re-uses it on every poll without re-prompting.
 void handleApiStatus() {
+  if (!requireAuth()) return;
   // Snapshot both data structs under their respective mutexes
   LiveData      liveSnap;
   ChargerBusData chargerSnap;
@@ -1805,9 +2132,9 @@ void handleApiStatus() {
                               ? (float)liveSnap.powerTankAH * powerTankSoc / 100.0f
                               : 0.0f;
 
-  // Snapshot session data
-  float sessWh = session.energyWh;
-  float sessAh = session.chargeAh;
+  // Snapshot session data — atomic read pair via sessionMutex.
+  float sessWh = 0.0f, sessAh = 0.0f;
+  sessionSnapshot(sessWh, sessAh);
 
   // Fixed fields — use a stack buffer for the bulk of the response
   char buf[1024];
@@ -1920,9 +2247,13 @@ void handleApiStatus() {
 }
 
 // POST /api/control — sets target power, enabled state, charger count,
-//                     ramp rate, and target voltage (protected)
+//                     ramp rate, and target voltage (protected).
 // Body: {"target_w": 3300, "enabled": true, "charger_count": 3,
 //        "ramp_rate_wps": 50, "target_volt_dv": 1100, "reset_session": true}
+// Body parsed via ArduinoJson (replaces an indexOf-based parser that could
+// match keys appearing inside string values elsewhere in the payload).
+// Only fields actually present in the body are applied; missing fields are
+// left unchanged.
 void handleApiControl() {
   if (!requireAuth()) return;
   if (!server.hasArg("plain")) {
@@ -1931,61 +2262,26 @@ void handleApiControl() {
   }
   String body = server.arg("plain");
 
-  // Minimal hand-rolled JSON extraction — avoids ArduinoJson heap cost
-  int tw = -1;
-  int idx = body.indexOf("\"target_w\"");
-  if (idx >= 0) {
-    int colon = body.indexOf(':', idx);
-    if (colon >= 0) tw = body.substring(colon + 1).toInt();
+  StaticJsonDocument<256> doc;
+  if (deserializeJson(doc, body)) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid JSON\"}");
+    return;
   }
 
-  bool en = ctrl.enabled;
-  idx = body.indexOf("\"enabled\"");
-  if (idx >= 0) {
-    int colon = body.indexOf(':', idx);
-    if (colon >= 0) {
-      String rest = body.substring(colon + 1);
-      rest.trim();
-      en = rest.startsWith("true");
-    }
-  }
-
-  int cc = -1;
-  idx = body.indexOf("\"charger_count\"");
-  if (idx >= 0) {
-    int colon = body.indexOf(':', idx);
-    if (colon >= 0) cc = body.substring(colon + 1).toInt();
-  }
-
-  int rr = -1;
-  idx = body.indexOf("\"ramp_rate_wps\"");
-  if (idx >= 0) {
-    int colon = body.indexOf(':', idx);
-    if (colon >= 0) rr = body.substring(colon + 1).toInt();
-  }
-
-  int tvd = -1;
-  idx = body.indexOf("\"target_volt_dv\"");
-  if (idx >= 0) {
-    int colon = body.indexOf(':', idx);
-    if (colon >= 0) tvd = body.substring(colon + 1).toInt();
-  }
-
-  bool resetSession = false;
-  idx = body.indexOf("\"reset_session\"");
-  if (idx >= 0) {
-    int colon = body.indexOf(':', idx);
-    if (colon >= 0) {
-      String rest = body.substring(colon + 1);
-      rest.trim();
-      resetSession = rest.startsWith("true");
-    }
-  }
+  bool hasEn   = doc.containsKey("enabled");
+  bool en      = doc["enabled"]        | false;
+  int  tw      = doc["target_w"]       | -1;
+  int  cc      = doc["charger_count"]  | -1;
+  int  rr      = doc["ramp_rate_wps"]  | -1;
+  int  tvd     = doc["target_volt_dv"] | -1;
+  bool resetSession = doc["reset_session"] | false;
 
   if (xSemaphoreTake(controlMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
     if (tw >= 0) ctrl.targetPowerW = (uint16_t)constrain(tw, 0, 13200);
-    ctrl.enabled = en;
-    if (!en) ctrl.currentPowerW = 0; // immediate stop on disable
+    if (hasEn) {
+      ctrl.enabled = en;
+      if (!en) ctrl.currentPowerW = 0; // immediate stop on disable
+    }
     if (cc >= 1 && cc <= 4) {
       ctrl.chargerCount = (uint8_t)cc;
       preferences.putUChar("charger_count", (uint8_t)cc);
@@ -2002,32 +2298,129 @@ void handleApiControl() {
   }
 
   if (resetSession) {
-    session.energyWh = 0.0f;
-    session.chargeAh = 0.0f;
-    session.startMs  = millis();
+    sessionReset();
     LOG("[CTRL] Session reset\n");
   }
 
   LOG("[CTRL] target=%dW enabled=%s chargers=%d ramp=%dW/s tgtV=%ddV\n",
-      tw, en ? "true" : "false",
+      tw, hasEn ? (en ? "true" : "false") : "(unchanged)",
       cc > 0 ? cc : (int)ctrl.chargerCount,
       rr > 0 ? rr : (int)ctrl.rampStepW,
       tvd > 0 ? tvd : (int)ctrl.targetVoltDv);
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
-// GET /update — OTA page, HTTP Basic Auth
-void handleOTAGet() {
-  if (!server.authenticate(SECRET_OTA_USER, SECRET_OTA_PASS)) {
-    return server.requestAuthentication();
+// ---------------------------------------------------------------------------
+// HMAC-signed OTA — verification state and helpers (security pass round 2)
+//
+//   The .bin produced by the build hook has a 32-byte HMAC-SHA256 trailer
+//   appended after the firmware image. The trailer is over the *image* bytes
+//   only, keyed with OTA_HMAC_SECRET[32] from ota_secret.h.
+//
+//   On upload we stream all bytes through mbedtls_md_hmac_update() except the
+//   trailing 32, which we hold in a sliding window. When the upload ends we
+//   pop the 32 bytes from the window (those are the candidate HMAC), feed any
+//   image bytes still in the window through the HMAC, finalize, and compare
+//   against the candidate using a constant-time check. Mismatch → Update.abort().
+//
+//   This blocks the "OTA creds leaked → arbitrary firmware flashed" attack:
+//   without the secret an attacker can't produce a valid trailer, so an
+//   unsigned (or wrongly-signed) .bin is rejected before any flash write
+//   commits.
+//
+//   Limitation: an attacker with physical access can extract the secret from
+//   flash. They can already reflash via USB though, so the secret being in
+//   flash is not widening the attack surface.
+//
+//   This block lives ABOVE the OTA handlers so handleOTAPost can read the
+//   sticky failure flag set by handleOTAUpload during the multipart stream.
+// ---------------------------------------------------------------------------
+static mbedtls_md_context_t otaHmacCtx;
+static bool                 otaHmacInited = false;
+// Sliding window of the most recent OTA_HMAC_LEN bytes. Anything older has
+// already been hashed AND written to the partition. At UPLOAD_FILE_END this
+// window holds exactly the candidate HMAC trailer.
+static const size_t OTA_HMAC_LEN = 32;
+static uint8_t otaHmacWin[OTA_HMAC_LEN];
+static size_t  otaHmacWinFill   = 0;     // 0..OTA_HMAC_LEN
+static bool    otaUploadFailed  = false; // sticky: any error bails out the rest
+static size_t  otaImageBytes    = 0;     // bytes actually flashed (image, no HMAC)
+
+static void otaResetHmacState() {
+  if (otaHmacInited) {
+    mbedtls_md_free(&otaHmacCtx);
+    otaHmacInited = false;
   }
+  otaHmacWinFill  = 0;
+  otaUploadFailed = false;
+  otaImageBytes   = 0;
+}
+
+static bool otaHmacBegin() {
+  mbedtls_md_init(&otaHmacCtx);
+  const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  if (!info) return false;
+  if (mbedtls_md_setup(&otaHmacCtx, info, 1 /* HMAC */) != 0) return false;
+  if (mbedtls_md_hmac_starts(&otaHmacCtx,
+                             OTA_HMAC_SECRET, sizeof(OTA_HMAC_SECRET)) != 0) {
+    mbedtls_md_free(&otaHmacCtx);
+    return false;
+  }
+  otaHmacInited = true;
+  return true;
+}
+
+// Constant-time byte compare — avoids leaking match progress via timing.
+static bool otaConstTimeEqual(const uint8_t* a, const uint8_t* b, size_t n) {
+  uint8_t diff = 0;
+  for (size_t i = 0; i < n; i++) diff |= (a[i] ^ b[i]);
+  return diff == 0;
+}
+
+// Process one chunk of upload bytes:
+//   1. Append `buf` to the sliding window (but the window only holds the
+//      last OTA_HMAC_LEN bytes — anything pushed out goes through the HMAC
+//      and gets flashed via Update.write()).
+//   2. The bytes that get pushed out of the window are committed image bytes;
+//      everything still in the window is "could be HMAC trailer, hold for now".
+//
+// At end-of-upload the window holds exactly the candidate HMAC trailer.
+static bool otaProcessChunk(const uint8_t* buf, size_t n) {
+  for (size_t i = 0; i < n; i++) {
+    if (otaHmacWinFill < OTA_HMAC_LEN) {
+      otaHmacWin[otaHmacWinFill++] = buf[i];
+      continue;
+    }
+    // Window full — push oldest byte out, slide everything left, append new.
+    uint8_t emit = otaHmacWin[0];
+    memmove(otaHmacWin, otaHmacWin + 1, OTA_HMAC_LEN - 1);
+    otaHmacWin[OTA_HMAC_LEN - 1] = buf[i];
+
+    // The emitted byte is part of the image — feed HMAC + flash.
+    if (mbedtls_md_hmac_update(&otaHmacCtx, &emit, 1) != 0) return false;
+    if (Update.write(&emit, 1) != 1) return false;
+    otaImageBytes++;
+  }
+  return true;
+}
+
+// GET /update — OTA page (Digest auth + brute-force back-off via requireAuth)
+void handleOTAGet() {
+  if (!requireAuth()) return;
   server.send_P(200, "text/html", HTML_OTA);
 }
 
 // POST /update completion handler
 void handleOTAPost() {
-  if (!server.authenticate(SECRET_OTA_USER, SECRET_OTA_PASS)) {
-    return server.requestAuthentication();
+  if (!requireAuth()) return;
+  // Check the HMAC-verification flag before Update.hasError() — the upload
+  // handler may have called Update.abort() on a signature mismatch, and
+  // hasError() doesn't always reflect an explicit abort.
+  if (otaUploadFailed) {
+    server.send(403, "text/plain",
+                "Update rejected: signature invalid or upload incomplete.\n");
+    LOG("[OTA] FAILED: rejected by HMAC verification\n");
+    return;
   }
   if (Update.hasError()) {
     server.send(500, "text/plain",
@@ -2043,25 +2436,72 @@ void handleOTAPost() {
 
 // POST /update body handler — called by WebServer as multipart chunks arrive.
 // Auth MUST be checked here — WebServer calls this for each chunk BEFORE
-// the POST completion handler (handleOTAPost) runs.
+// the POST completion handler (handleOTAPost) runs. We use the silent variant
+// so we don't try to send a 401 response in the middle of a multipart stream.
+// HMAC verification state and helpers are declared above handleOTAGet.
 void handleOTAUpload() {
-  if (!server.authenticate(SECRET_OTA_USER, SECRET_OTA_PASS)) return;
+  if (!authValidNoChallenge()) return;
   HTTPUpload& upload = server.upload();
+
   if (upload.status == UPLOAD_FILE_START) {
+    otaResetHmacState();
     LOG("[OTA] Start: field='%s' file='%s'\n",
                   upload.name.c_str(), upload.filename.c_str());
+    if (!otaHmacBegin()) {
+      LOG("[OTA] HMAC init failed — aborting upload\n");
+      otaUploadFailed = true;
+      return;
+    }
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
       LOG("[OTA] begin() error: %s\n", Update.errorString());
+      otaUploadFailed = true;
+      return;
     }
+
   } else if (upload.status == UPLOAD_FILE_WRITE) {
-    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-      LOG("[OTA] write() error: %s\n", Update.errorString());
+    if (otaUploadFailed) return;
+    if (!otaProcessChunk(upload.buf, upload.currentSize)) {
+      LOG("[OTA] chunk processing failed — aborting\n");
+      Update.abort();
+      otaUploadFailed = true;
     }
+
   } else if (upload.status == UPLOAD_FILE_END) {
+    if (otaUploadFailed) {
+      // Already aborted earlier; nothing more to do here.
+      return;
+    }
+    // The sliding window now holds exactly the candidate HMAC trailer.
+    // (Upload smaller than 32 bytes? Then the window is short and we have
+    // no room for an image — definitely not a valid signed firmware.)
+    if (otaHmacWinFill < OTA_HMAC_LEN) {
+      LOG("[OTA] Upload too small (%u bytes total) to contain HMAC trailer — "
+          "rejecting\n", (unsigned)upload.totalSize);
+      Update.abort();
+      otaUploadFailed = true;
+      return;
+    }
+    uint8_t calc[OTA_HMAC_LEN];
+    if (mbedtls_md_hmac_finish(&otaHmacCtx, calc) != 0) {
+      LOG("[OTA] HMAC finalize failed — rejecting\n");
+      Update.abort();
+      otaUploadFailed = true;
+      return;
+    }
+    if (!otaConstTimeEqual(calc, otaHmacWin, OTA_HMAC_LEN)) {
+      LOG("[OTA] HMAC mismatch — image is not signed by this build host. "
+          "Rejecting (image=%u bytes).\n", (unsigned)otaImageBytes);
+      Update.abort();
+      otaUploadFailed = true;
+      return;
+    }
+    LOG("[OTA] HMAC verified — finalising flash (%u bytes)\n",
+        (unsigned)otaImageBytes);
     if (Update.end(true)) {
-      LOG("[OTA] Done. %u bytes written.\n", upload.totalSize);
+      LOG("[OTA] Done. %u bytes written.\n", (unsigned)otaImageBytes);
     } else {
       LOG("[OTA] end() error: %s\n", Update.errorString());
+      otaUploadFailed = true;
     }
   }
 }
@@ -2371,6 +2811,14 @@ void setup() {
       mqttHost[sizeof(mqttHost) - 1] = '\0';
     }
     mqttPort = preferences.getUShort("mqtt_port", 1883);
+    // TLS toggle + CA cert blob. Default: TLS off (preserves the unencrypted
+    // installation path). Cert blob is stored as a NUL-terminated PEM string
+    // in NVS — Preferences caps a single string at ~3.5 KB which comfortably
+    // fits a CA certificate (typically 1.5–2 KB).
+    mqttTls    = preferences.getBool("mqtt_tls", false);
+    mqttCaCert = preferences.getString("mqtt_ca", "");
+    LOG("[BOOT] MQTT TLS: %s, CA cert: %u bytes\n",
+        mqttTls ? "ON" : "off", (unsigned)mqttCaCert.length());
     String u = preferences.getString("mqtt_user", "");
     if (u.length() > 0) {
       u.toCharArray(mqttUser, sizeof(mqttUser));
@@ -2422,6 +2870,14 @@ void setup() {
   server.on("/log",             HTTP_GET,  handleLogPage);
   server.on("/update",          HTTP_GET,  handleOTAGet);
   server.on("/update",          HTTP_POST, handleOTAPost, handleOTAUpload);
+
+  // Tell WebServer to keep the Authorization header on incoming requests —
+  // required by both server.authenticate() (Digest needs the nonce/cnonce
+  // back from the client) and our requireAuth()'s "did the client even
+  // submit credentials?" check, which only counts a fail if a header was
+  // present (so a fresh dashboard visit doesn't burn three free attempts).
+  const char* collectedHeaders[] = { "Authorization" };
+  server.collectHeaders(collectedHeaders, 1);
 
   server.begin();
 
@@ -2852,6 +3308,13 @@ void processChargerFrame(uint32_t id, byte len, byte* buf) {
   uint8_t nibble = (uint8_t)(id & 0x0F); // charger instance index
   if (nibble >= MAX_CHARGERS) return;
 
+  // Guard against short / malformed frames — the buf[] passed in is an
+  // 8-byte stack array that's only filled up to `len`; reading past `len`
+  // would yield uninitialised garbage that we'd then act on as charger volts
+  // / amps. A real Elcon TC HK status frame is always 8 bytes; anything
+  // shorter is a protocol violation and we drop it.
+  if (len < 4) return;
+
   uint16_t voltDv = ((uint16_t)buf[0] << 8) | buf[1]; // 0.1 V units
   uint16_t ampsDa = ((uint16_t)buf[2] << 8) | buf[3]; // 0.1 A units
   uint8_t  status = (len >= 5) ? buf[4] : 0;
@@ -3202,8 +3665,7 @@ void rampTask(void* /*pvParameters*/) {
 
     // Session energy (CC phase only — CV energy accumulated below with actual amps)
     if (phase == PHASE_CC && packDv > 0 && current > 0 && cmdAmpsDa > 0) {
-      session.energyWh += current / 3600.0f;
-      session.chargeAh += totalAmpsA / 3600.0f;
+      sessionAddCC(current / 3600.0f, totalAmpsA / 3600.0f);
     }
 
     // ── Charger bus update + CV phase management ──────────────────────────────
@@ -3237,8 +3699,7 @@ void rampTask(void* /*pvParameters*/) {
         }
         if (!terminating && packDv > 0 && actualA > 0.0f) {
           float cvPwrW = actualA * (packDv / 10.0f);
-          session.energyWh += cvPwrW / 3600.0f;
-          session.chargeAh += actualA  / 3600.0f;
+          sessionAddCC(cvPwrW / 3600.0f, actualA / 3600.0f);
         }
 
         // Keep charger alive in CV mode
@@ -3357,6 +3818,14 @@ void rampInit() {
   controlMutex = xSemaphoreCreateMutex();
   if (controlMutex == nullptr) {
     LOG("[RAMP] Failed to create mutex — halting\n");
+    while (true) { delay(1000); }
+  }
+
+  // Session counters are touched from rampTask, /api/control, and mqttCallback —
+  // create the mutex before any of those tasks start.
+  sessionMutex = xSemaphoreCreateMutex();
+  if (sessionMutex == nullptr) {
+    LOG("[RAMP] Failed to create session mutex — halting\n");
     while (true) { delay(1000); }
   }
 
@@ -3865,9 +4334,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
   } else if (strcmp(cmd, "reset_session") == 0) {
     // Any payload (HA button sends "PRESS") triggers the reset
-    session.energyWh = 0.0f;
-    session.chargeAh = 0.0f;
-    session.startMs  = millis();
+    sessionReset();
     // Force MQTT snapshot reset so new zeroed values publish immediately
     mqttLast.sessionWh = -1;
     mqttLast.sessionAh = -1;
@@ -3885,6 +4352,30 @@ static bool mqttConnect() {
   char cmdBase[90];
   snprintf(cmdBase, sizeof(cmdBase), "%s/command/#", baseTopic);
 
+  // Pick the underlying transport: WiFiClientSecure (TLS) when the user has
+  // enabled SSL on the settings page AND uploaded a CA cert; plaintext
+  // WiFiClient otherwise. We refuse to fall back to setInsecure() — without
+  // a pinned CA, MQTT-TLS provides confidentiality but no authentication of
+  // the broker, which is worse than plaintext (gives a false sense of
+  // security and lets MITM attackers transparently relay credentials).
+  if (mqttTls) {
+    if (mqttCaCert.length() == 0) {
+      static unsigned long lastWarnMs = 0;
+      if (millis() - lastWarnMs > 30000UL) {
+        lastWarnMs = millis();
+        LOG("[MQTT] TLS enabled but no CA cert configured — refusing to connect. "
+            "Upload a PEM cert on the settings page or disable TLS.\n");
+      }
+      return false;
+    }
+    mqttTlsClient.setCACert(mqttCaCert.c_str());
+    mqttClient.setClient(mqttTlsClient);
+  } else {
+    mqttClient.setClient(mqttWifiClient);
+  }
+  // Keep the broker host/port in sync with the (possibly-swapped) transport.
+  mqttClient.setServer(mqttHost, mqttPort);
+
   bool ok = mqttClient.connect(
     mqttHostname,
     mqttUser,
@@ -3901,9 +4392,11 @@ static bool mqttConnect() {
     mqttPublishDiscovery();
     // Reset snapshot so all values publish immediately after reconnect
     mqttLast = MqttSnapshot();
-    LOG("[MQTT] Connected to %s:%d as %s\n", mqttHost, mqttPort, mqttHostname);
+    LOG("[MQTT] Connected to %s:%d (%s) as %s\n",
+        mqttHost, mqttPort, mqttTls ? "TLS" : "plain", mqttHostname);
   } else {
-    LOG("[MQTT] Connect failed, rc=%d\n", mqttClient.state());
+    LOG("[MQTT] Connect failed (%s), rc=%d\n",
+        mqttTls ? "TLS" : "plain", mqttClient.state());
   }
   return ok;
 }
@@ -3920,9 +4413,11 @@ static bool mqttPublishChanges() {
   if (xSemaphoreTake(chargerMutex, pdMS_TO_TICKS(10)) == pdTRUE) { cs = chargerBus; xSemaphoreGive(chargerMutex); }
   if (xSemaphoreTake(controlMutex, pdMS_TO_TICKS(10)) == pdTRUE) { ks = ctrl;       xSemaphoreGive(controlMutex); }
 
-  // Session data is only written by rampTask (Core 1), same core as mqttTask — safe to read directly
-  float sessWh = session.energyWh;
-  float sessAh = session.chargeAh;
+  // Session data: rampTask, /api/control and mqttCallback all touch these.
+  // Use the helper for an atomic read of the (Wh, Ah) pair so a half-reset
+  // is never observable.
+  float sessWh = 0.0f, sessAh = 0.0f;
+  sessionSnapshot(sessWh, sessAh);
 
   bool published = false;
 

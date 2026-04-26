@@ -1,0 +1,1 @@
+recipe.hooks.objcopy.postobjcopy.99.pattern=python "{build.source.path}/sign_ota.py" "{build.path}/{build.project_name}.bin"
