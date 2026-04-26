@@ -46,7 +46,7 @@
 //   driver/twai.h    } built into Espressif ESP32 Arduino core - no install needed
 // ==========================================================================
 
-#define VERSION 202604261143
+#define VERSION 202604261536
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -335,8 +335,8 @@ static const int MAX_CHARGER_ROWS = 4;
 static const uint16_t MAX_CHARGE_VOLTAGE_DV =
   VOLTAGE_CUTBACK[ (sizeof(VOLTAGE_CUTBACK)/sizeof(VOLTAGE_CUTBACK[0])) - 1 ].threshold;
 
-// Ramp rate: default 50 W per ramp tick (1 s), slider step 100 W
-static const uint16_t DEFAULT_RAMP_STEP_W = 50;
+// Ramp rate: default 100 W per ramp tick (1 s), slider step 100 W
+static const uint16_t DEFAULT_RAMP_STEP_W = 100;
 static const uint16_t SLIDER_STEP_W = 100;
 
 // Voltage-to-SOC lookup table (decivolts → percent)
@@ -674,7 +674,7 @@ const char HTML_SETTINGS[] PROGMEM = R"rawliteral(
   <div class="box">
     <label>Ramp Rate (W/s, 10–500)</label>
     <input type="number" id="rampRate" min="10" max="500" value="50">
-    <div class="hint">Power increases/decreases by this many watts per second when ramping. Lower = gentler ramp. Default: 50 W/s.</div>
+    <div class="hint">Power increases/decreases by this many watts per second when ramping. Lower = gentler ramp. Default: 100 W/s.</div>
     <button onclick="saveRampRate()">Save Ramp Rate</button>
   </div>
 
@@ -1702,76 +1702,77 @@ void sseFlush() {
 //    the LAN can't lift the credential. Browser caches the challenge for
 //    the session, so the dashboard's 2 s polling reuses auth without
 //    re-prompting.
-//  - **Brute-force back-off via response delay**: after the 3rd consecutive
-//    failed attempt, every subsequent failed attempt incurs a vTaskDelay
-//    *before* the 401 response is sent — 1, 2, 4, 8, 16, then 30 s (capped),
-//    plus 0–2 s of random jitter. The delay is on the failing handler
-//    itself, not a global block window: this is what makes a brute-force
-//    feel monotonically slower, instead of mixing instant 429-rejections
-//    with the slow real failures (which is visually indistinguishable from
-//    fast successes). Counter and any pending delay reset on the first
-//    successful auth. Tracking is global (not per-IP) — single-user device,
-//    an attacker can open as many connections as they want, they all
-//    serialize through the single WebServer task.
-//  - **30 s cap per delay** stays under typical browser/curl request
-//    timeouts (~60 s) so the client connection doesn't drop mid-wait. The
-//    cumulative back-off across many attempts is still strong:
-//    3 fast + 1+2+4+8+16+30+30+30+... s sequential.
+//  - **Brute-force back-off — counter-driven, unconditional**: after the
+//    second consecutive failure, EVERY subsequent attempt incurs a
+//    vTaskDelay *before* its 401 response. The delay grows with the failure
+//    count alone — there is no wall-clock deadline the attacker can pace
+//    themselves to step over. (An earlier deadline-based design was
+//    bypassable by typing every ~2 s; the user observed 30+ retries in
+//    under a minute. This rewrite makes the wait a pure function of the
+//    counter so paced attempts no longer get a free pass.)
+//  - **Schedule** (counter = number of prior consecutive failures):
+//      1st attempt    : 0 s
+//      2nd attempt    : 0 s
+//      3rd attempt    : 2 s
+//      4th attempt    : 5 s
+//      5th attempt    : 15 s
+//      6th attempt    : 30 s
+//      7th and beyond : 60 s
+//    Plus 0–2 s random jitter. Cumulative cost to brute-force 10 attempts
+//    ≈ 5 minutes, so a casual attacker is blocked well before getting
+//    anywhere near a serious search. A legit user who typos a few times
+//    pays the delay once and is back to free attempts after a successful
+//    login (counter resets on success).
+//  - **60 s cap** matches typical HTTP client timeouts; the connection
+//    stays alive through the wait so the client gets the eventual 401.
+//  - **Single WebServer task → all attempts serialise**, so opening
+//    parallel connections gains the attacker nothing.
 // ---------------------------------------------------------------------------
 static const char AUTH_REALM[] = "Supercharger";
-static uint8_t       authFailCount     = 0;
-// Pending response delay in ms — accumulated as failures pile up, applied
-// to the NEXT failing request before its 401 is sent, then re-computed.
-// Held as an absolute deadline (millis) so any wall-clock time the client
-// spends getting back to us is credited against the wait.
-static unsigned long authBlockUntilMs  = 0;
+static uint8_t authFailCount = 0;
+static const uint8_t AUTH_GRACE = 2;  // free attempts before delays kick in
+
+// Returns the seconds to wait before processing an attempt, given how many
+// consecutive failures have already accumulated.
+static unsigned long authDelaySec(uint8_t fails) {
+  if (fails < AUTH_GRACE) return 0;
+  switch (fails) {
+    case 2:  return 2;        // 3rd attempt
+    case 3:  return 5;        // 4th attempt
+    case 4:  return 15;       // 5th attempt
+    case 5:  return 30;       // 6th attempt
+    default: return 60;       // 7th+
+  }
+}
 
 static bool requireAuth() {
-  unsigned long now = millis();
-
-  // Pre-process delay: if the previous failure(s) set a back-off deadline,
-  // wait it out HERE before consulting the submitted credentials. The wait
-  // is honoured even if the client this time happens to send the correct
-  // password — that's intentional, because letting "correct" requests skip
-  // the wait would leak the right answer via timing.
-  // Cap each individual wait at 30 s so the client's TCP connection /
-  // browser request timer doesn't expire mid-wait.
-  if (authBlockUntilMs > now) {
-    unsigned long waitMs = authBlockUntilMs - now;
-    if (waitMs > 30000UL) waitMs = 30000UL;
-    LOG("[AUTH] Back-off active — delaying response %lu ms\n", waitMs);
-    vTaskDelay(pdMS_TO_TICKS(waitMs));
+  // Counter-driven wait — UNCONDITIONAL once past the grace window. The
+  // wait is honoured even if the client this time happens to send the
+  // correct password; letting "correct" requests skip the wait would leak
+  // the right answer via timing, and would let an attacker who already
+  // owns the password (e.g. via lateral movement) sidestep the rate limit.
+  if (authFailCount >= AUTH_GRACE) {
+    unsigned long delaySec = authDelaySec(authFailCount);
+    delaySec += (unsigned long)(esp_random() % 3);  // 0–2 s jitter
+    LOG("[AUTH] %d prior failures — delaying this attempt %lu s\n",
+        (int)authFailCount, delaySec);
+    vTaskDelay(pdMS_TO_TICKS(delaySec * 1000UL));
   }
 
   if (server.authenticate(SECRET_OTA_USER, SECRET_OTA_PASS)) {
-    if (authFailCount > 0 || authBlockUntilMs > 0) {
+    if (authFailCount > 0) {
       LOG("[AUTH] Successful auth — clearing fail counter (was %d)\n",
           (int)authFailCount);
     }
-    authFailCount    = 0;
-    authBlockUntilMs = 0;
+    authFailCount = 0;
     return true;
   }
 
   // Auth failed.
   if (authFailCount < 255) authFailCount++;
-  LOG("[AUTH] Failed auth attempt #%d\n", (int)authFailCount);
-
-  if (authFailCount >= 3) {
-    // Exponential: 1, 2, 4, 8, 16, then 30 s cap. Plus 0-2 s jitter.
-    // Note: the wait happens at the START of the NEXT request — by the
-    // time it kicks in, anywhere from 0 to several seconds of real time
-    // may have already elapsed (browser thinking, user typing the next
-    // guess). Storing as an absolute deadline credits that elapsed time.
-    uint8_t shift = authFailCount - 3;
-    if (shift > 4) shift = 4;          // 1<<4 = 16 s; everything past caps
-    unsigned long delaySec = 1UL << shift;
-    if (delaySec > 16) delaySec = 16;
-    if (authFailCount > 7) delaySec = 30;  // cap once past 16 s
-    delaySec += (unsigned long)(esp_random() % 3);
-    authBlockUntilMs = millis() + delaySec * 1000UL;
-    LOG("[AUTH] Next failed attempt will be delayed %lu s\n", delaySec);
-  }
+  LOG("[AUTH] Failed auth attempt #%d (next will wait %lu s)\n",
+      (int)authFailCount,
+      authDelaySec(authFailCount));
 
   // Send the Digest challenge. The third arg is the realm shown in the
   // browser's auth dialog; the fourth is a fail message embedded in the 401
@@ -1784,13 +1785,12 @@ static bool requireAuth() {
 // Silent variant for upload chunk handlers (handleOTAUpload). WebServer
 // invokes those once per multipart chunk before the POST completion handler
 // runs; sending a 401 response mid-upload would corrupt the request stream.
-// Returns true iff (a) the back-off window isn't active and (b) the request
-// bears valid Digest credentials. No counter bump on failure — the parent
-// /update GET/POST has already gone through requireAuth() and accounted for
-// the attempt; we just need to keep refusing chunks if that initial pass
-// somehow didn't authenticate (or if a block window kicked in mid-upload).
+// Returns true iff the request bears valid Digest credentials. Does NOT
+// trigger the back-off delay (would stall the upload for minutes per chunk)
+// and does NOT bump the counter — the parent /update POST has already gone
+// through requireAuth() and accounted for the attempt at the start of the
+// multipart sequence.
 static bool authValidNoChallenge() {
-  if (authBlockUntilMs > millis()) return false;
   return server.authenticate(SECRET_OTA_USER, SECRET_OTA_PASS);
 }
 
@@ -3476,10 +3476,28 @@ void rampTask(void* /*pvParameters*/) {
   static unsigned long cvMs   = 0;   // millis() when CV phase was entered
   static uint16_t cvAmpsDa    = 0;   // per-charger amps ceiling during CV
   static bool prevEnabled     = false; // for rising-edge detection on `enabled`
+  // Current-taper CC→CV trigger: when the chargers can't push more current
+  // into the pack despite us commanding power (because the pack has hit its
+  // physical ceiling below the configured voltage target), the cycle never
+  // leaves CC under the voltage-only trigger. Tracks the timestamp at which
+  // measured charger amps first dropped below the taper threshold while
+  // we're at our commanded power; cleared whenever amps recover. Once the
+  // duration crosses CC_TAPER_MS, we transition to CV regardless of pack
+  // voltage. See Bugs 1/2 in [project_charging_bugs_2026-04-26.md].
+  static unsigned long ccTaperStartMs = 0;
 
   const unsigned long CV_HOLD_MS = 60UL * 60UL * 1000UL; // 1 h absorption safety timeout
   const unsigned long CV_MIN_MS  = 120000UL;              // don't terminate CV before 2 min
   const float         CV_TERM_A  = 2.0f;                  // stop CV when total amps < 2 A
+  // Current-taper CC→CV thresholds. Trigger fires when measured charger
+  // amps stay below max(CC_TAPER_FLOOR_A, expected_amps * CC_TAPER_FRAC)
+  // for CC_TAPER_MS while we're commanding ≥90% of our user setpoint. The
+  // floor handles low-target settings (e.g. 100 W trickle where expected
+  // amps are tiny anyway); the fractional check handles normal targets
+  // where "10% of expected" is a meaningful "the pack's done" signal.
+  const float         CC_TAPER_FLOOR_A = 0.5f;
+  const float         CC_TAPER_FRAC    = 0.10f;
+  const unsigned long CC_TAPER_MS      = 90000UL;   // 90 s sustained low-current
 
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(1000)); // 1 s ramp tick
@@ -3548,6 +3566,25 @@ void rampTask(void* /*pvParameters*/) {
     uint16_t voltCeiling = min(targetVolt, MAX_CHARGE_VOLTAGE_DV);
     const long hyst = 10; // 1.0 V in dV
 
+    // ── Measured charger output snapshot ─────────────────────────────────────
+    // Read once up front so that BOTH the current-taper trigger (CC→CV
+    // when pack saturates below the voltage ceiling) AND the CC-phase
+    // session accumulator can use the actual delivered amps. Previously
+    // the CC accumulator added energy at the COMMANDED rate, which kept
+    // counting Wh/Ah even when the chargers reported 0 A — exactly the
+    // pathology Bug 3 in [project_charging_bugs_2026-04-26.md] describes.
+    unsigned long now0     = millis();
+    float         actualA  = 0.0f;
+    if (xSemaphoreTake(chargerMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      for (int i = 0; i < MAX_CHARGERS; i++) {
+        if (chargerBus.chargers[i].present &&
+            (now0 - chargerBus.chargers[i].lastSeenMs) < CHARGER_TIMEOUT_MS) {
+          actualA += chargerBus.chargers[i].ampsDa / 10.0f;
+        }
+      }
+      xSemaphoreGive(chargerMutex);
+    }
+
     // ── Skip charge if pack is already at or above target ────────────────────
     // Triggered only on the rising edge of `enabled` so a fresh start with a
     // pack already above the chosen preset (e.g. preset = 80 %, bike at 81 %)
@@ -3586,9 +3623,54 @@ void rampTask(void* /*pvParameters*/) {
       phase = PHASE_CC;
       LOG("[RAMP] CV→CC: pack dropped to %ld dV (load sag)\n", rawPackDv);
     }
-    // CC → CV : voltage target reached
-    if (phase == PHASE_CC && rawPackDv > 0 &&
-        rawPackDv >= (long)voltCeiling) {
+    // CC → CV : two triggers
+    //  (a) **voltage trigger** — pack reached the configured ceiling. This is
+    //      the textbook CC/CV transition.
+    //  (b) **current-taper trigger** — pack saturated below the ceiling
+    //      (e.g. 100 % preset is 116.4 V but the user's pack physically
+    //      tops out at ~115.1 V). Without this we'd stay in CC forever
+    //      because the voltage trigger is unreachable. Heuristic: while
+    //      we've ramped up to ≥90 % of the user's setpoint, if measured
+    //      charger amps stay below max(0.5 A, 10 % of expected) for a
+    //      sustained 90 s, the pack isn't accepting more current — call it
+    //      done with CC and drop into CV. (Note: low-target sessions
+    //      already have low expected amps; the floor keeps the trigger
+    //      from firing prematurely on small targets.)
+    bool ccTriggerVoltage = (phase == PHASE_CC && rawPackDv > 0 &&
+                             rawPackDv >= (long)voltCeiling);
+
+    bool ccTriggerTaper = false;
+    if (phase == PHASE_CC && current > 0 && rawPackDv > 0) {
+      // 90 %-of-target gate ensures we don't sample taper during the
+      // initial ramp-up (when actualA is naturally still climbing).
+      bool atRamp = (current * 10u >= ((uint32_t)target * 9u));
+      if (atRamp) {
+        float expectedA  = (float)current / (rawPackDv / 10.0f);
+        float threshA    = max(CC_TAPER_FLOOR_A, expectedA * CC_TAPER_FRAC);
+        if (actualA < threshA) {
+          if (ccTaperStartMs == 0) {
+            ccTaperStartMs = now0;
+            LOG("[RAMP] CC taper watch: actual %.2fA < %.2fA threshold "
+                "(expected %.2fA at %dW)\n",
+                actualA, threshA, expectedA, current);
+          } else if ((now0 - ccTaperStartMs) >= CC_TAPER_MS) {
+            ccTriggerTaper = true;
+          }
+        } else if (ccTaperStartMs != 0) {
+          // Current recovered — abandon the watch
+          LOG("[RAMP] CC taper cleared: actual %.2fA recovered above "
+              "threshold after %lus\n",
+              actualA, (now0 - ccTaperStartMs) / 1000UL);
+          ccTaperStartMs = 0;
+        }
+      } else {
+        ccTaperStartMs = 0;  // still ramping — don't start the timer
+      }
+    } else {
+      ccTaperStartMs = 0;
+    }
+
+    if (ccTriggerVoltage || ccTriggerTaper) {
       phase = PHASE_CV;
       cvMs  = millis();
       // CV amps ceiling: at least as generous as last CC command so the charger
@@ -3600,8 +3682,16 @@ void rampTask(void* /*pvParameters*/) {
       float  cvMaxPerCh   = (float)monolithAH * 0.2f / nChargers; // C/5
       cvAmpsDa = (uint16_t)(max(ccAmpsPerCh, cvMaxPerCh) * 10.0f);
       cvAmpsDa = max(cvAmpsDa, (uint16_t)10); // floor 1 A/charger
-      LOG("[RAMP] CC→CV @ %ld dV (ceil %d dV), cvAmpsDa=%d/ch\n",
-          rawPackDv, voltCeiling, (int)cvAmpsDa);
+      if (ccTriggerVoltage) {
+        LOG("[RAMP] CC→CV (voltage) @ %ld dV (ceil %d dV), cvAmpsDa=%d/ch\n",
+            rawPackDv, voltCeiling, (int)cvAmpsDa);
+      } else {
+        LOG("[RAMP] CC→CV (current taper): %lus of %.2fA actual at %dW "
+            "commanded, pack at %ld dV (ceil %d dV), cvAmpsDa=%d/ch\n",
+            (now0 - ccTaperStartMs) / 1000UL,
+            actualA, current, rawPackDv, voltCeiling, (int)cvAmpsDa);
+      }
+      ccTaperStartMs = 0;
     }
 
     // ── Power cutback limits (CC phase only) ──────────────────────────────────
@@ -3663,9 +3753,18 @@ void rampTask(void* /*pvParameters*/) {
       cmdAmpsDa      = (uint16_t)max(1.0f, perCh * 10.0f);
     }
 
-    // Session energy (CC phase only — CV energy accumulated below with actual amps)
-    if (phase == PHASE_CC && packDv > 0 && current > 0 && cmdAmpsDa > 0) {
-      sessionAddCC(current / 3600.0f, totalAmpsA / 3600.0f);
+    // Session energy (CC phase) — accumulate using measured charger output,
+    // not the commanded power. The commanded value keeps growing as the
+    // ramp catches up, but if the chargers are saturating (e.g. pack at
+    // its physical voltage limit, charger AC-input-limited, etc.) the
+    // actually delivered current can be much lower or even zero. Bug 3 in
+    // [project_charging_bugs_2026-04-26.md] was the dashboard's session
+    // counters continuing to climb at the commanded rate while monolith
+    // and chargers both reported 0 A — fixed here by mirroring the CV
+    // branch's "actualA × packV" accounting.
+    if (phase == PHASE_CC && packDv > 0 && actualA > 0.0f) {
+      float actualW = actualA * (packDv / 10.0f);
+      sessionAddCC(actualW / 3600.0f, actualA / 3600.0f);
     }
 
     // ── Charger bus update + CV phase management ──────────────────────────────
@@ -3673,20 +3772,15 @@ void rampTask(void* /*pvParameters*/) {
       bool chargersPresent = (chargerBus.chargerCount > 0);
 
       if (phase == PHASE_CV) {
-        // Read actual total current delivered to determine when CV is complete
+        // Use the same `actualA` snapshot taken at the top of this tick — no
+        // need to re-scan the charger array under the mutex (the value can't
+        // have changed by more than one MCP frame and we re-check next tick).
         unsigned long now     = millis();
         unsigned long elapsed = now - cvMs;
-        float actualA = 0.0f;
-        for (int i = 0; i < MAX_CHARGERS; i++) {
-          if (chargerBus.chargers[i].present &&
-              (now - chargerBus.chargers[i].lastSeenMs) < CHARGER_TIMEOUT_MS)
-            actualA += chargerBus.chargers[i].ampsDa / 10.0f;
-        }
 
-        // Accumulate CV session energy using actual charger output
+        // Termination check (give at least CV_MIN_MS to settle)
         bool terminating = false;
         if (packDv > 0) {
-          // CV termination check (give at least CV_MIN_MS to settle)
           bool termCurrent = (elapsed >= CV_MIN_MS) && (actualA < CV_TERM_A);
           bool termTimeout = (elapsed >= CV_HOLD_MS);
           if (termCurrent || termTimeout) {
@@ -3763,18 +3857,9 @@ void rampTask(void* /*pvParameters*/) {
                        : (rawPackDv > 0)       ? calcSocFromVoltage(rawPackDv)
                                                : 0;
       float ahNeeded  = (float)(targetSoc - nowSoc) / 100.0f * (float)monolithAH;
-      // Use the actual delivered current if we have it, else fall back to the
-      // commanded total (cmdAmpsDa is per-charger × 10).
-      float ampsNow   = 0.0f;
-      if (xSemaphoreTake(chargerMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-        unsigned long now = millis();
-        for (int i = 0; i < MAX_CHARGERS; i++) {
-          if (chargerBus.chargers[i].present &&
-              (now - chargerBus.chargers[i].lastSeenMs) < CHARGER_TIMEOUT_MS)
-            ampsNow += chargerBus.chargers[i].ampsDa / 10.0f;
-        }
-        xSemaphoreGive(chargerMutex);
-      }
+      // Use the same actualA snapshot taken at the top of the tick — already
+      // includes only chargers with a fresh frame within CHARGER_TIMEOUT_MS.
+      float ampsNow   = actualA;
       // Sanity floor — below ~2 A into a 100 Ah pack the ETA blows up.
       if (ahNeeded > 0.0f && ampsNow > 2.0f) {
         float minutesRaw = ahNeeded / ampsNow * 60.0f;
