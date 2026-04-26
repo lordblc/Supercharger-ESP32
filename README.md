@@ -42,6 +42,8 @@ The charger is commanded over CAN with a target voltage ceiling and a current li
 * Float / Complete: CV phase ends when actual charger current drops below 2 A (after a minimum 2-minute settle period) or after a 20-minute timeout, whichever comes first. The charger is then stopped and the session is marked complete.  
 The charger voltage ceiling is always set to the configured target, not the present pack voltage. This is important — setting it to the present pack voltage would leave the charger with no headroom and it would not regulate correctly.
 
+One key difference here: When charging to 100% the controller will state being in "Bulk" all the way up to 100% but it will be relying on the voltage tables to regulate the power and you can see this reflected in the Current levels tapering off as it gets closer to 100%.
+
 Protection and Cutback
 
 Three lookup tables apply independent power cutbacks. All three are evaluated every cycle and the most restrictive limit wins:
