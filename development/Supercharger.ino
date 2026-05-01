@@ -46,7 +46,7 @@
 //   driver/twai.h    } built into Espressif ESP32 Arduino core - no install needed
 // ==========================================================================
 
-#define VERSION 202605011142
+#define VERSION 202605011308
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -1774,7 +1774,7 @@ void sseFlush() {
 //    Subsequent requests just look up the cookie in the table. No Digest,
 //    no rate-limit logic, no delay — the dashboard's 2 s polling is cheap.
 //    Token table is RAM-only: a reboot invalidates every session, which is
-//    deliberate (clean state on every reset). Idle timeout 1 h.
+//    deliberate (clean state on every reset). Idle timeout 6 h.
 //
 // 2. **Immediate-reject rate limit** on the LOGIN endpoint only: failed
 //    Digest attempts increment a counter and set `nextAllowedAttemptMs`.
@@ -1817,7 +1817,7 @@ struct AuthSession {
   unsigned long lastUsedMs;
 };
 static const int           MAX_SESSIONS              = 4;
-static const unsigned long SESSION_IDLE_TIMEOUT_MS   = 60UL * 60UL * 1000UL; // 1 h
+static const unsigned long SESSION_IDLE_TIMEOUT_MS   = 60UL * 60UL * 6000UL; // 6 h
 static AuthSession         authSessions[MAX_SESSIONS];
 
 // Returns seconds to wait before the next login attempt is permitted, given
