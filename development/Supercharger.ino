@@ -46,7 +46,7 @@
 //   driver/twai.h    } built into Espressif ESP32 Arduino core - no install needed
 // ==========================================================================
 
-#define VERSION 202604261536
+#define VERSION 202605011142
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -386,10 +386,14 @@ SemaphoreHandle_t controlMutex = nullptr;
 struct ChargingControl {
   uint16_t targetPowerW  = 0;     // desired end-state power, set by web UI
   uint16_t currentPowerW = 0;     // actual commanded power, ramped each second
-  bool     enabled       = true;  // default: enabled per spec
+  bool     enabled       = false; // set from defaultEnabled at boot in rampInit()
   uint8_t  chargerCount  = 3;     // manual charger count for per-unit current division
   uint16_t rampStepW     = DEFAULT_RAMP_STEP_W; // W per second ramp rate, configurable
-  uint16_t targetVoltDv  = 1164;  // target charge voltage (dV), default 100% = 116.4V
+  uint16_t targetVoltDv  = 1100;  // target charge voltage (dV), overwritten from NVS in rampInit()
+  // Boot-time defaults — loaded from NVS in rampInit(), configurable via /settings
+  bool     defaultEnabled        = false; // charging on/off state at boot
+  uint8_t  defaultPowerPresetIdx = 1;     // POWER_PRESETS column at boot (idx 1 = 1/2/3/4 kW by charger count)
+  uint16_t defaultTargetVoltDv   = 1100;  // target voltage at boot (dV); 1100 = 80%
 } ctrl;
 
 // Session energy tracking — accumulated in rampTask, reset on boot or manual reset.
@@ -585,7 +589,7 @@ const char HTML_SETTINGS[] PROGMEM = R"rawliteral(
          box-shadow:0 4px 12px rgba(0,0,0,.4)}
     label{display:block;font-size:0.82em;color:#aaa;margin-bottom:3px;margin-top:10px}
     label:first-child{margin-top:0}
-    input[type=text],input[type=password],input[type=number]{
+    input[type=text],input[type=password],input[type=number],select{
       width:100%;padding:9px;border:1px solid #0f3460;border-radius:5px;
       background:#0f3460;color:#eee;font-size:14px}
     .row2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
@@ -678,6 +682,36 @@ const char HTML_SETTINGS[] PROGMEM = R"rawliteral(
     <button onclick="saveRampRate()">Save Ramp Rate</button>
   </div>
 
+  <div class="section">Boot Defaults</div>
+  <div class="box">
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:0">
+      <input type="checkbox" id="defChgEnabled">
+      <span>Start with charging enabled at boot</span>
+    </label>
+    <div class="hint">When unchecked, charging must be enabled manually from the dashboard after each boot.</div>
+
+    <label style="margin-top:14px">Default charge speed preset</label>
+    <select id="defPowerPreset">
+      <option value="0">Preset 1 &mdash; 0.5 / 1 / 1.5 / 2 kW (1&ndash;4 chargers)</option>
+      <option value="1">Preset 2 &mdash; 1 / 2 / 3 / 4 kW (1&ndash;4 chargers)</option>
+      <option value="2">Preset 3 &mdash; 1.65 / 3.3 / 5 / 6.6 kW (1&ndash;4 chargers)</option>
+      <option value="3">Preset 4 &mdash; 2.2 / 4.4 / 6.6 / 8.8 kW (1&ndash;4 chargers)</option>
+      <option value="4">Preset 5 &mdash; 3.3 / 6.6 / 9.9 / 13.2 kW (1&ndash;4 chargers)</option>
+    </select>
+    <div class="hint">Actual watts depend on charger count. Preset 2 = 2 kW with 2 chargers.</div>
+
+    <label style="margin-top:14px">Default target voltage</label>
+    <select id="defTargetVolt">
+      <option value="1060">70% &mdash; 106.0 V</option>
+      <option value="1100">80% &mdash; 110.0 V</option>
+      <option value="1132">90% &mdash; 113.2 V</option>
+      <option value="1164">100% &mdash; 116.4 V</option>
+    </select>
+    <div class="hint">Applied at boot. Can be changed per session from the dashboard.</div>
+
+    <button onclick="saveBootDefaults()">Save Boot Defaults</button>
+  </div>
+
   <div id="msgBox" class="msg"></div>
 
   <script>
@@ -689,7 +723,10 @@ const char HTML_SETTINGS[] PROGMEM = R"rawliteral(
     }
 
     // Load current settings on page load
-    fetch('/api/settings').then(function(r){ return r.json(); }).then(function(d){
+    fetch('/api/settings').then(function(r){
+      if (r.status === 401) { window.location.href = '/login'; throw new Error('redirecting'); }
+      return r.json();
+    }).then(function(d){
       document.getElementById('wifiSSID').value = d.wifi_ssid || '';
       document.getElementById('apSSID').value   = d.ap_ssid   || '';
       if (d.ap_pass_set) {
@@ -697,6 +734,9 @@ const char HTML_SETTINGS[] PROGMEM = R"rawliteral(
       }
       document.getElementById('ccCount').value    = d.charger_count || 3;
       document.getElementById('rampRate').value   = d.ramp_rate_wps || 50;
+      document.getElementById('defChgEnabled').checked = !!d.charging_enabled_default;
+      document.getElementById('defPowerPreset').value  = (d.power_preset_default !== undefined) ? d.power_preset_default : 1;
+      document.getElementById('defTargetVolt').value   = (d.target_volt_default   !== undefined) ? d.target_volt_default  : 1100;
       // Toggle MQTT section based on AP mode
       if (d.ap_mode) {
         document.getElementById('mqttForm').style.display = 'none';
@@ -800,6 +840,18 @@ const char HTML_SETTINGS[] PROGMEM = R"rawliteral(
         else showMsg(d.error || 'Save failed', false);
       }).catch(function(){ showMsg('Connection error', false); });
     }
+    function saveBootDefaults() {
+      var ce  = document.getElementById('defChgEnabled').checked;
+      var pi  = parseInt(document.getElementById('defPowerPreset').value);
+      var tvd = parseInt(document.getElementById('defTargetVolt').value);
+      if (isNaN(pi)  || pi  < 0 || pi  > 4)    { showMsg('Invalid preset index',         false); return; }
+      if (isNaN(tvd) || tvd < 1060 || tvd > 1164) { showMsg('Invalid target voltage',    false); return; }
+      postSettings({
+        charging_enabled_default: ce,
+        power_preset_default:     pi,
+        target_volt_default:      tvd
+      }, 'Boot defaults saved', false);
+    }
   </script>
 </body>
 </html>
@@ -893,7 +945,7 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
   <h1>&#9889; Supercharger
     <span class="badge stale" id="badge">NO DATA</span>
   </h1>
-  <nav><a href="/settings">&#9881; Settings</a><a href="/update">&#128190; OTA Update</a><a href="/log">&#128220; Log</a></nav>
+  <nav><a href="/settings">&#9881; Settings</a><a href="/update">&#128190; OTA Update</a><a href="/log">&#128220; Log</a><a href="#" onclick="logout();return false">&#128274; Logout</a></nav>
 
   <div id="apBanner" style="display:none;background:#0f3460;border:1px solid #e94560;
        border-radius:8px;padding:12px 16px;margin-top:12px;text-align:center">
@@ -1220,9 +1272,27 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
       }
     }
 
+    function logout(){
+      fetch('/logout', {method:'POST'}).finally(function(){
+        // The server already clears the cookie via Set-Cookie with Max-Age=0,
+        // but follow up with a hard nav so any in-flight polling cancels.
+        window.location.href = '/login';
+      });
+    }
+
     function refresh(){
       fetch('/api/status')
-        .then(function(r){ return r.json(); })
+        .then(function(r){
+          // Session expired (or never existed) → bounce to /login. The login
+          // page runs Digest, mints a fresh session cookie, then redirects
+          // back to /. Browser cookie is HttpOnly so we can't act on it
+          // from JS — the 401 status is our cue.
+          if (r.status === 401) {
+            window.location.href = '/login';
+            throw new Error('redirecting to /login');
+          }
+          return r.json();
+        })
         .then(function(d){
           var b = document.getElementById('badge');
           b.textContent = d.fresh ? 'LIVE' : 'NO DATA';
@@ -1619,7 +1689,7 @@ static bool       sseActive   = false;
 
 // GET /log — serves the log viewer page (protected)
 void handleLogPage() {
-  if (!requireAuth()) return;
+  if (!requireAuth(false)) return;  // HTML route — 302 to /login on no session
   server.send_P(200, "text/html", HTML_LOG);
 }
 
@@ -1627,7 +1697,7 @@ void handleLogPage() {
 // The response headers are sent here; data is pushed from loop() via
 // sseFlush() so the connection stays open without blocking handleClient().
 void handleLogStream() {
-  if (!requireAuth()) return;
+  if (!requireAuth(true)) return;   // SSE/API — 401 on no session
   // Close any existing SSE client before accepting a new one
   if (sseActive) {
     sseClient.stop();
@@ -1690,124 +1760,345 @@ void sseFlush() {
 }
 
 // ---------------------------------------------------------------------------
-// Authentication helper.
-// Uses OTA credentials (SECRET_OTA_USER / SECRET_OTA_PASS) for all
-// protected endpoints. Returns false and sends a 401 if auth fails.
-// All auth-gated routes: dashboard (/), /api/status, /save, all of
-// /api/settings, /api/control, /log, /api/log/stream, /update.
-//
-// Security properties of this gate:
-//  - **HTTP Digest** (not Basic): the password is never transmitted on the
-//    wire, only an MD5 hash of (user:realm:pass:nonce). A passive sniffer on
-//    the LAN can't lift the credential. Browser caches the challenge for
-//    the session, so the dashboard's 2 s polling reuses auth without
-//    re-prompting.
-//  - **Brute-force back-off — counter-driven, unconditional**: after the
-//    second consecutive failure, EVERY subsequent attempt incurs a
-//    vTaskDelay *before* its 401 response. The delay grows with the failure
-//    count alone — there is no wall-clock deadline the attacker can pace
-//    themselves to step over. (An earlier deadline-based design was
-//    bypassable by typing every ~2 s; the user observed 30+ retries in
-//    under a minute. This rewrite makes the wait a pure function of the
-//    counter so paced attempts no longer get a free pass.)
-//  - **Schedule** (counter = number of prior consecutive failures):
-//      1st attempt    : 0 s
-//      2nd attempt    : 0 s
-//      3rd attempt    : 2 s
-//      4th attempt    : 5 s
-//      5th attempt    : 15 s
-//      6th attempt    : 30 s
-//      7th and beyond : 60 s
-//    Plus 0–2 s random jitter. Cumulative cost to brute-force 10 attempts
-//    ≈ 5 minutes, so a casual attacker is blocked well before getting
-//    anywhere near a serious search. A legit user who typos a few times
-//    pays the delay once and is back to free attempts after a successful
-//    login (counter resets on success).
-//  - **60 s cap** matches typical HTTP client timeouts; the connection
-//    stays alive through the wait so the client gets the eventual 401.
-//  - **Single WebServer task → all attempts serialise**, so opening
-//    parallel connections gains the attacker nothing.
+// Authentication — session-cookie model with Digest-auth login + hard-lock.
 // ---------------------------------------------------------------------------
-static const char AUTH_REALM[] = "Supercharger";
-static uint8_t authFailCount = 0;
-static const uint8_t AUTH_GRACE = 2;  // free attempts before delays kick in
+// Threat model: single-user device on a LAN. Need to (a) keep brute-force
+// guesses expensive without making the dashboard sluggish, and (b) make
+// remote brute-force completely unsurvivable past a small threshold.
+//
+// Three layers, evaluated in this order on every protected route:
+//
+// 1. **Session cookie** (`scs=<32-hex>`): on a successful login, the server
+//    mints a random 16-byte token, stores it in a small in-memory table,
+//    and returns it as `Set-Cookie: scs=...; HttpOnly; SameSite=Strict`.
+//    Subsequent requests just look up the cookie in the table. No Digest,
+//    no rate-limit logic, no delay — the dashboard's 2 s polling is cheap.
+//    Token table is RAM-only: a reboot invalidates every session, which is
+//    deliberate (clean state on every reset). Idle timeout 1 h.
+//
+// 2. **Immediate-reject rate limit** on the LOGIN endpoint only: failed
+//    Digest attempts increment a counter and set `nextAllowedAttemptMs`.
+//    A subsequent attempt while now < nextAllowedAttemptMs is rejected
+//    with 429 + Retry-After *immediately* — no vTaskDelay, no blocked
+//    WebServer task. Matches the "Immediate Reject" approach: client
+//    sees the rate-limit, doesn't time out, dashboard polls (which use
+//    the cookie path) keep working uninterrupted.
+//
+// 3. **State-based hard lock**: after AUTH_HARD_LOCK_THRESHOLD failed
+//    Digest attempts, `authHardLocked` becomes true. Login attempts
+//    return 423 Locked until either (a) HARD_LOCK_AUTO_CLEAR_MS elapses,
+//    (b) a BOOT-button hold of 3–5 s clears it, or (c) the device is
+//    rebooted. Existing valid sessions are NOT invalidated by the lock —
+//    only NEW logins are blocked. Defensible because brute-forcers can't
+//    have a valid session (no cookie without the password), so honouring
+//    active sessions during a lock can't aid an attacker.
+//
+// History note: an earlier vTaskDelay-based design (counter-driven wait
+// before sending 401) was found to make the dashboard sluggish (every
+// 2 s poll re-ran the heavy Digest check) and to block legitimate users
+// who shared the WebServer task. This redesign moves the heavy logic to
+// a single login endpoint and makes everything else cookie-cheap.
+// ---------------------------------------------------------------------------
 
-// Returns the seconds to wait before processing an attempt, given how many
-// consecutive failures have already accumulated.
+static const char    AUTH_REALM[]              = "Supercharger";
+
+// Login rate-limit + hard-lock state
+static uint8_t       authFailCount             = 0;
+static unsigned long nextAllowedAttemptMs      = 0;
+static const uint8_t AUTH_GRACE                = 2;   // free attempts before back-off
+static const uint8_t AUTH_HARD_LOCK_THRESHOLD  = 5;   // failures that trip the hard lock
+static bool          authHardLocked            = false;
+static unsigned long hardLockSinceMs           = 0;
+static const unsigned long HARD_LOCK_AUTO_CLEAR_MS = 15UL * 60UL * 1000UL;
+
+// Session store — fixed-size, RAM-only, never persisted
+struct AuthSession {
+  char          token[33];     // 32 hex + NUL; token[0]=='\0' → slot free
+  unsigned long lastUsedMs;
+};
+static const int           MAX_SESSIONS              = 4;
+static const unsigned long SESSION_IDLE_TIMEOUT_MS   = 60UL * 60UL * 1000UL; // 1 h
+static AuthSession         authSessions[MAX_SESSIONS];
+
+// Returns seconds to wait before the next login attempt is permitted, given
+// how many consecutive failures have already accumulated. Schedule:
+//   1st-2nd : 0 s    (free)
+//   3rd     : 2 s
+//   4th     : 5 s
+//   5th     : 15 s   (also trips hard lock — but the rate-limit value still applies)
+//   6th     : 30 s
+//   7th+    : 60 s
 static unsigned long authDelaySec(uint8_t fails) {
   if (fails < AUTH_GRACE) return 0;
   switch (fails) {
-    case 2:  return 2;        // 3rd attempt
-    case 3:  return 5;        // 4th attempt
-    case 4:  return 15;       // 5th attempt
-    case 5:  return 30;       // 6th attempt
-    default: return 60;       // 7th+
+    case 2:  return 2;
+    case 3:  return 5;
+    case 4:  return 15;
+    case 5:  return 30;
+    default: return 60;
   }
 }
 
-static bool requireAuth() {
-  // Counter-driven wait — UNCONDITIONAL once past the grace window. The
-  // wait is honoured even if the client this time happens to send the
-  // correct password; letting "correct" requests skip the wait would leak
-  // the right answer via timing, and would let an attacker who already
-  // owns the password (e.g. via lateral movement) sidestep the rate limit.
-  if (authFailCount >= AUTH_GRACE) {
-    unsigned long delaySec = authDelaySec(authFailCount);
-    delaySec += (unsigned long)(esp_random() % 3);  // 0–2 s jitter
-    LOG("[AUTH] %d prior failures — delaying this attempt %lu s\n",
-        (int)authFailCount, delaySec);
-    vTaskDelay(pdMS_TO_TICKS(delaySec * 1000UL));
+// Auto-clear hard lock if the cooldown has elapsed. Called lazily before
+// every login decision rather than via a timer task.
+static void hardLockMaybeAutoExpire() {
+  if (!authHardLocked) return;
+  if ((millis() - hardLockSinceMs) >= HARD_LOCK_AUTO_CLEAR_MS) {
+    authHardLocked       = false;
+    authFailCount        = 0;
+    nextAllowedAttemptMs = 0;
+    LOG("[AUTH] Hard lock auto-cleared after cooldown\n");
   }
+}
 
-  if (server.authenticate(SECRET_OTA_USER, SECRET_OTA_PASS)) {
-    if (authFailCount > 0) {
-      LOG("[AUTH] Successful auth — clearing fail counter (was %d)\n",
-          (int)authFailCount);
+// Manual clear path (called from BOOT button handler).
+static void hardLockManualClear(const char* reason) {
+  if (!authHardLocked && authFailCount == 0 && nextAllowedAttemptMs == 0) return;
+  authHardLocked       = false;
+  authFailCount        = 0;
+  nextAllowedAttemptMs = 0;
+  LOG("[AUTH] Hard lock + fail counter cleared (%s)\n", reason);
+}
+
+// Pull the session token out of the request's Cookie header. Returns empty
+// string if no Cookie or no scs= entry.
+static String sessionParseCookieToken() {
+  if (!server.hasHeader("Cookie")) return String();
+  String cookie = server.header("Cookie");
+  int idx = cookie.indexOf("scs=");
+  if (idx < 0) return String();
+  // Skip past any leading "; " etc. — only accept "scs=" at start of cookie
+  // or preceded by "; " so we don't false-match "xscs=foo".
+  if (idx > 0 && cookie.charAt(idx - 1) != ' ' && cookie.charAt(idx - 1) != ';') {
+    return String();
+  }
+  int valStart = idx + 4;
+  int valEnd   = cookie.indexOf(';', valStart);
+  if (valEnd < 0) valEnd = cookie.length();
+  String token = cookie.substring(valStart, valEnd);
+  token.trim();
+  return token;
+}
+
+// If the request's Cookie maps to a non-expired session slot, refresh its
+// lastUsedMs and return true. Otherwise return false. Also lazily evicts
+// any session it encounters that's already past the idle timeout.
+static bool sessionTouchOrFail() {
+  String token = sessionParseCookieToken();
+  if (token.length() != 32) return false;
+  unsigned long now = millis();
+  for (int i = 0; i < MAX_SESSIONS; i++) {
+    if (authSessions[i].token[0] == '\0') continue;
+    // Lazy expiry sweep
+    if ((now - authSessions[i].lastUsedMs) > SESSION_IDLE_TIMEOUT_MS) {
+      authSessions[i].token[0] = '\0';
+      continue;
     }
-    authFailCount = 0;
-    return true;
+    if (token.equals(authSessions[i].token)) {
+      authSessions[i].lastUsedMs = now;
+      return true;
+    }
   }
+  return false;
+}
 
-  // Auth failed.
-  if (authFailCount < 255) authFailCount++;
-  LOG("[AUTH] Failed auth attempt #%d (next will wait %lu s)\n",
-      (int)authFailCount,
-      authDelaySec(authFailCount));
+// Mint a new session — find a free slot, or evict the oldest. Writes the
+// new token into `outToken` (must be ≥33 chars).
+static void sessionMint(char* outToken) {
+  unsigned long now = millis();
+  int           slot       = -1;
+  unsigned long oldestUsed = ULONG_MAX;
+  int           oldestSlot = 0;
+  for (int i = 0; i < MAX_SESSIONS; i++) {
+    if (authSessions[i].token[0] == '\0') { slot = i; break; }
+    if (authSessions[i].lastUsedMs < oldestUsed) {
+      oldestUsed = authSessions[i].lastUsedMs;
+      oldestSlot = i;
+    }
+  }
+  if (slot < 0) {
+    slot = oldestSlot;
+    LOG("[AUTH] Session table full — evicting oldest slot %d\n", slot);
+  }
+  // 16 random bytes → 32 hex chars
+  for (int i = 0; i < 16; i++) {
+    uint8_t b = (uint8_t)(esp_random() & 0xFF);
+    snprintf(&authSessions[slot].token[i * 2], 3, "%02x", b);
+  }
+  authSessions[slot].token[32] = '\0';
+  authSessions[slot].lastUsedMs = now;
+  strncpy(outToken, authSessions[slot].token, 33);
+}
 
-  // Send the Digest challenge. The third arg is the realm shown in the
-  // browser's auth dialog; the fourth is a fail message embedded in the 401
-  // body for non-browser clients.
-  server.requestAuthentication(DIGEST_AUTH, AUTH_REALM,
-                               "Authentication required");
+// Invalidate the session matching the request's cookie (logout path).
+static void sessionForgetCurrent() {
+  String token = sessionParseCookieToken();
+  if (token.length() != 32) return;
+  for (int i = 0; i < MAX_SESSIONS; i++) {
+    if (authSessions[i].token[0] != '\0' && token.equals(authSessions[i].token)) {
+      authSessions[i].token[0] = '\0';
+      LOG("[AUTH] Session slot %d invalidated by logout\n", i);
+      return;
+    }
+  }
+}
+
+// Gate a request on a valid session. Used by every protected handler.
+//   isApi == true  → respond with 401 on failure (JS catches and redirects)
+//   isApi == false → respond with 302 → /login (browser navigates directly)
+//
+// Hard-lock note: this does NOT block authed sessions. Only NEW logins
+// (handleLogin) are gated by the hard lock. An attacker can't have a
+// session without the password, so respecting active sessions through a
+// lock window doesn't widen the attack surface.
+static bool requireAuth(bool isApi) {
+  if (sessionTouchOrFail()) return true;
+
+  if (isApi) {
+    server.send(401, "text/plain", "Authentication required");
+  } else {
+    server.sendHeader("Location", "/login");
+    server.send(302, "text/plain", "");
+  }
   return false;
 }
 
 // Silent variant for upload chunk handlers (handleOTAUpload). WebServer
 // invokes those once per multipart chunk before the POST completion handler
 // runs; sending a 401 response mid-upload would corrupt the request stream.
-// Returns true iff the request bears valid Digest credentials. Does NOT
-// trigger the back-off delay (would stall the upload for minutes per chunk)
-// and does NOT bump the counter — the parent /update POST has already gone
-// through requireAuth() and accounted for the attempt at the start of the
-// multipart sequence.
+// Returns true iff the request bears a valid session cookie.
 static bool authValidNoChallenge() {
-  return server.authenticate(SECRET_OTA_USER, SECRET_OTA_PASS);
+  return sessionTouchOrFail();
+}
+
+// GET /login — Digest auth + rate-limit + hard-lock checkpoint, mints a
+// session cookie on success. This is the ONLY route that ever runs Digest
+// authentication; every other protected route just checks the session
+// cookie via requireAuth().
+void handleLogin() {
+  // If the user already has a valid session, skip the Digest flow entirely
+  // and just redirect to the dashboard. This handles the common case where
+  // the user manually navigates to /login but is still logged in.
+  if (sessionTouchOrFail()) {
+    server.sendHeader("Location", "/");
+    server.send(302, "text/plain", "");
+    return;
+  }
+
+  hardLockMaybeAutoExpire();
+
+  // Hard-lock check first — short-circuits Digest entirely.
+  if (authHardLocked) {
+    unsigned long lockedForMs = millis() - hardLockSinceMs;
+    unsigned long remMs       = (HARD_LOCK_AUTO_CLEAR_MS > lockedForMs)
+                                  ? (HARD_LOCK_AUTO_CLEAR_MS - lockedForMs) : 0;
+    char retryHdr[16];
+    snprintf(retryHdr, sizeof(retryHdr), "%lu", (remMs + 999UL) / 1000UL);
+    server.sendHeader("Retry-After", retryHdr);
+    server.send(423, "text/plain",
+      "Locked: too many failed login attempts.\n\n"
+      "To unlock: hold the BOOT button on the device for 3-5 seconds, "
+      "reboot the device, or wait for the cooldown to expire.\n");
+    return;
+  }
+
+  // Immediate-reject rate limit — no vTaskDelay, no blocked WebServer task.
+  unsigned long now = millis();
+  if (authFailCount >= AUTH_GRACE && now < nextAllowedAttemptMs) {
+    unsigned long retrySec = (nextAllowedAttemptMs - now + 999UL) / 1000UL;
+    char retryHdr[16];
+    snprintf(retryHdr, sizeof(retryHdr), "%lu", retrySec);
+    server.sendHeader("Retry-After", retryHdr);
+    server.send(429, "text/plain",
+                "Too many failed attempts. Please wait and try again.\n");
+    return;
+  }
+
+  // Run Digest auth. server.authenticate() validates the Digest response
+  // against the canonical user/pass; an absent or wrong Authorization
+  // header → return false here.
+  if (!server.authenticate(SECRET_OTA_USER, SECRET_OTA_PASS)) {
+    if (authFailCount < 255) authFailCount++;
+
+    // Trip the hard lock if we've crossed the threshold.
+    if (authFailCount >= AUTH_HARD_LOCK_THRESHOLD && !authHardLocked) {
+      authHardLocked  = true;
+      hardLockSinceMs = millis();
+      LOG("[AUTH] HARD LOCK tripped after %d failures — manual unlock required "
+          "(hold BOOT 3-5s, reboot, or wait %lu min)\n",
+          (int)authFailCount, HARD_LOCK_AUTO_CLEAR_MS / 60000UL);
+    } else {
+      // Set the next-allowed timestamp for the immediate-reject path.
+      unsigned long delaySec = authDelaySec(authFailCount);
+      delaySec += (unsigned long)(esp_random() % 3);   // 0–2 s jitter
+      nextAllowedAttemptMs = millis() + delaySec * 1000UL;
+      LOG("[AUTH] Failed login #%d — next attempt allowed in %lu s\n",
+          (int)authFailCount, delaySec);
+    }
+
+    // Send the Digest challenge so the browser can re-prompt the user.
+    // Note: the browser will only show its own dialog if there's no cached
+    // credential; on a wrong-password retry it sends the cached digest
+    // again, fails, and gives up after some implementation-specific number
+    // of retries.
+    server.requestAuthentication(DIGEST_AUTH, AUTH_REALM, "Login required");
+    return;
+  }
+
+  // Success — mint a session and redirect to the dashboard.
+  if (authFailCount > 0) {
+    LOG("[AUTH] Login OK — clearing fail counter (was %d)\n", (int)authFailCount);
+  }
+  authFailCount        = 0;
+  nextAllowedAttemptMs = 0;
+
+  char token[33];
+  sessionMint(token);
+
+  // Cookie attributes:
+  //  - HttpOnly       — JS can't read it (XSS defense)
+  //  - SameSite=Strict — never sent on cross-origin requests (CSRF defense)
+  //  - Path=/         — sent on every path
+  //  - Max-Age=3600   — 1 h client-side expiry; matches server-side idle
+  //                     timeout, so a stale cookie won't linger after the
+  //                     server has already forgotten the session
+  //  - No `Secure`    — this is plain HTTP on a LAN
+  char cookieHdr[120];
+  snprintf(cookieHdr, sizeof(cookieHdr),
+           "scs=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=3600",
+           token);
+  server.sendHeader("Set-Cookie", cookieHdr);
+  server.sendHeader("Location",   "/");
+  server.send(302, "text/plain", "");
+
+  LOG("[AUTH] Login OK — session minted (token suffix ...%s)\n", token + 26);
+}
+
+// POST /logout — invalidates the current session and clears the cookie.
+// POST (not GET) so that link previews / prefetchers don't accidentally
+// log the user out.
+void handleLogout() {
+  sessionForgetCurrent();
+  // Set-Cookie with Max-Age=0 tells the browser to drop its copy too.
+  server.sendHeader("Set-Cookie", "scs=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");
+  server.sendHeader("Location",   "/login");
+  server.send(302, "text/plain", "");
 }
 
 void handleRoot() {
-  if (!requireAuth()) return;
+  if (!requireAuth(false)) return;  // HTML route — 302 to /login on no session
   server.send_P(200, "text/html", HTML_DASHBOARD);
 }
 
 // GET /settings — settings page (protected)
 void handleSettingsPage() {
-  if (!requireAuth()) return;
+  if (!requireAuth(false)) return;  // HTML route
   server.send_P(200, "text/html", HTML_SETTINGS);
 }
 
 // GET /api/settings — returns current settings as JSON (protected)
 void handleApiSettingsGet() {
-  if (!requireAuth()) return;
+  if (!requireAuth(true)) return;   // API route
   String ssid = preferences.getString("ssid", "");
   String aps  = preferences.getString("ap_ssid", String(apSSID));
   String mh   = String(mqttHost);
@@ -1839,17 +2130,22 @@ void handleApiSettingsGet() {
   bool   caSet   = mqttCaCert.length() > 0;
   size_t caBytes = mqttCaCert.length();
 
-  char buf[640];
+  char buf[720];
   snprintf(buf, sizeof(buf),
     "{\"ap_mode\":%s,\"wifi_ssid\":\"%s\",\"ap_ssid\":\"%s\",\"ap_pass_set\":%s,"
     "\"mqtt_host\":\"%s\",\"mqtt_port\":%d,\"mqtt_user\":\"%s\","
     "\"mqtt_tls\":%s,\"mqtt_ca_set\":%s,\"mqtt_ca_bytes\":%u,"
-    "\"charger_count\":%d,\"ramp_rate_wps\":%d}",
+    "\"charger_count\":%d,\"ramp_rate_wps\":%d,"
+    "\"charging_enabled_default\":%s,\"power_preset_default\":%d,"
+    "\"target_volt_default\":%d}",
     apIsBroadcasting() ? "true" : "false",
     jSsid.c_str(), jAps.c_str(), hasApPass ? "true" : "false",
     jMh.c_str(), (int)mqttPort, jMu.c_str(),
     mqttTls ? "true" : "false", caSet ? "true" : "false", (unsigned)caBytes,
-    (int)cc, (int)ctrl.rampStepW
+    (int)cc, (int)ctrl.rampStepW,
+    ctrl.defaultEnabled ? "true" : "false",
+    (int)ctrl.defaultPowerPresetIdx,
+    (int)ctrl.defaultTargetVoltDv
   );
   server.send(200, "application/json", buf);
 }
@@ -1860,7 +2156,7 @@ void handleApiSettingsGet() {
 // larger than the destination buffer). All length-constrained string fields
 // now reject oversized input with a 400 instead of being silently clipped.
 void handleApiSettingsPost() {
-  if (!requireAuth()) return;
+  if (!requireAuth(true)) return;   // API route
   if (!server.hasArg("plain")) {
     server.send(400, "application/json", "{\"ok\":false,\"error\":\"No body\"}");
     return;
@@ -2048,6 +2344,34 @@ void handleApiSettingsPost() {
     }
   }
 
+  // Boot default — charging enabled state.
+  if (doc.containsKey("charging_enabled_default")) {
+    bool ce = doc["charging_enabled_default"] | false;
+    ctrl.defaultEnabled = ce;
+    preferences.putBool("def_chg_en", ce);
+    LOG("[SETTINGS] Boot charging default: %s\n", ce ? "ON" : "OFF");
+  }
+
+  // Boot default — power preset column index (0–4 in POWER_PRESETS).
+  if (doc.containsKey("power_preset_default")) {
+    int pi = doc["power_preset_default"] | -1;
+    if (pi >= 0 && pi < MAX_PRESETS_PER_ROW) {
+      ctrl.defaultPowerPresetIdx = (uint8_t)pi;
+      preferences.putUChar("def_pwr_idx", (uint8_t)pi);
+      LOG("[SETTINGS] Boot power preset index: %d\n", pi);
+    }
+  }
+
+  // Boot default — target voltage (dV); must be a valid preset or within range.
+  if (doc.containsKey("target_volt_default")) {
+    int tvd = doc["target_volt_default"] | -1;
+    if (tvd >= (int)TARGET_VOLT_PRESETS[0].dv && tvd <= (int)MAX_CHARGE_VOLTAGE_DV) {
+      ctrl.defaultTargetVoltDv = (uint16_t)tvd;
+      preferences.putUShort("def_tgt_dv", (uint16_t)tvd);
+      LOG("[SETTINGS] Boot target volt default: %d dV\n", tvd);
+    }
+  }
+
   server.send(200, "application/json", "{\"ok\":true}");
 
   if (needRestart) {
@@ -2063,7 +2387,7 @@ void handleApiSettingsPost() {
 // form-encoded POSTs are CORS-simple, no preflight) could rewrite the WiFi
 // credentials and force a reboot, hijacking the controller.
 void handleSave() {
-  if (!requireAuth()) return;
+  if (!requireAuth(false)) return;  // legacy HTML form-POST, returns HTML
   if (server.hasArg("ssid")) {
     String newSSID = server.arg("ssid");
     String newPass = server.arg("pass");
@@ -2087,7 +2411,7 @@ void handleSave() {
 // by any device on the LAN. The browser caches the Basic Auth header from
 // the dashboard load and re-uses it on every poll without re-prompting.
 void handleApiStatus() {
-  if (!requireAuth()) return;
+  if (!requireAuth(true)) return;   // API route — JS-side handles 401 redirect
   // Snapshot both data structs under their respective mutexes
   LiveData      liveSnap;
   ChargerBusData chargerSnap;
@@ -2255,7 +2579,7 @@ void handleApiStatus() {
 // Only fields actually present in the body are applied; missing fields are
 // left unchanged.
 void handleApiControl() {
-  if (!requireAuth()) return;
+  if (!requireAuth(true)) return;   // API route
   if (!server.hasArg("plain")) {
     server.send(400, "text/plain", "No body");
     return;
@@ -2404,15 +2728,15 @@ static bool otaProcessChunk(const uint8_t* buf, size_t n) {
   return true;
 }
 
-// GET /update — OTA page (Digest auth + brute-force back-off via requireAuth)
+// GET /update — OTA page (session-cookie protected)
 void handleOTAGet() {
-  if (!requireAuth()) return;
+  if (!requireAuth(false)) return;  // HTML route
   server.send_P(200, "text/html", HTML_OTA);
 }
 
 // POST /update completion handler
 void handleOTAPost() {
-  if (!requireAuth()) return;
+  if (!requireAuth(false)) return;  // browser form-context, return code <-> redirect
   // Check the HMAC-verification flag before Update.hasError() — the upload
   // handler may have called Update.abort() on a signature mismatch, and
   // hasError() doesn't always reflect an explicit abort.
@@ -2560,9 +2884,22 @@ void checkBootButton() {
       preferences.remove("pass");
       delay(300);
       ESP.restart();
+    } else if (heldMs >= 3000UL) {
+      // 3–5 s window: clear the auth hard-lock if one is active. This is the
+      // documented manual-unlock path for users locked out of the dashboard
+      // after too many failed login attempts. Note: only takes effect on
+      // release, so a press that grows past 5 s into AP-reset territory
+      // wins instead. Sessions persist; only the lock + fail counter clear.
+      if (authHardLocked || authFailCount > 0) {
+        hardLockManualClear("BOOT button held 3-5s");
+      } else {
+        LOG("[BTN] BOOT pressed %lums (no auth lock to clear)\n", heldMs);
+      }
     } else if (heldMs >= 1000UL) {
-      // 1–5 s window: log it so the user sees their press registered, but no action.
-      LOG("[BTN] BOOT pressed %lums (no action — hold ≥5s for AP reset, ≥10s for factory)\n", heldMs);
+      // 1–3 s window: too short for any action. Log it so the user sees the
+      // press registered.
+      LOG("[BTN] BOOT pressed %lums (no action — hold ≥3s for auth unlock, "
+          "≥5s for AP reset, ≥10s for factory)\n", heldMs);
     }
   }
 }
@@ -2860,6 +3197,8 @@ void setup() {
   }
 
   server.on("/",                HTTP_GET,  handleRoot);
+  server.on("/login",           HTTP_GET,  handleLogin);   // Digest entry point
+  server.on("/logout",          HTTP_POST, handleLogout);  // POST so prefetchers can't trigger it
   server.on("/save",            HTTP_POST, handleSave);
   server.on("/settings",        HTTP_GET,  handleSettingsPage);
   server.on("/api/settings",    HTTP_GET,  handleApiSettingsGet);
@@ -2871,13 +3210,14 @@ void setup() {
   server.on("/update",          HTTP_GET,  handleOTAGet);
   server.on("/update",          HTTP_POST, handleOTAPost, handleOTAUpload);
 
-  // Tell WebServer to keep the Authorization header on incoming requests —
-  // required by both server.authenticate() (Digest needs the nonce/cnonce
-  // back from the client) and our requireAuth()'s "did the client even
-  // submit credentials?" check, which only counts a fail if a header was
-  // present (so a fresh dashboard visit doesn't burn three free attempts).
-  const char* collectedHeaders[] = { "Authorization" };
-  server.collectHeaders(collectedHeaders, 1);
+  // Tell WebServer to keep these request headers — by default it discards
+  // anything not on this list, so server.header()/hasHeader() return empty.
+  //   - Authorization : needed by server.authenticate() (Digest nonce+cnonce)
+  //                     on the /login route only.
+  //   - Cookie        : needed by sessionTouchOrFail() on every protected
+  //                     route to look up the current scs= session token.
+  static const char* collectedHeaders[] = { "Authorization", "Cookie" };
+  server.collectHeaders(collectedHeaders, 2);
 
   server.begin();
 
@@ -3914,32 +4254,63 @@ void rampInit() {
     while (true) { delay(1000); }
   }
 
-  // Set default target to zero — charger count unknown at boot,
-  // so we can't select the correct preset minimum yet.
-  // The dashboard will send the correct default once charger_count
-  // becomes non-zero (rebuildPresets triggers sendControl on first build).
-  ctrl.targetPowerW  = 0;
   ctrl.currentPowerW = 0;
-  ctrl.enabled       = false; // stays off until chargers are detected
 
-  // Restore persisted ramp rate (default 50 W/s if never saved)
+  // ---- Load boot-time defaults from NVS ----
+  // These three values are user-configurable via /settings and define the
+  // state the charger wakes into on every fresh boot.
+  {
+    ctrl.defaultEnabled = preferences.getBool("def_chg_en", false);
+
+    uint8_t pi = (uint8_t)preferences.getUChar("def_pwr_idx", 1);
+    if (pi >= (uint8_t)MAX_PRESETS_PER_ROW) pi = 1;  // clamp to valid column
+    ctrl.defaultPowerPresetIdx = pi;
+
+    uint16_t defTgt80 = TARGET_VOLT_PRESETS[1].dv;    // 80% = 1100 dV
+    uint16_t defTgt   = preferences.getUShort("def_tgt_dv", defTgt80);
+    if (defTgt < TARGET_VOLT_PRESETS[0].dv || defTgt > MAX_CHARGE_VOLTAGE_DV)
+      defTgt = defTgt80;
+    ctrl.defaultTargetVoltDv = defTgt;
+
+    LOG("[BOOT] defaults: chg_en=%d pwr_idx=%d tgt_dv=%u\n",
+        (int)ctrl.defaultEnabled, (int)ctrl.defaultPowerPresetIdx,
+        (unsigned)ctrl.defaultTargetVoltDv);
+  }
+
+  // ---- Apply boot defaults to active control state ----
+  ctrl.enabled = ctrl.defaultEnabled;
+
+  // Initial target power: use the configured preset column and charger count.
+  // chargerCount is already restored from NVS above (default 3). If out of
+  // range for any reason, fall back to the lowest preset of 1-charger row.
+  {
+    uint8_t cc   = ctrl.chargerCount;
+    uint8_t pidx = ctrl.defaultPowerPresetIdx;
+    ctrl.targetPowerW = (cc >= 1 && cc <= 4)
+                        ? POWER_PRESETS[cc - 1][pidx]
+                        : POWER_PRESETS[0][0];  // absolute fallback: 500 W
+    LOG("[BOOT] initial target power: %u W (chargers=%d preset_idx=%d)\n",
+        (unsigned)ctrl.targetPowerW, (int)cc, (int)pidx);
+  }
+
+  // Restore persisted ramp rate (default 100 W/s if never saved)
   ctrl.rampStepW = preferences.getUShort("ramp_step_w", DEFAULT_RAMP_STEP_W);
   if (ctrl.rampStepW < 10 || ctrl.rampStepW > 500) ctrl.rampStepW = DEFAULT_RAMP_STEP_W;
 
-  // Restore persisted target voltage; default to 100 % (highest preset) if
-  // never saved. Survives reboots and OTA / serial-flash firmware updates
-  // (NVS partition is preserved unless the flasher does --erase_all).
+  // Restore persisted target voltage. Priority order:
+  //   1. Last explicitly saved session value ("target_volt_dv" key)
+  //   2. The user-configured boot default ("def_tgt_dv")
+  //   3. Hard-coded 80% fallback
+  // This means the target survives reboots but a one-time NVS clear will
+  // fall back to the configured default rather than always 100%.
   {
-    uint16_t defaultTgt = TARGET_VOLT_PRESETS[TARGET_VOLT_PRESET_COUNT - 1].dv;
-    uint16_t savedTgt   = preferences.getUShort("target_volt_dv", defaultTgt);
-    // Sanity-clamp in case the saved value is out of the valid range.
-    if (savedTgt < TARGET_VOLT_PRESETS[0].dv ||
-        savedTgt > MAX_CHARGE_VOLTAGE_DV) {
-      savedTgt = defaultTgt;
-    }
+    uint16_t savedTgt = preferences.getUShort("target_volt_dv",
+                                               ctrl.defaultTargetVoltDv);
+    if (savedTgt < TARGET_VOLT_PRESETS[0].dv || savedTgt > MAX_CHARGE_VOLTAGE_DV)
+      savedTgt = ctrl.defaultTargetVoltDv;
     ctrl.targetVoltDv = savedTgt;
     LOG("[BOOT] target_volt_dv restored: %u dV (default %u dV)\n",
-        savedTgt, defaultTgt);
+        savedTgt, ctrl.defaultTargetVoltDv);
   }
 
   xTaskCreatePinnedToCore(
