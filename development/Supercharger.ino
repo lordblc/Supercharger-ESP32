@@ -46,7 +46,7 @@
 //   driver/twai.h    } built into Espressif ESP32 Arduino core - no install needed
 // ==========================================================================
 
-#define VERSION 202605011308
+#define VERSION 202605011612
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -390,11 +390,19 @@ struct ChargingControl {
   uint8_t  chargerCount  = 3;     // manual charger count for per-unit current division
   uint16_t rampStepW     = DEFAULT_RAMP_STEP_W; // W per second ramp rate, configurable
   uint16_t targetVoltDv  = 1100;  // target charge voltage (dV), overwritten from NVS in rampInit()
-  // Boot-time defaults — loaded from NVS in rampInit(), configurable via /settings
+  // Boot-time defaults (AP / road mode) — loaded from NVS in rampInit(), applied immediately
   bool     defaultEnabled        = false; // charging on/off state at boot
   uint8_t  defaultPowerPresetIdx = 1;     // POWER_PRESETS column at boot (idx 1 = 1/2/3/4 kW by charger count)
   uint16_t defaultTargetVoltDv   = 1100;  // target voltage at boot (dV); 1100 = 80%
+  // Home WiFi defaults — loaded from NVS in rampInit(), applied once STA first connects
+  bool     homeDefaultEnabled        = false;
+  uint8_t  homeDefaultPowerPresetIdx = 1;
+  uint16_t homeDefaultTargetVoltDv   = 1100;
 } ctrl;
+
+// Set to true the first time home WiFi defaults are applied (STATE_CONNECTING →
+// STATE_CONNECTED transition). Prevents re-applying on every WiFi reconnect.
+static bool homeDefaultsApplied = false;
 
 // Session energy tracking — accumulated in rampTask, reset on boot or manual reset.
 // Guarded by sessionMutex: rampTask does read-modify-write `+= delta` each tick
@@ -682,14 +690,13 @@ const char HTML_SETTINGS[] PROGMEM = R"rawliteral(
     <button onclick="saveRampRate()">Save Ramp Rate</button>
   </div>
 
-  <div class="section">Boot Defaults</div>
+  <div class="section">Boot Defaults &mdash; AP / Road Mode</div>
   <div class="box">
+    <div class="hint" style="margin-top:0;margin-bottom:10px">Applied when the device boots without a home WiFi connection (AP mode or no saved network).</div>
     <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:0">
       <input type="checkbox" id="defChgEnabled">
-      <span>Start with charging enabled at boot</span>
+      <span>Start with charging enabled</span>
     </label>
-    <div class="hint">When unchecked, charging must be enabled manually from the dashboard after each boot.</div>
-
     <label style="margin-top:14px">Default charge speed preset</label>
     <select id="defPowerPreset">
       <option value="0">Preset 1 &mdash; 0.5 / 1 / 1.5 / 2 kW (1&ndash;4 chargers)</option>
@@ -699,7 +706,6 @@ const char HTML_SETTINGS[] PROGMEM = R"rawliteral(
       <option value="4">Preset 5 &mdash; 3.3 / 6.6 / 9.9 / 13.2 kW (1&ndash;4 chargers)</option>
     </select>
     <div class="hint">Actual watts depend on charger count. Preset 2 = 2 kW with 2 chargers.</div>
-
     <label style="margin-top:14px">Default target voltage</label>
     <select id="defTargetVolt">
       <option value="1060">70% &mdash; 106.0 V</option>
@@ -708,8 +714,34 @@ const char HTML_SETTINGS[] PROGMEM = R"rawliteral(
       <option value="1164">100% &mdash; 116.4 V</option>
     </select>
     <div class="hint">Applied at boot. Can be changed per session from the dashboard.</div>
+    <button onclick="saveBootDefaults()">Save AP / Road Defaults</button>
+  </div>
 
-    <button onclick="saveBootDefaults()">Save Boot Defaults</button>
+  <div class="section">Boot Defaults &mdash; Home WiFi</div>
+  <div class="box">
+    <div class="hint" style="margin-top:0;margin-bottom:10px">Applied once when the device first connects to your home WiFi network after boot. Overrides the AP / Road defaults above.</div>
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:0">
+      <input type="checkbox" id="homeDefChgEnabled">
+      <span>Start with charging enabled</span>
+    </label>
+    <label style="margin-top:14px">Default charge speed preset</label>
+    <select id="homeDefPowerPreset">
+      <option value="0">Preset 1 &mdash; 0.5 / 1 / 1.5 / 2 kW (1&ndash;4 chargers)</option>
+      <option value="1">Preset 2 &mdash; 1 / 2 / 3 / 4 kW (1&ndash;4 chargers)</option>
+      <option value="2">Preset 3 &mdash; 1.65 / 3.3 / 5 / 6.6 kW (1&ndash;4 chargers)</option>
+      <option value="3">Preset 4 &mdash; 2.2 / 4.4 / 6.6 / 8.8 kW (1&ndash;4 chargers)</option>
+      <option value="4">Preset 5 &mdash; 3.3 / 6.6 / 9.9 / 13.2 kW (1&ndash;4 chargers)</option>
+    </select>
+    <div class="hint">Actual watts depend on charger count. Preset 2 = 2 kW with 2 chargers.</div>
+    <label style="margin-top:14px">Default target voltage</label>
+    <select id="homeDefTargetVolt">
+      <option value="1060">70% &mdash; 106.0 V</option>
+      <option value="1100">80% &mdash; 110.0 V</option>
+      <option value="1132">90% &mdash; 113.2 V</option>
+      <option value="1164">100% &mdash; 116.4 V</option>
+    </select>
+    <div class="hint">Applied at boot. Can be changed per session from the dashboard.</div>
+    <button onclick="saveHomeDefaults()">Save Home WiFi Defaults</button>
   </div>
 
   <div id="msgBox" class="msg"></div>
@@ -734,9 +766,12 @@ const char HTML_SETTINGS[] PROGMEM = R"rawliteral(
       }
       document.getElementById('ccCount').value    = d.charger_count || 3;
       document.getElementById('rampRate').value   = d.ramp_rate_wps || 50;
-      document.getElementById('defChgEnabled').checked = !!d.charging_enabled_default;
-      document.getElementById('defPowerPreset').value  = (d.power_preset_default !== undefined) ? d.power_preset_default : 1;
-      document.getElementById('defTargetVolt').value   = (d.target_volt_default   !== undefined) ? d.target_volt_default  : 1100;
+      document.getElementById('defChgEnabled').checked     = !!d.charging_enabled_default;
+      document.getElementById('defPowerPreset').value      = (d.power_preset_default !== undefined) ? d.power_preset_default : 1;
+      document.getElementById('defTargetVolt').value       = (d.target_volt_default   !== undefined) ? d.target_volt_default  : 1100;
+      document.getElementById('homeDefChgEnabled').checked = !!d.home_charging_enabled_default;
+      document.getElementById('homeDefPowerPreset').value  = (d.home_power_preset_default !== undefined) ? d.home_power_preset_default : 1;
+      document.getElementById('homeDefTargetVolt').value   = (d.home_target_volt_default   !== undefined) ? d.home_target_volt_default  : 1100;
       // Toggle MQTT section based on AP mode
       if (d.ap_mode) {
         document.getElementById('mqttForm').style.display = 'none';
@@ -844,13 +879,25 @@ const char HTML_SETTINGS[] PROGMEM = R"rawliteral(
       var ce  = document.getElementById('defChgEnabled').checked;
       var pi  = parseInt(document.getElementById('defPowerPreset').value);
       var tvd = parseInt(document.getElementById('defTargetVolt').value);
-      if (isNaN(pi)  || pi  < 0 || pi  > 4)    { showMsg('Invalid preset index',         false); return; }
-      if (isNaN(tvd) || tvd < 1060 || tvd > 1164) { showMsg('Invalid target voltage',    false); return; }
+      if (isNaN(pi)  || pi  < 0 || pi  > 4)       { showMsg('Invalid preset index',   false); return; }
+      if (isNaN(tvd) || tvd < 1060 || tvd > 1164)  { showMsg('Invalid target voltage', false); return; }
       postSettings({
         charging_enabled_default: ce,
         power_preset_default:     pi,
         target_volt_default:      tvd
-      }, 'Boot defaults saved', false);
+      }, 'AP / Road defaults saved', false);
+    }
+    function saveHomeDefaults() {
+      var ce  = document.getElementById('homeDefChgEnabled').checked;
+      var pi  = parseInt(document.getElementById('homeDefPowerPreset').value);
+      var tvd = parseInt(document.getElementById('homeDefTargetVolt').value);
+      if (isNaN(pi)  || pi  < 0 || pi  > 4)       { showMsg('Invalid preset index',   false); return; }
+      if (isNaN(tvd) || tvd < 1060 || tvd > 1164)  { showMsg('Invalid target voltage', false); return; }
+      postSettings({
+        home_charging_enabled_default: ce,
+        home_power_preset_default:     pi,
+        home_target_volt_default:      tvd
+      }, 'Home WiFi defaults saved', false);
     }
   </script>
 </body>
@@ -2059,13 +2106,13 @@ void handleLogin() {
   //  - HttpOnly       — JS can't read it (XSS defense)
   //  - SameSite=Strict — never sent on cross-origin requests (CSRF defense)
   //  - Path=/         — sent on every path
-  //  - Max-Age=3600   — 1 h client-side expiry; matches server-side idle
-  //                     timeout, so a stale cookie won't linger after the
-  //                     server has already forgotten the session
+  //  - Max-Age=21600  — 6 h client-side expiry; matches SESSION_IDLE_TIMEOUT_MS
+  //                     so a stale cookie won't linger after the server has
+  //                     already forgotten the session
   //  - No `Secure`    — this is plain HTTP on a LAN
   char cookieHdr[120];
   snprintf(cookieHdr, sizeof(cookieHdr),
-           "scs=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=3600",
+           "scs=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=21600",
            token);
   server.sendHeader("Set-Cookie", cookieHdr);
   server.sendHeader("Location",   "/");
@@ -2130,14 +2177,14 @@ void handleApiSettingsGet() {
   bool   caSet   = mqttCaCert.length() > 0;
   size_t caBytes = mqttCaCert.length();
 
-  char buf[720];
+  char buf[820];
   snprintf(buf, sizeof(buf),
     "{\"ap_mode\":%s,\"wifi_ssid\":\"%s\",\"ap_ssid\":\"%s\",\"ap_pass_set\":%s,"
     "\"mqtt_host\":\"%s\",\"mqtt_port\":%d,\"mqtt_user\":\"%s\","
     "\"mqtt_tls\":%s,\"mqtt_ca_set\":%s,\"mqtt_ca_bytes\":%u,"
     "\"charger_count\":%d,\"ramp_rate_wps\":%d,"
-    "\"charging_enabled_default\":%s,\"power_preset_default\":%d,"
-    "\"target_volt_default\":%d}",
+    "\"charging_enabled_default\":%s,\"power_preset_default\":%d,\"target_volt_default\":%d,"
+    "\"home_charging_enabled_default\":%s,\"home_power_preset_default\":%d,\"home_target_volt_default\":%d}",
     apIsBroadcasting() ? "true" : "false",
     jSsid.c_str(), jAps.c_str(), hasApPass ? "true" : "false",
     jMh.c_str(), (int)mqttPort, jMu.c_str(),
@@ -2145,7 +2192,10 @@ void handleApiSettingsGet() {
     (int)cc, (int)ctrl.rampStepW,
     ctrl.defaultEnabled ? "true" : "false",
     (int)ctrl.defaultPowerPresetIdx,
-    (int)ctrl.defaultTargetVoltDv
+    (int)ctrl.defaultTargetVoltDv,
+    ctrl.homeDefaultEnabled ? "true" : "false",
+    (int)ctrl.homeDefaultPowerPresetIdx,
+    (int)ctrl.homeDefaultTargetVoltDv
   );
   server.send(200, "application/json", buf);
 }
@@ -2369,6 +2419,30 @@ void handleApiSettingsPost() {
       ctrl.defaultTargetVoltDv = (uint16_t)tvd;
       preferences.putUShort("def_tgt_dv", (uint16_t)tvd);
       LOG("[SETTINGS] Boot target volt default: %d dV\n", tvd);
+    }
+  }
+
+  // Home WiFi boot defaults — same three settings, different NVS keys.
+  if (doc.containsKey("home_charging_enabled_default")) {
+    bool ce = doc["home_charging_enabled_default"] | false;
+    ctrl.homeDefaultEnabled = ce;
+    preferences.putBool("home_chg_en", ce);
+    LOG("[SETTINGS] Home boot charging default: %s\n", ce ? "ON" : "OFF");
+  }
+  if (doc.containsKey("home_power_preset_default")) {
+    int pi = doc["home_power_preset_default"] | -1;
+    if (pi >= 0 && pi < MAX_PRESETS_PER_ROW) {
+      ctrl.homeDefaultPowerPresetIdx = (uint8_t)pi;
+      preferences.putUChar("home_pwr_idx", (uint8_t)pi);
+      LOG("[SETTINGS] Home boot power preset index: %d\n", pi);
+    }
+  }
+  if (doc.containsKey("home_target_volt_default")) {
+    int tvd = doc["home_target_volt_default"] | -1;
+    if (tvd >= (int)TARGET_VOLT_PRESETS[0].dv && tvd <= (int)MAX_CHARGE_VOLTAGE_DV) {
+      ctrl.homeDefaultTargetVoltDv = (uint16_t)tvd;
+      preferences.putUShort("home_tgt_dv", (uint16_t)tvd);
+      LOG("[SETTINGS] Home boot target volt default: %d dV\n", tvd);
     }
   }
 
@@ -3009,6 +3083,7 @@ void monitorWifiStatus() {
         snprintf(mqttHostname, sizeof(mqttHostname), "%s", hn);
       startMdns();
       currentState = STATE_CONNECTED;
+      applyHomeWifiBootDefaults();  // apply home WiFi profile once, on first STA connect
       return;
     }
     // Not yet connected — check whether we've exceeded the timeout.
@@ -4238,6 +4313,33 @@ void rampTask(void* /*pvParameters*/) {
   }
 }
 
+// Called once when home WiFi (STA) first connects successfully. Overrides the
+// AP/road boot defaults that rampInit() loaded with the home WiFi profile.
+// Guarded by homeDefaultsApplied so mid-session reconnects don't clobber an
+// in-progress charge session that the user may have already adjusted.
+void applyHomeWifiBootDefaults() {
+  if (homeDefaultsApplied) return;
+  homeDefaultsApplied = true;
+
+  if (xSemaphoreTake(controlMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    ctrl.enabled = ctrl.homeDefaultEnabled;
+
+    uint8_t cc   = ctrl.chargerCount;
+    uint8_t pidx = ctrl.homeDefaultPowerPresetIdx;
+    ctrl.targetPowerW = (cc >= 1 && cc <= 4)
+                        ? POWER_PRESETS[cc - 1][pidx]
+                        : POWER_PRESETS[0][0];
+
+    ctrl.targetVoltDv = ctrl.homeDefaultTargetVoltDv;
+    xSemaphoreGive(controlMutex);
+  }
+
+  LOG("[BOOT] Home WiFi up — home defaults applied: chg_en=%d pwr=%u W tgt=%u dV\n",
+      (int)ctrl.homeDefaultEnabled,
+      (unsigned)ctrl.targetPowerW,
+      (unsigned)ctrl.homeDefaultTargetVoltDv);
+}
+
 // Called from setup() — creates controlMutex and launches ramp task on Core 1
 void rampInit() {
   controlMutex = xSemaphoreCreateMutex();
@@ -4272,9 +4374,25 @@ void rampInit() {
       defTgt = defTgt80;
     ctrl.defaultTargetVoltDv = defTgt;
 
-    LOG("[BOOT] defaults: chg_en=%d pwr_idx=%d tgt_dv=%u\n",
+    // Home WiFi profile — same three settings, different NVS keys.
+    // Applied once in applyHomeWifiBootDefaults() when STA first connects.
+    ctrl.homeDefaultEnabled = preferences.getBool("home_chg_en", false);
+
+    uint8_t hpi = (uint8_t)preferences.getUChar("home_pwr_idx", 1);
+    if (hpi >= (uint8_t)MAX_PRESETS_PER_ROW) hpi = 1;
+    ctrl.homeDefaultPowerPresetIdx = hpi;
+
+    uint16_t hTgt = preferences.getUShort("home_tgt_dv", defTgt80);
+    if (hTgt < TARGET_VOLT_PRESETS[0].dv || hTgt > MAX_CHARGE_VOLTAGE_DV)
+      hTgt = defTgt80;
+    ctrl.homeDefaultTargetVoltDv = hTgt;
+
+    LOG("[BOOT] AP defaults:   chg_en=%d pwr_idx=%d tgt_dv=%u\n",
         (int)ctrl.defaultEnabled, (int)ctrl.defaultPowerPresetIdx,
         (unsigned)ctrl.defaultTargetVoltDv);
+    LOG("[BOOT] Home defaults: chg_en=%d pwr_idx=%d tgt_dv=%u\n",
+        (int)ctrl.homeDefaultEnabled, (int)ctrl.homeDefaultPowerPresetIdx,
+        (unsigned)ctrl.homeDefaultTargetVoltDv);
   }
 
   // ---- Apply boot defaults to active control state ----

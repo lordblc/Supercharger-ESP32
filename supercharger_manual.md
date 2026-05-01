@@ -106,16 +106,49 @@ Hardware reset, wired straight to the chip's enable pin. Pressing it cold-boots 
 
 ### BOOT (User Reset / Recovery)
 
-This is the one to remember. Two hold patterns are recognised:
+This is the one to remember. Four hold patterns are recognised:
 
 | Hold time | Action | What it does |
 | --- | --- | --- |
-| **5 seconds** (release after 5 s, before 10 s) | Clear WiFi & restart into AP mode | Wipes saved WiFi SSID/password only. AP credentials, MQTT settings, charger count, ramp rate, and target voltage all stay intact. Use this when you need to switch the controller to a new network. |
-| **10 seconds** (just keep holding) | Factory reset | Wipes the entire NVS configuration namespace — WiFi credentials, AP credentials, MQTT settings, charger count, ramp rate, target voltage. The controller reboots immediately when the 10 s threshold is hit (you don't need to release), so you'll feel the reset rather than wonder if it took. Use this when re-homing the controller to another bike or troubleshooting a stuck configuration. |
-
-Releases under 1 second are ignored entirely (no accidental triggers from packaging knocks during shipping). Releases between 1 and 5 seconds are logged but take no action.
+| **< 1 s** | Nothing | Ignored — prevents accidental triggers from packaging knocks. |
+| **1 – 3 s** | Nothing (logged) | Logged to serial/SSE but no action taken. |
+| **3 – 5 s** | Clear auth lock | If the dashboard login is hard-locked (5 failed password attempts), this clears the lock and the fail counter so the login page becomes responsive again. Has no effect if the lock is not currently active. |
+| **5 – 10 s** | Clear WiFi & restart into AP mode | Wipes saved WiFi SSID/password only. AP credentials, MQTT settings, charger count, ramp rate, target voltage, and boot defaults all stay intact. Use this when you need to switch the controller to a new network. |
+| **10 s+** | Factory reset | Wipes the entire NVS configuration namespace — WiFi credentials, AP credentials, MQTT settings, charger count, ramp rate, target voltage, and boot defaults. The controller reboots immediately when the 10 s threshold is hit (you don't need to release), so you'll feel the reset rather than wonder if it took. Use this when re-homing the controller to another bike or troubleshooting a stuck configuration. |
 
 The BOOT button still doubles as the chip's bootloader entry button if you happen to hold it while pressing RST — that puts the ESP32-S3 into USB download mode, which only matters if you're flashing over USB.
+
+---
+
+## Logging In
+
+The dashboard is password protected. On first visit your browser will show a login dialog.
+
+- **Username**: set in `arduino_secrets.h` as `SECRET_OTA_USER`
+- **Password**: set in `arduino_secrets.h` as `SECRET_OTA_PASS`
+
+The controller uses HTTP Digest authentication — your password is never sent over the wire, only a cryptographic hash. After a successful login the browser receives a session cookie that is valid for **6 hours of idle time**. While the dashboard tab is open and polling, the session stays alive indefinitely. The cookie is cleared when you click **Logout** (top of the dashboard), or when the session expires from 6 hours of inactivity.
+
+### Login rate limiting and lock-out
+
+Failed login attempts are tracked globally:
+
+| Attempt | Delay before next try |
+| --- | --- |
+| 1 – 2 | None (free) |
+| 3 | 2 s |
+| 4 | 5 s |
+| 5 | 15 s — and the login is **hard-locked** |
+| 6 | 30 s |
+| 7+ | 60 s (cap) |
+
+After **5 failures** the login page returns **423 Locked** and refuses all further attempts regardless of waiting. Three ways to clear the lock:
+
+1. **BOOT button hold 3 – 5 s** — instant, no reboot required (see button section above).
+2. **15 minute auto-clear** — the lock clears itself after 15 minutes with no manual intervention.
+3. **Reboot** — power cycle or press RST.
+
+Existing open sessions are not affected by a lock — if you are already logged in, the dashboard keeps working while the lock is active. Only new login attempts are blocked.
 
 ---
 
@@ -169,12 +202,14 @@ One card per detected charger, with voltage, current, and status. Chargers appea
 
 Presets per charger count:
 
-| Chargers | Presets (W) |
-| --- | --- |
-| 1 | 500, 1000, 1650, 2200, 3300 |
-| 2 | 1000, 2200, 3300, 5000, 6600 |
-| 3 | 1600, 3300, 5000, 6600, 9900 |
-| 4 | 2200, 4400, 6600, 9900, 13200 |
+| Chargers | Preset 1 | Preset 2 | Preset 3 | Preset 4 | Preset 5 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 500 W | 1000 W | 1650 W | 2200 W | 3300 W |
+| 2 | 1000 W | 2000 W | 3300 W | 4400 W | 6600 W |
+| 3 | 1500 W | 3000 W | 5000 W | 6600 W | 9900 W |
+| 4 | 2000 W | 4000 W | 6600 W | 8800 W | 13200 W |
+
+The preset number (1–5) stays consistent across charger counts — Preset 2 always represents the second-lowest power level for however many chargers you have. This is also the column used for the Boot Defaults preset setting (see Settings page below).
 
 **Auto behavior**: when chargers first appear, the controller auto enables charging at the lowest preset. When they all disappear (e.g. you unplug), it auto disables. You don't have to babysit it.
 
@@ -245,6 +280,58 @@ At the bottom: uptime, WiFi signal, firmware version, CPU load per core, free he
 Click the Log link, or go to **/log**. Live serial log in your browser, updated in real time. Good for diagnosing CAN bus issues without needing a USB cable.
 
 ![Dashboard Screenshot](pics/202604231420-Log_768.jpg)
+
+---
+
+## Settings Page
+
+Click **Settings** in the dashboard navigation bar, or go to **/settings**. All settings are saved to non-volatile storage immediately — they survive reboots and OTA updates.
+
+### WiFi Network
+
+Set the SSID and password for the home WiFi network the controller should join. Changes require a restart (the save button triggers one automatically).
+
+### Access Point (Fallback)
+
+The name and password for the controller's own hotspot, used when home WiFi is unavailable. Minimum 8 characters for the password. The built-in default is `Supercharger` / `12345678` — change this if the device will be used in shared spaces.
+
+### MQTT Broker
+
+Configure the broker address, port, username, and password for Home Assistant integration. TLS (SSL) can be enabled — if you enable it you must also paste the broker's CA certificate (PEM format) into the text area that appears. Saving reconnects the MQTT client immediately without a reboot.
+
+### Charger Hardware
+
+Sets how many chargers the controller expects to see on the CAN bus (1 – 4). This controls which row of the preset table is used and divides the commanded current evenly across units.
+
+### Charging Behaviour
+
+**Ramp Rate (W/s)**: how many watts the controller adds or removes per second when stepping toward a new target. Lower values give a gentler ramp. Default is 100 W/s; valid range 10 – 500.
+
+### Boot Defaults — AP / Road Mode
+
+These settings define the charging state the controller wakes into on every boot **when no home WiFi connection is available** (AP/road mode). They are applied immediately in the boot sequence before any WiFi connection is attempted.
+
+| Setting | What it controls |
+| --- | --- |
+| **Start with charging enabled** | If checked, charging is active as soon as the controller boots. If unchecked, you must press ON from the dashboard. Default: off. |
+| **Default charge speed preset** | Which preset column (1 – 5) to use as the initial power target. Actual watts depend on charger count — see the preset table above. Default: Preset 2 (1 / 2 / 3 / 4 kW). |
+| **Default target voltage** | Which charge limit preset (70 / 80 / 90 / 100 %) to start with. Default: 80% (110.0 V). |
+
+Click **Save AP / Road Defaults** to persist. These take effect on the next boot.
+
+### Boot Defaults — Home WiFi
+
+The same three settings, applied **once** when the controller first joins your home WiFi network after boot. They override the AP / Road defaults above at that moment. Subsequent WiFi drops and reconnects during a session do not re-apply them — once applied they stay applied for that session only.
+
+| Setting | What it controls |
+| --- | --- |
+| **Start with charging enabled** | As above, but for home WiFi sessions. |
+| **Default charge speed preset** | As above, but for home WiFi sessions. |
+| **Default target voltage** | As above, but for home WiFi sessions. |
+
+Click **Save Home WiFi Defaults** to persist. These take effect on the next boot once the controller connects to home WiFi.
+
+**Typical use**: set the AP / Road defaults conservatively (charging off, low preset, 80% target) for when the controller is connected to the bike at an unfamiliar location. Set the Home WiFi defaults to your preferred daily charging behaviour (charging on, your usual preset, 80% target) so you don't have to touch the dashboard each time you plug in at home.
 
 ---
 
