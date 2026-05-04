@@ -7,7 +7,7 @@
 // basis for a lot of what this controller does. I just put it together
 // and added some other features.
 // (There are a lot more people involved here and I thank you all. If you
-// want your name in this list, do not hesitatet to get in contact with me)
+// want your name in this list, do not hesitate to get in contact with me)
 // 
 // Hardware info:
 //  CAN:
@@ -44,9 +44,11 @@
 //   BLEDevice        } built into Espressif ESP32 Arduino core - no install needed
 //   ESPmDNS          } built into Espressif ESP32 Arduino core - no install needed
 //   driver/twai.h    } built into Espressif ESP32 Arduino core - no install needed
+//   WiFiClientSecure } built into Espressif ESP32 Arduino core - used for MQTT-TLS client
+//   esp_https_server } built into Espressif ESP32 Arduino core - used for HTTPS port-443 serving
 // ==========================================================================
 
-#define VERSION 202605011612
+#define VERSION 202605041608
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -72,6 +74,10 @@
 #include <WiFiClientSecure.h>// MQTT-over-TLS path (mqttTls=true)
 #include <mbedtls/md.h>      // HMAC-SHA256 for signed OTA verification
 #include "ota_secret.h"      // OTA_HMAC_SECRET[32] — gitignored, generated per build host
+// HttpCtx struct + ESP-IDF httpd_ssl request helpers.
+// Must come before any .ino function definition so Arduino's prototype
+// generator can see the struct type.
+#include "https_ctx.h"
 
 // ---------------------------------------------------------------------------
 // Logging — ring buffer mirrored to hardware serial and SSE stream
@@ -575,6 +581,74 @@ static String   mqttCaCert         = "";
 #define BTN_HOLD_FACTORY_MS    10000UL   // 10 s: wipe entire NVS namespace
 
 // ---------------------------------------------------------------------------
+// HTTPS / TLS server — optional port-443 server (ESP-IDF httpd_ssl).
+//
+// Implementation: ESP-IDF's esp_https_server (httpd_ssl_*). Built into the
+// ESP32 Arduino core; runs in its own FreeRTOS task — no loop() polling.
+//
+// HttpCtx struct, IDF→ctx adapter (initFromIDFReq), URL decode, and
+// parseKVPairs are in https_ctx.h (included above).
+//
+// When httpsEnabled==true and a valid cert+key are loaded in NVS:
+//   • Port 80  WebServer serves the "redirect to https://" handler plus
+//              /api/tls (escape hatch so the user can disable HTTPS over
+//              HTTP if cert upload was misconfigured).
+//   • Port 443 httpd_ssl_server runs in its own task. Each registered URI
+//              hits a thin idf_*() wrapper that builds an HttpCtx and calls
+//              the same httpsHandle*() function used elsewhere.
+//
+// Keep-alive is handled internally by httpd_ssl. Dashboard 2 s polling stays
+// on a single TLS session.
+//
+// Routes intentionally HTTP-only (not registered on 443):
+//   /update OTA, /api/log/stream SSE, /log, /save — the IDF path needs a
+//   chunked/streaming or multipart-upload story before they can move over.
+//   When httpsEnabled, these endpoints are unavailable; disable HTTPS to
+//   reach them.
+// ---------------------------------------------------------------------------
+
+// HTTPS server state — only active when httpsEnabled=true.
+static bool            httpsEnabled  = false;
+static httpd_handle_t  g_httpsServer = nullptr;
+
+// ---------------------------------------------------------------------------
+// Login page — standard HTML form so password managers can autofill.
+// The %s slot is replaced with an empty string (no error) or an error
+// paragraph; use snprintf(buf, sizeof(buf), HTML_LOGIN, errFrag).
+// Note: literal % in CSS must be written %% so snprintf doesn't choke.
+// ---------------------------------------------------------------------------
+
+const char HTML_LOGIN[] PROGMEM =
+  "<!DOCTYPE html><html><head><title>Supercharger \xe2\x80\x94 Login</title>"
+  "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+  "<style>"
+  "body{font-family:sans-serif;background:#0a0a1a;color:#ccc;"
+  "display:flex;flex-direction:column;align-items:center;"
+  "justify-content:center;min-height:100vh;margin:0}"
+  "h1{color:#e94560;margin-bottom:24px;font-size:1.4rem}"
+  "form{background:#16213e;padding:28px 32px;border-radius:10px;"
+  "min-width:260px;display:flex;flex-direction:column;gap:12px}"
+  "label{font-size:.85rem;color:#aaa}"
+  "input{background:#0f3460;border:1px solid #334;color:#eee;"
+  "padding:9px 12px;border-radius:6px;font-size:1rem;"
+  "width:100%%;box-sizing:border-box}"
+  "input:focus{border-color:#e94560;outline:none}"
+  "button{background:#e94560;color:#fff;border:none;padding:10px;"
+  "border-radius:6px;font-size:1rem;cursor:pointer;font-weight:bold}"
+  "button:hover{background:#c73652}"
+  ".err{color:#e94560;font-size:.9rem;text-align:center;margin:0}"
+  "</style></head><body>"
+  "<h1>&#9889; Supercharger</h1>"
+  "<form method='POST' action='/login' autocomplete='on'>"
+  "<label for='u'>Username</label>"
+  "<input id='u' name='username' type='text' autocomplete='username' required>"
+  "<label for='p'>Password</label>"
+  "<input id='p' name='password' type='password' autocomplete='current-password' required>"
+  "%s"   // error fragment — empty string or <p class='err'>…</p>
+  "<button type='submit'>Log in</button>"
+  "</form></body></html>";
+
+// ---------------------------------------------------------------------------
 // WiFi setup page — only served in AP / setup mode
 // ---------------------------------------------------------------------------
 
@@ -744,6 +818,34 @@ const char HTML_SETTINGS[] PROGMEM = R"rawliteral(
     <button onclick="saveHomeDefaults()">Save Home WiFi Defaults</button>
   </div>
 
+  <div class="section">HTTPS / TLS</div>
+  <div class="box">
+    <div class="hint" style="margin-top:0;margin-bottom:10px">
+      Upload a certificate and private key (PEM format) to enable HTTPS on port 443.
+      When enabled, port 80 redirects to HTTPS. Requires restart to take effect.
+      Use a self-signed cert for local LAN use; a publicly-trusted cert if exposed externally.
+    </div>
+    <div id="tlsCertStatus" class="hint" style="margin-bottom:10px">No certificate uploaded yet.</div>
+    <label>Certificate (PEM)</label>
+    <textarea id="tlsCert" rows="5"
+      style="width:100%;font-family:monospace;font-size:11px;background:#0f0f1e;
+             color:#eee;border:1px solid #0f3460;border-radius:5px;padding:8px"
+      placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"></textarea>
+    <label style="margin-top:10px">Private Key (PEM)</label>
+    <textarea id="tlsKey" rows="5"
+      style="width:100%;font-family:monospace;font-size:11px;background:#0f0f1e;
+             color:#eee;border:1px solid #0f3460;border-radius:5px;padding:8px"
+      placeholder="-----BEGIN RSA PRIVATE KEY-----&#10;...&#10;-----END RSA PRIVATE KEY-----"></textarea>
+    <button onclick="saveTlsCert()" style="margin-top:10px">Upload Cert &amp; Key</button>
+    <div style="margin-top:14px">
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+        <input type="checkbox" id="httpsEnabled" onchange="saveHttpsToggle()">
+        <span>Enable HTTPS (redirect port 80 → 443)</span>
+      </label>
+      <div class="hint">A certificate must be uploaded before enabling. Reboot required after changing.</div>
+    </div>
+  </div>
+
   <div id="msgBox" class="msg"></div>
 
   <script>
@@ -791,6 +893,12 @@ const char HTML_SETTINGS[] PROGMEM = R"rawliteral(
           ? ('Certificate stored on device (' + d.mqtt_ca_bytes + ' bytes). Paste a new one to replace.')
           : 'No certificate uploaded yet.';
       }
+      // HTTPS section
+      document.getElementById('httpsEnabled').checked = !!d.https_enabled;
+      var ts = document.getElementById('tlsCertStatus');
+      if (ts) ts.textContent = d.https_cert_set
+        ? 'Certificate stored on device. Paste new PEM to replace.'
+        : 'No certificate uploaded yet.';
       // Passwords are never returned from the API for security
     });
 
@@ -898,6 +1006,38 @@ const char HTML_SETTINGS[] PROGMEM = R"rawliteral(
         home_power_preset_default:     pi,
         home_target_volt_default:      tvd
       }, 'Home WiFi defaults saved', false);
+    }
+    function saveTlsCert() {
+      var cert = document.getElementById('tlsCert').value.trim();
+      var key  = document.getElementById('tlsKey').value.trim();
+      if (!cert || !key) { showMsg('Both certificate and private key are required', false); return; }
+      if (cert.indexOf('-----BEGIN CERTIFICATE-----') < 0) {
+        showMsg('Certificate must be PEM with BEGIN CERTIFICATE marker', false); return;
+      }
+      fetch('/api/tls', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({cert: cert, key: key})
+      }).then(function(r){ return r.json(); }).then(function(d){
+        if (d.ok) {
+          showMsg('Certificate uploaded. Enable HTTPS below and reboot.', true);
+          document.getElementById('tlsCertStatus').textContent =
+            'Certificate stored on device. Paste new PEM to replace.';
+          document.getElementById('tlsCert').value = '';
+          document.getElementById('tlsKey').value  = '';
+        } else { showMsg(d.error || 'Upload failed', false); }
+      }).catch(function(){ showMsg('Connection error', false); });
+    }
+    function saveHttpsToggle() {
+      var en = document.getElementById('httpsEnabled').checked;
+      fetch('/api/tls', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({enabled: en})
+      }).then(function(r){ return r.json(); }).then(function(d){
+        if (d.ok) showMsg('HTTPS ' + (en ? 'enabled' : 'disabled') + ' — reboot to apply', true);
+        else { showMsg(d.error || 'Save failed', false); document.getElementById('httpsEnabled').checked = !en; }
+      }).catch(function(){ showMsg('Connection error', false); document.getElementById('httpsEnabled').checked = !en; });
     }
   </script>
 </body>
@@ -1320,20 +1460,21 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
     }
 
     function logout(){
-      fetch('/logout', {method:'POST'}).finally(function(){
-        // The server already clears the cookie via Set-Cookie with Max-Age=0,
-        // but follow up with a hard nav so any in-flight polling cancels.
-        window.location.href = '/login';
-      });
+      // Use a real form submit so the browser navigates away and renders
+      // the server's "logged out" page directly.  A fetch() + redirect
+      // would follow the 3xx back through Digest auto-auth and end up
+      // silently re-logging the user in (looks like a page refresh).
+      var f = document.createElement('form');
+      f.method = 'POST'; f.action = '/logout';
+      document.body.appendChild(f); f.submit();
     }
 
     function refresh(){
       fetch('/api/status')
         .then(function(r){
-          // Session expired (or never existed) → bounce to /login. The login
-          // page runs Digest, mints a fresh session cookie, then redirects
-          // back to /. Browser cookie is HttpOnly so we can't act on it
-          // from JS — the 401 status is our cue.
+          // Session expired (or never existed) → bounce to /login.
+          // The cookie is HttpOnly so we can't inspect it from JS —
+          // a 401 from /api/status is our cue to redirect.
           if (r.status === 401) {
             window.location.href = '/login';
             throw new Error('redirecting to /login');
@@ -1807,7 +1948,7 @@ void sseFlush() {
 }
 
 // ---------------------------------------------------------------------------
-// Authentication — session-cookie model with Digest-auth login + hard-lock.
+// Authentication — session-cookie model with form-based login + hard-lock.
 // ---------------------------------------------------------------------------
 // Threat model: single-user device on a LAN. Need to (a) keep brute-force
 // guesses expensive without making the dashboard sluggish, and (b) make
@@ -1823,31 +1964,34 @@ void sseFlush() {
 //    Token table is RAM-only: a reboot invalidates every session, which is
 //    deliberate (clean state on every reset). Idle timeout 6 h.
 //
-// 2. **Immediate-reject rate limit** on the LOGIN endpoint only: failed
-//    Digest attempts increment a counter and set `nextAllowedAttemptMs`.
-//    A subsequent attempt while now < nextAllowedAttemptMs is rejected
-//    with 429 + Retry-After *immediately* — no vTaskDelay, no blocked
-//    WebServer task. Matches the "Immediate Reject" approach: client
-//    sees the rate-limit, doesn't time out, dashboard polls (which use
-//    the cookie path) keep working uninterrupted.
+// 2. **Immediate-reject rate limit** on POST /login only: failed attempts
+//    increment a counter and set `nextAllowedAttemptMs`. A subsequent
+//    attempt while now < nextAllowedAttemptMs is rejected with 429 +
+//    Retry-After *immediately* — no vTaskDelay, no blocked WebServer task.
+//    Client sees the rate-limit, doesn't time out, dashboard polls (which
+//    use the cookie path) keep working uninterrupted.
 //
 // 3. **State-based hard lock**: after AUTH_HARD_LOCK_THRESHOLD failed
-//    Digest attempts, `authHardLocked` becomes true. Login attempts
-//    return 423 Locked until either (a) HARD_LOCK_AUTO_CLEAR_MS elapses,
-//    (b) a BOOT-button hold of 3–5 s clears it, or (c) the device is
-//    rebooted. Existing valid sessions are NOT invalidated by the lock —
-//    only NEW logins are blocked. Defensible because brute-forcers can't
-//    have a valid session (no cookie without the password), so honouring
-//    active sessions during a lock can't aid an attacker.
+//    attempts, `authHardLocked` becomes true. Login attempts return 423
+//    Locked until either (a) HARD_LOCK_AUTO_CLEAR_MS elapses, (b) a
+//    BOOT-button hold of 3–5 s clears it, or (c) the device is rebooted.
+//    Existing valid sessions are NOT invalidated by the lock — only NEW
+//    logins are blocked. Defensible because brute-forcers can't have a
+//    valid session (no cookie without the password), so honouring active
+//    sessions during a lock can't aid an attacker.
 //
-// History note: an earlier vTaskDelay-based design (counter-driven wait
-// before sending 401) was found to make the dashboard sluggish (every
-// 2 s poll re-ran the heavy Digest check) and to block legitimate users
-// who shared the WebServer task. This redesign moves the heavy logic to
-// a single login endpoint and makes everything else cookie-cheap.
+// Login form vs Digest: the form sends credentials in plaintext over HTTP
+// (same as every consumer router / embedded device login page on a LAN).
+// The advantage is that password managers (Bitwarden, etc.) can autofill
+// standard <input type=password> fields; they cannot autofill Digest
+// browser dialogs. Session security is unchanged post-login.
+//
+// History: an earlier Digest design required the Authorization header to
+// be round-tripped on every /login, and a vTaskDelay-based rate-limiter
+// blocked the WebServer task and made the dashboard sluggish. Both have
+// been replaced by this form + cookie design.
 // ---------------------------------------------------------------------------
 
-static const char    AUTH_REALM[]              = "Supercharger";
 
 // Login rate-limit + hard-lock state
 static uint8_t       authFailCount             = 0;
@@ -1907,15 +2051,12 @@ static void hardLockManualClear(const char* reason) {
   LOG("[AUTH] Hard lock + fail counter cleared (%s)\n", reason);
 }
 
-// Pull the session token out of the request's Cookie header. Returns empty
-// string if no Cookie or no scs= entry.
-static String sessionParseCookieToken() {
-  if (!server.hasHeader("Cookie")) return String();
-  String cookie = server.header("Cookie");
+// Pull the session token out of a Cookie header string. Returns empty
+// string if the string doesn't contain an scs= entry.
+static String sessionParseCookieTokenStr(const String& cookie) {
   int idx = cookie.indexOf("scs=");
   if (idx < 0) return String();
-  // Skip past any leading "; " etc. — only accept "scs=" at start of cookie
-  // or preceded by "; " so we don't false-match "xscs=foo".
+  // Guard against false-matching "xscs=foo"
   if (idx > 0 && cookie.charAt(idx - 1) != ' ' && cookie.charAt(idx - 1) != ';') {
     return String();
   }
@@ -1927,11 +2068,14 @@ static String sessionParseCookieToken() {
   return token;
 }
 
-// If the request's Cookie maps to a non-expired session slot, refresh its
-// lastUsedMs and return true. Otherwise return false. Also lazily evicts
-// any session it encounters that's already past the idle timeout.
-static bool sessionTouchOrFail() {
-  String token = sessionParseCookieToken();
+// Pull the session token out of the WebServer request's Cookie header.
+static String sessionParseCookieToken() {
+  if (!server.hasHeader("Cookie")) return String();
+  return sessionParseCookieTokenStr(server.header("Cookie"));
+}
+
+// Core session-touch logic — takes a token string directly.
+static bool sessionTouchOrFailToken(const String& token) {
   if (token.length() != 32) return false;
   unsigned long now = millis();
   for (int i = 0; i < MAX_SESSIONS; i++) {
@@ -1947,6 +2091,18 @@ static bool sessionTouchOrFail() {
     }
   }
   return false;
+}
+
+// If the request's Cookie maps to a non-expired session slot, refresh its
+// lastUsedMs and return true. Otherwise return false. Also lazily evicts
+// any session it encounters that's already past the idle timeout.
+static bool sessionTouchOrFail() {
+  return sessionTouchOrFailToken(sessionParseCookieToken());
+}
+
+// HTTPS-path variant: checks the cookie string from the TLS request headers.
+static bool sessionTouchOrFailStr(const String& cookieHeader) {
+  return sessionTouchOrFailToken(sessionParseCookieTokenStr(cookieHeader));
 }
 
 // Mint a new session — find a free slot, or evict the oldest. Writes the
@@ -1977,9 +2133,8 @@ static void sessionMint(char* outToken) {
   strncpy(outToken, authSessions[slot].token, 33);
 }
 
-// Invalidate the session matching the request's cookie (logout path).
-static void sessionForgetCurrent() {
-  String token = sessionParseCookieToken();
+// Invalidate the session matching the given token string.
+static void sessionForgetToken(const String& token) {
   if (token.length() != 32) return;
   for (int i = 0; i < MAX_SESSIONS; i++) {
     if (authSessions[i].token[0] != '\0' && token.equals(authSessions[i].token)) {
@@ -1988,6 +2143,16 @@ static void sessionForgetCurrent() {
       return;
     }
   }
+}
+
+// Invalidate the session matching the WebServer request's cookie (logout path).
+static void sessionForgetCurrent() {
+  sessionForgetToken(sessionParseCookieToken());
+}
+
+// HTTPS-path variant.
+static void sessionForgetStr(const String& cookieHeader) {
+  sessionForgetToken(sessionParseCookieTokenStr(cookieHeader));
 }
 
 // Gate a request on a valid session. Used by every protected handler.
@@ -2018,14 +2183,73 @@ static bool authValidNoChallenge() {
   return sessionTouchOrFail();
 }
 
-// GET /login — Digest auth + rate-limit + hard-lock checkpoint, mints a
-// session cookie on success. This is the ONLY route that ever runs Digest
-// authentication; every other protected route just checks the session
-// cookie via requireAuth().
-void handleLogin() {
-  // If the user already has a valid session, skip the Digest flow entirely
-  // and just redirect to the dashboard. This handles the common case where
-  // the user manually navigates to /login but is still logged in.
+// Shared helper — mint session, set cookie, redirect to dashboard.
+static void loginSuccess() {
+  if (authFailCount > 0) {
+    LOG("[AUTH] Login OK — clearing fail counter (was %d)\n", (int)authFailCount);
+  }
+  authFailCount        = 0;
+  nextAllowedAttemptMs = 0;
+
+  char token[33];
+  sessionMint(token);
+
+  // Cookie attributes:
+  //  - HttpOnly        — JS can't read it (XSS defense)
+  //  - SameSite=Lax    — sent on top-level GET navigations (bookmarks, tab
+  //                      restore) but NOT on cross-site POST (CSRF safe).
+  //                      Strict was too aggressive: it prevented the cookie
+  //                      arriving on the first request when returning to the
+  //                      dashboard after using other browser tabs, causing
+  //                      spurious "idle logout" on every tab switch / restore.
+  //  - Path=/          — sent on every path
+  //  - Max-Age=21600   — 6 h client-side expiry; matches SESSION_IDLE_TIMEOUT_MS
+  //  - No `Secure`     — plain HTTP on a LAN
+  char cookieHdr[120];
+  snprintf(cookieHdr, sizeof(cookieHdr),
+           "scs=%s; Path=/; HttpOnly; SameSite=Lax; Max-Age=21600", token);
+  server.sendHeader("Set-Cookie", cookieHdr);
+  server.sendHeader("Location",   "/");
+  server.send(302, "text/plain", "");
+  LOG("[AUTH] Login OK — session minted (token suffix ...%s)\n", token + 26);
+}
+
+// HTTPS-path login success: mints session, sets Secure cookie, redirects to /.
+static void loginSuccessCtx(HttpCtx& ctx) {
+  if (authFailCount > 0) {
+    LOG("[AUTH] Login OK (TLS) — clearing fail counter (was %d)\n", (int)authFailCount);
+  }
+  authFailCount        = 0;
+  nextAllowedAttemptMs = 0;
+  char token[33];
+  sessionMint(token);
+  char cookieHdr[140];
+  // Add Secure flag because this path is always HTTPS
+  snprintf(cookieHdr, sizeof(cookieHdr),
+           "scs=%s; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=21600", token);
+  ctx.addRespHdr("Set-Cookie", String(cookieHdr));
+  ctx.addRespHdr("Location",   "/");
+  ctx.send(302, "text/plain", "");
+  LOG("[AUTH] Login OK (TLS) — session minted (...%s)\n", token + 26);
+}
+
+// HTTPS-path auth gate. isApi behaves the same as requireAuth().
+static bool requireAuthCtx(HttpCtx& ctx, bool isApi) {
+  if (sessionTouchOrFailStr(ctx.header("Cookie"))) return true;
+  if (isApi) {
+    ctx.send(401, "text/plain", "Authentication required");
+  } else {
+    ctx.addRespHdr("Location", "/login");
+    ctx.send(302, "text/plain", "");
+  }
+  return false;
+}
+
+// GET /login — serve the HTML login form.
+// Redirects to / if a valid session is already present.
+// Shows a locked page if the hard lock is active.
+// Shows an error paragraph when the query string contains ?err=1.
+void handleLoginGet() {
   if (sessionTouchOrFail()) {
     server.sendHeader("Location", "/");
     server.send(302, "text/plain", "");
@@ -2034,7 +2258,39 @@ void handleLogin() {
 
   hardLockMaybeAutoExpire();
 
-  // Hard-lock check first — short-circuits Digest entirely.
+  if (authHardLocked) {
+    unsigned long lockedForMs = millis() - hardLockSinceMs;
+    unsigned long remMs       = (HARD_LOCK_AUTO_CLEAR_MS > lockedForMs)
+                                  ? (HARD_LOCK_AUTO_CLEAR_MS - lockedForMs) : 0;
+    char retryHdr[16];
+    snprintf(retryHdr, sizeof(retryHdr), "%lu", (remMs + 999UL) / 1000UL);
+    server.sendHeader("Retry-After", retryHdr);
+    server.send(423, "text/plain",
+      "Locked: too many failed login attempts.\n\n"
+      "To unlock: hold the BOOT button on the device for 3-5 seconds, "
+      "reboot the device, or wait for the cooldown to expire.\n");
+    return;
+  }
+
+  const char* errFrag = server.hasArg("err")
+    ? "<p class='err'>&#10006; Invalid username or password.</p>"
+    : "";
+  char buf[2048];   // HTML_LOGIN is ~1300 bytes formatted; was 1100 — truncated mid-form
+  snprintf(buf, sizeof(buf), HTML_LOGIN, errFrag);
+  server.send(200, "text/html", buf);
+}
+
+// POST /login — validate form credentials, apply rate-limit + hard-lock,
+// mint a session cookie on success, redirect back to /login?err=1 on failure.
+void handleLoginPost() {
+  if (sessionTouchOrFail()) {
+    server.sendHeader("Location", "/");
+    server.send(302, "text/plain", "");
+    return;
+  }
+
+  hardLockMaybeAutoExpire();
+
   if (authHardLocked) {
     unsigned long lockedForMs = millis() - hardLockSinceMs;
     unsigned long remMs       = (HARD_LOCK_AUTO_CLEAR_MS > lockedForMs)
@@ -2061,13 +2317,13 @@ void handleLogin() {
     return;
   }
 
-  // Run Digest auth. server.authenticate() validates the Digest response
-  // against the canonical user/pass; an absent or wrong Authorization
-  // header → return false here.
-  if (!server.authenticate(SECRET_OTA_USER, SECRET_OTA_PASS)) {
+  // Validate credentials from form body.
+  bool ok = server.arg("username").equals(SECRET_OTA_USER) &&
+            server.arg("password").equals(SECRET_OTA_PASS);
+
+  if (!ok) {
     if (authFailCount < 255) authFailCount++;
 
-    // Trip the hard lock if we've crossed the threshold.
     if (authFailCount >= AUTH_HARD_LOCK_THRESHOLD && !authHardLocked) {
       authHardLocked  = true;
       hardLockSinceMs = millis();
@@ -2075,7 +2331,6 @@ void handleLogin() {
           "(hold BOOT 3-5s, reboot, or wait %lu min)\n",
           (int)authFailCount, HARD_LOCK_AUTO_CLEAR_MS / 60000UL);
     } else {
-      // Set the next-allowed timestamp for the immediate-reject path.
       unsigned long delaySec = authDelaySec(authFailCount);
       delaySec += (unsigned long)(esp_random() % 3);   // 0–2 s jitter
       nextAllowedAttemptMs = millis() + delaySec * 1000UL;
@@ -2083,42 +2338,14 @@ void handleLogin() {
           (int)authFailCount, delaySec);
     }
 
-    // Send the Digest challenge so the browser can re-prompt the user.
-    // Note: the browser will only show its own dialog if there's no cached
-    // credential; on a wrong-password retry it sends the cached digest
-    // again, fails, and gives up after some implementation-specific number
-    // of retries.
-    server.requestAuthentication(DIGEST_AUTH, AUTH_REALM, "Login required");
+    // Redirect back to the form with an error flag rather than re-serving
+    // the page here — avoids a browser "resubmit form?" warning on refresh.
+    server.sendHeader("Location", "/login?err=1");
+    server.send(303, "text/plain", "");
     return;
   }
 
-  // Success — mint a session and redirect to the dashboard.
-  if (authFailCount > 0) {
-    LOG("[AUTH] Login OK — clearing fail counter (was %d)\n", (int)authFailCount);
-  }
-  authFailCount        = 0;
-  nextAllowedAttemptMs = 0;
-
-  char token[33];
-  sessionMint(token);
-
-  // Cookie attributes:
-  //  - HttpOnly       — JS can't read it (XSS defense)
-  //  - SameSite=Strict — never sent on cross-origin requests (CSRF defense)
-  //  - Path=/         — sent on every path
-  //  - Max-Age=21600  — 6 h client-side expiry; matches SESSION_IDLE_TIMEOUT_MS
-  //                     so a stale cookie won't linger after the server has
-  //                     already forgotten the session
-  //  - No `Secure`    — this is plain HTTP on a LAN
-  char cookieHdr[120];
-  snprintf(cookieHdr, sizeof(cookieHdr),
-           "scs=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=21600",
-           token);
-  server.sendHeader("Set-Cookie", cookieHdr);
-  server.sendHeader("Location",   "/");
-  server.send(302, "text/plain", "");
-
-  LOG("[AUTH] Login OK — session minted (token suffix ...%s)\n", token + 26);
+  loginSuccess();
 }
 
 // POST /logout — invalidates the current session and clears the cookie.
@@ -2126,10 +2353,30 @@ void handleLogin() {
 // log the user out.
 void handleLogout() {
   sessionForgetCurrent();
-  // Set-Cookie with Max-Age=0 tells the browser to drop its copy too.
+  // Clear the cookie and return a 200 page — NOT a redirect.
+  // A redirect to /login would be followed by the browser's cached Digest
+  // credentials, silently minting a new session and bouncing back to the
+  // dashboard.  Serving a page here breaks that loop: the browser shows
+  // "logged out" and the user must take a deliberate action to log back in.
   server.sendHeader("Set-Cookie", "scs=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");
-  server.sendHeader("Location",   "/login");
-  server.send(302, "text/plain", "");
+  server.send(200, "text/html",
+    "<!DOCTYPE html><html><head><title>Logged out</title>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<style>"
+    "body{font-family:sans-serif;background:#0a0a1a;color:#ccc;"
+    "display:flex;flex-direction:column;align-items:center;"
+    "justify-content:center;min-height:100vh;margin:0;text-align:center}"
+    "h2{color:#e94560;margin-bottom:8px}"
+    "p{color:#aaa;margin:4px 0}"
+    "a{display:inline-block;margin-top:24px;padding:10px 28px;"
+    "background:#e94560;color:#fff;border-radius:6px;text-decoration:none;"
+    "font-weight:bold}"
+    "a:hover{background:#c73652}"
+    "</style></head><body>"
+    "<h2>&#128274; Logged out</h2>"
+    "<p>Your session has been cleared.</p>"
+    "<a href='/login'>Log in again &rarr;</a>"
+    "</body></html>");
 }
 
 void handleRoot() {
@@ -2143,9 +2390,380 @@ void handleSettingsPage() {
   server.send_P(200, "text/html", HTML_SETTINGS);
 }
 
-// GET /api/settings — returns current settings as JSON (protected)
-void handleApiSettingsGet() {
-  if (!requireAuth(true)) return;   // API route
+// ---------------------------------------------------------------------------
+// HTTPS handler functions — mirror the WebServer handlers but use HttpCtx.
+// Only the routes that a user needs over HTTPS are duplicated here; OTA
+// upload (/update) remains HTTP-only because multipart streaming over a
+// manually-parsed TLS connection is impractical.
+// ---------------------------------------------------------------------------
+
+// settingsNeedRestart — set by applyApiSettingsBody() when a WiFi change
+// requires a reboot. Declared here (before the HTTPS handlers that read it)
+// and initialised to false. Do NOT redeclare this below.
+static bool settingsNeedRestart = false;
+
+// GET / (HTTPS)
+static void httpsHandleRoot(HttpCtx& ctx) {
+  if (!requireAuthCtx(ctx, false)) return;
+  ctx.sendProgmem(200, "text/html", HTML_DASHBOARD);
+}
+
+// GET /settings (HTTPS)
+static void httpsHandleSettingsPage(HttpCtx& ctx) {
+  if (!requireAuthCtx(ctx, false)) return;
+  ctx.sendProgmem(200, "text/html", HTML_SETTINGS);
+}
+
+// GET /login (HTTPS)
+static void httpsHandleLoginGet(HttpCtx& ctx) {
+  if (sessionTouchOrFailStr(ctx.header("Cookie"))) {
+    ctx.addRespHdr("Location", "/");
+    ctx.send(302, "text/plain", "");
+    return;
+  }
+  hardLockMaybeAutoExpire();
+  if (authHardLocked) {
+    unsigned long lockedForMs = millis() - hardLockSinceMs;
+    unsigned long remMs = (HARD_LOCK_AUTO_CLEAR_MS > lockedForMs)
+                            ? (HARD_LOCK_AUTO_CLEAR_MS - lockedForMs) : 0;
+    char retryHdr[16];
+    snprintf(retryHdr, sizeof(retryHdr), "%lu", (remMs + 999UL) / 1000UL);
+    ctx.addRespHdr("Retry-After", String(retryHdr));
+    ctx.send(423, "text/plain",
+      "Locked: too many failed login attempts.\n\n"
+      "To unlock: hold the BOOT button for 3-5 s, reboot, or wait for cooldown.\n");
+    return;
+  }
+  const char* errFrag = ctx.hasArg("err")
+    ? "<p class='err'>&#10006; Invalid username or password.</p>" : "";
+  char buf[2048];   // HTML_LOGIN is ~1300 bytes formatted; was 1100 — truncated mid-form
+  snprintf(buf, sizeof(buf), HTML_LOGIN, errFrag);
+  ctx.send(200, "text/html", String(buf));
+}
+
+// POST /login (HTTPS)
+static void httpsHandleLoginPost(HttpCtx& ctx) {
+  if (sessionTouchOrFailStr(ctx.header("Cookie"))) {
+    ctx.addRespHdr("Location", "/");
+    ctx.send(302, "text/plain", "");
+    return;
+  }
+  hardLockMaybeAutoExpire();
+  if (authHardLocked) {
+    ctx.send(423, "text/plain", "Locked: too many failed login attempts.\n");
+    return;
+  }
+  unsigned long now = millis();
+  if (nextAllowedAttemptMs && (now < nextAllowedAttemptMs)) {
+    unsigned long retryMs = nextAllowedAttemptMs - now;
+    char retryHdr[16];
+    snprintf(retryHdr, sizeof(retryHdr), "%lu", (retryMs + 999UL) / 1000UL);
+    ctx.addRespHdr("Retry-After", String(retryHdr));
+    ctx.send(429, "text/plain", "Too many login attempts. Try again later.\n");
+    return;
+  }
+  bool ok = ctx.arg("username").equals(SECRET_OTA_USER) &&
+            ctx.arg("password").equals(SECRET_OTA_PASS);
+  if (!ok) {
+    authFailCount++;
+    LOG("[AUTH] TLS login fail #%d\n", (int)authFailCount);
+    if (authFailCount >= AUTH_HARD_LOCK_THRESHOLD) {
+      authHardLocked    = true;
+      hardLockSinceMs   = millis();
+      LOG("[AUTH] Hard lock engaged (TLS) after %d failures\n", (int)authFailCount);
+    } else if (authFailCount > AUTH_GRACE) {
+      uint32_t delay_ms = (1UL << min((int)(authFailCount - AUTH_GRACE), 10)) * 1000UL;
+      nextAllowedAttemptMs = millis() + delay_ms;
+    }
+    ctx.addRespHdr("Location", "/login?err=1");
+    ctx.send(303, "text/plain", "");
+    return;
+  }
+  loginSuccessCtx(ctx);
+}
+
+// POST /logout (HTTPS)
+static void httpsHandleLogout(HttpCtx& ctx) {
+  sessionForgetStr(ctx.header("Cookie"));
+  ctx.addRespHdr("Set-Cookie", "scs=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0");
+  ctx.send(200, "text/html",
+    "<!DOCTYPE html><html><head><title>Logged out</title>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<style>"
+    "body{font-family:sans-serif;background:#0a0a1a;color:#ccc;"
+    "display:flex;flex-direction:column;align-items:center;"
+    "justify-content:center;min-height:100vh;margin:0;text-align:center}"
+    "h2{color:#e94560;margin-bottom:8px}"
+    "p{color:#aaa;margin:4px 0}"
+    "a{display:inline-block;margin-top:24px;padding:10px 28px;"
+    "background:#e94560;color:#fff;border-radius:6px;text-decoration:none;"
+    "font-weight:bold}"
+    "a:hover{background:#c73652}"
+    "</style></head><body>"
+    "<h2>&#128274; Logged out</h2>"
+    "<p>Your session has been cleared.</p>"
+    "<a href='/login'>Log in again &rarr;</a>"
+    "</body></html>");
+}
+
+// GET /api/status (HTTPS) — identical logic to WebServer version but writes to ctx.
+// Forward-declare the function that builds the JSON so we can call it from both paths.
+static String buildApiStatusJson();  // defined near handleApiStatus
+
+static void httpsHandleApiStatus(HttpCtx& ctx) {
+  if (!requireAuthCtx(ctx, true)) return;
+  String json = buildApiStatusJson();
+  ctx.send(200, "application/json", json);
+}
+
+// GET /api/settings (HTTPS) — forward-declare builder.
+static String buildApiSettingsJson();
+
+static void httpsHandleApiSettingsGet(HttpCtx& ctx) {
+  if (!requireAuthCtx(ctx, true)) return;
+  String json = buildApiSettingsJson();
+  ctx.send(200, "application/json", json);
+}
+
+// POST /api/settings (HTTPS) — reuse the logic factored out of handleApiSettingsPost.
+static String applyApiSettingsBody(const String& body);  // returns JSON ack
+
+static void httpsHandleApiSettingsPost(HttpCtx& ctx) {
+  if (!requireAuthCtx(ctx, true)) return;
+  if (ctx.body.length() == 0) {
+    ctx.send(400, "application/json", "{\"ok\":false,\"error\":\"No body\"}");
+    return;
+  }
+  String result = applyApiSettingsBody(ctx.body);
+  // Determine HTTP status from result JSON
+  int code = (result.indexOf("\"ok\":true") >= 0) ? 200 : 400;
+  if (result.indexOf("\"error\":\"Payload too large\"") >= 0) code = 413;
+  ctx.send(code, "application/json", result);
+  if (settingsNeedRestart) {
+    LOG("[SETTINGS] Restarting for WiFi changes (TLS path)...\n");
+    delay(1500);
+    ESP.restart();
+  }
+}
+
+// POST /api/control (HTTPS) — forward-declare applier.
+static String applyApiControlBody(const String& body);
+
+static void httpsHandleApiControl(HttpCtx& ctx) {
+  if (!requireAuthCtx(ctx, true)) return;
+  if (ctx.body.length() == 0) {
+    ctx.send(400, "application/json", "{\"ok\":false,\"error\":\"No body\"}");
+    return;
+  }
+  String result = applyApiControlBody(ctx.body);
+  int code = (result.indexOf("\"ok\":true") >= 0) ? 200 : 400;
+  ctx.send(code, "application/json", result);
+}
+
+// POST /api/tls (HTTPS and HTTP) — cert/key upload.
+// Body JSON: {"cert":"<PEM>","key":"<PEM>"} (both required) or {"enabled":bool}.
+static void handleApiTlsPost(HttpCtx& ctx) {
+  // Authentication
+  if (ctx.isWS) { if (!requireAuth(true)) return; }
+  else          { if (!requireAuthCtx(ctx, true)) return; }
+
+  String body = ctx.isWS ? server.arg("plain") : ctx.body;
+  if (body.length() > 8192) {
+    if (ctx.isWS) server.send(413, "application/json", "{\"ok\":false,\"error\":\"Payload too large\"}");
+    else ctx.send(413, "application/json", "{\"ok\":false,\"error\":\"Payload too large\"}");
+    return;
+  }
+  DynamicJsonDocument doc(body.length() + 512);
+  if (deserializeJson(doc, body)) {
+    if (ctx.isWS) server.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid JSON\"}");
+    else ctx.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid JSON\"}");
+    return;
+  }
+
+  bool changed = false;
+  if (doc.containsKey("cert") && doc.containsKey("key")) {
+    const char* cert = doc["cert"] | "";
+    const char* key  = doc["key"]  | "";
+    if (strlen(cert) < 64 || strstr(cert, "-----BEGIN CERTIFICATE-----") == nullptr) {
+      if (ctx.isWS) server.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid cert PEM\"}");
+      else ctx.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid cert PEM\"}");
+      return;
+    }
+    preferences.putString("tls_cert", cert);
+    preferences.putString("tls_key",  key);
+    changed = true;
+    LOG("[TLS] Cert+key stored in NVS (%u / %u bytes)\n",
+        (unsigned)strlen(cert), (unsigned)strlen(key));
+  }
+  if (doc.containsKey("enabled")) {
+    bool en = doc["enabled"] | false;
+    httpsEnabled = en;
+    preferences.putBool("https_en", en);
+    changed = true;
+    LOG("[TLS] HTTPS %s\n", en ? "enabled" : "disabled");
+  }
+  if (!changed) {
+    if (ctx.isWS) server.send(400, "application/json", "{\"ok\":false,\"error\":\"No recognized fields\"}");
+    else ctx.send(400, "application/json", "{\"ok\":false,\"error\":\"No recognized fields\"}");
+    return;
+  }
+  if (ctx.isWS) server.send(200, "application/json", "{\"ok\":true}");
+  else ctx.send(200, "application/json", "{\"ok\":true}");
+}
+
+// Wrapper for WebServer route registration
+static void handleApiTlsPostWS() {
+  HttpCtx ctx; ctx.isWS = true;
+  handleApiTlsPost(ctx);
+}
+
+// ---------------------------------------------------------------------------
+// IDF URI handler wrappers — one per HTTPS route.
+//
+// Each builds an HttpCtx from the IDF request (parses query string + form
+// body into ctx.args[]), calls the existing httpsHandle*() function, and
+// returns ESP_OK. The handlers themselves are unchanged from the legacy
+// path: they read ctx.arg() / ctx.header() and emit via ctx.send() /
+// ctx.sendProgmem(), which dispatch on ctx.isIDF inside HttpCtx.
+// ---------------------------------------------------------------------------
+
+static esp_err_t idf_root_get(httpd_req_t* req) {
+  HttpCtx ctx; initFromIDFReq(req, ctx);
+  httpsHandleRoot(ctx);
+  return ESP_OK;
+}
+static esp_err_t idf_settings_get(httpd_req_t* req) {
+  HttpCtx ctx; initFromIDFReq(req, ctx);
+  httpsHandleSettingsPage(ctx);
+  return ESP_OK;
+}
+static esp_err_t idf_login_get(httpd_req_t* req) {
+  HttpCtx ctx; initFromIDFReq(req, ctx);
+  httpsHandleLoginGet(ctx);
+  return ESP_OK;
+}
+static esp_err_t idf_login_post(httpd_req_t* req) {
+  HttpCtx ctx; initFromIDFReq(req, ctx);
+  httpsHandleLoginPost(ctx);
+  return ESP_OK;
+}
+static esp_err_t idf_logout_post(httpd_req_t* req) {
+  HttpCtx ctx; initFromIDFReq(req, ctx);
+  httpsHandleLogout(ctx);
+  return ESP_OK;
+}
+static esp_err_t idf_api_status_get(httpd_req_t* req) {
+  HttpCtx ctx; initFromIDFReq(req, ctx);
+  httpsHandleApiStatus(ctx);
+  return ESP_OK;
+}
+static esp_err_t idf_api_settings_get(httpd_req_t* req) {
+  HttpCtx ctx; initFromIDFReq(req, ctx);
+  httpsHandleApiSettingsGet(ctx);
+  return ESP_OK;
+}
+static esp_err_t idf_api_settings_post(httpd_req_t* req) {
+  HttpCtx ctx; initFromIDFReq(req, ctx);
+  httpsHandleApiSettingsPost(ctx);
+  return ESP_OK;
+}
+static esp_err_t idf_api_control_post(httpd_req_t* req) {
+  HttpCtx ctx; initFromIDFReq(req, ctx);
+  httpsHandleApiControl(ctx);
+  return ESP_OK;
+}
+static esp_err_t idf_api_tls_post(httpd_req_t* req) {
+  HttpCtx ctx; initFromIDFReq(req, ctx);
+  handleApiTlsPost(ctx);
+  return ESP_OK;
+}
+
+// ---------------------------------------------------------------------------
+// startHTTPSServer / stopHTTPSServer
+//
+// Cert and key strings must outlive httpd_ssl_start; static String storage
+// here keeps the c_str() pointers valid for the server's lifetime. Stack
+// size is raised to 10 KB (default 4 KB is too small for TLS + ArduinoJson).
+// ---------------------------------------------------------------------------
+
+static bool startHTTPSServer(const String& cert, const String& key) {
+  if (g_httpsServer) return true;  // already running
+
+  static String s_cert, s_key;
+  s_cert = cert;
+  s_key  = key;
+
+  httpd_ssl_config_t cfg = HTTPD_SSL_CONFIG_DEFAULT();
+  cfg.cacert_pem             = (const uint8_t*)s_cert.c_str();
+  cfg.cacert_len             = s_cert.length() + 1;
+  cfg.prvtkey_pem            = (const uint8_t*)s_key.c_str();
+  cfg.prvtkey_len            = s_key.length() + 1;
+  cfg.port_secure            = 443;
+  cfg.httpd.stack_size       = 10240;
+  cfg.httpd.max_uri_handlers = 12;
+
+  esp_err_t err = httpd_ssl_start(&g_httpsServer, &cfg);
+  if (err != ESP_OK) {
+    g_httpsServer = nullptr;
+    LOG("[TLS] httpd_ssl_start failed (%d) — falling back to HTTP\n", (int)err);
+    return false;
+  }
+
+  // Helper avoids C++ aggregate-init pitfalls if httpd_uri_t gains fields.
+  auto reg = [&](const char* uri, httpd_method_t method,
+                 esp_err_t (*handler)(httpd_req_t*)) {
+    httpd_uri_t u = {};
+    u.uri      = uri;
+    u.method   = method;
+    u.handler  = handler;
+    u.user_ctx = nullptr;
+    httpd_register_uri_handler(g_httpsServer, &u);
+  };
+  reg("/",              HTTP_GET,  idf_root_get);
+  reg("/settings",      HTTP_GET,  idf_settings_get);
+  reg("/login",         HTTP_GET,  idf_login_get);
+  reg("/login",         HTTP_POST, idf_login_post);
+  reg("/logout",        HTTP_POST, idf_logout_post);
+  reg("/api/status",    HTTP_GET,  idf_api_status_get);
+  reg("/api/settings",  HTTP_GET,  idf_api_settings_get);
+  reg("/api/settings",  HTTP_POST, idf_api_settings_post);
+  reg("/api/control",   HTTP_POST, idf_api_control_post);
+  reg("/api/tls",       HTTP_POST, idf_api_tls_post);
+
+  LOG("[TLS] HTTPS server started on port 443 (cert %u bytes)\n",
+      (unsigned)s_cert.length());
+  return true;
+}
+
+static void stopHTTPSServer() {
+  if (!g_httpsServer) return;
+  httpd_ssl_stop(g_httpsServer);
+  g_httpsServer = nullptr;
+  LOG("[TLS] HTTPS server stopped\n");
+}
+
+// Port-80 redirect handler — installed as onNotFound when httpsEnabled.
+// Redirects every HTTP request to the same path on HTTPS.
+static void handleHTTPSRedirect() {
+  String host = server.hostHeader();
+  // Strip port number from host if present
+  int col = host.lastIndexOf(':');
+  if (col > 0) host = host.substring(0, col);
+  String url = "https://" + host + server.uri();
+  if (server.args() > 0) {
+    // Reconstruct query string
+    url += "?";
+    for (int i = 0; i < server.args(); i++) {
+      if (i) url += "&";
+      url += server.argName(i) + "=" + server.arg(i);
+    }
+  }
+  server.sendHeader("Location", url);
+  server.send(301, "text/plain", "");
+}
+
+// Build the /api/settings JSON string. Called by both HTTP and HTTPS handlers.
+static String buildApiSettingsJson() {
   String ssid = preferences.getString("ssid", "");
   String aps  = preferences.getString("ap_ssid", String(apSSID));
   String mh   = String(mqttHost);
@@ -2154,7 +2772,6 @@ void handleApiSettingsGet() {
   bool hasApPass = (strlen(apPass) > 0 ||
                     preferences.getString("ap_pass", "").length() > 0);
 
-  // Escape strings for safe JSON embedding (handles " and \ characters)
   auto jsonEscape = [](const String& in) -> String {
     String out;
     out.reserve(in.length() + 8);
@@ -2171,20 +2788,20 @@ void handleApiSettingsGet() {
   String jMh   = jsonEscape(mh);
   String jMu   = jsonEscape(mu);
 
-  // mqtt_ca: never return the cert blob itself (it can be 1-2 KB and the
-  // dashboard doesn't need it back). Just report whether one is stored and
-  // its size, so the UI can label the textarea "Certificate stored (NNN bytes)".
   bool   caSet   = mqttCaCert.length() > 0;
   size_t caBytes = mqttCaCert.length();
+  // TLS cert presence (for HTTPS section in settings UI)
+  bool   tlsCertSet = preferences.getString("tls_cert", "").length() > 0;
 
-  char buf[820];
+  char buf[920];
   snprintf(buf, sizeof(buf),
     "{\"ap_mode\":%s,\"wifi_ssid\":\"%s\",\"ap_ssid\":\"%s\",\"ap_pass_set\":%s,"
     "\"mqtt_host\":\"%s\",\"mqtt_port\":%d,\"mqtt_user\":\"%s\","
     "\"mqtt_tls\":%s,\"mqtt_ca_set\":%s,\"mqtt_ca_bytes\":%u,"
     "\"charger_count\":%d,\"ramp_rate_wps\":%d,"
     "\"charging_enabled_default\":%s,\"power_preset_default\":%d,\"target_volt_default\":%d,"
-    "\"home_charging_enabled_default\":%s,\"home_power_preset_default\":%d,\"home_target_volt_default\":%d}",
+    "\"home_charging_enabled_default\":%s,\"home_power_preset_default\":%d,\"home_target_volt_default\":%d,"
+    "\"https_enabled\":%s,\"https_cert_set\":%s}",
     apIsBroadcasting() ? "true" : "false",
     jSsid.c_str(), jAps.c_str(), hasApPass ? "true" : "false",
     jMh.c_str(), (int)mqttPort, jMu.c_str(),
@@ -2195,44 +2812,35 @@ void handleApiSettingsGet() {
     (int)ctrl.defaultTargetVoltDv,
     ctrl.homeDefaultEnabled ? "true" : "false",
     (int)ctrl.homeDefaultPowerPresetIdx,
-    (int)ctrl.homeDefaultTargetVoltDv
+    (int)ctrl.homeDefaultTargetVoltDv,
+    httpsEnabled ? "true" : "false",
+    tlsCertSet   ? "true" : "false"
   );
-  server.send(200, "application/json", buf);
+  return String(buf);
 }
 
-// POST /api/settings — saves settings to NVS (protected).
-// Body parsed via ArduinoJson (replaces a hand-rolled indexOf-based parser
-// that could match keys inside string values and silently truncate strings
-// larger than the destination buffer). All length-constrained string fields
-// now reject oversized input with a 400 instead of being silently clipped.
-void handleApiSettingsPost() {
+// GET /api/settings — returns current settings as JSON (protected)
+void handleApiSettingsGet() {
   if (!requireAuth(true)) return;   // API route
-  if (!server.hasArg("plain")) {
-    server.send(400, "application/json", "{\"ok\":false,\"error\":\"No body\"}");
-    return;
-  }
-  String body = server.arg("plain");
+  server.send(200, "application/json", buildApiSettingsJson());
+}
 
-  // Dynamic doc — sized to the body — because the optional mqtt_ca blob can
-  // be a 2 KB PEM cert, which would overflow a fixed StaticJsonDocument.
-  // Without the cert the body is a few hundred bytes and the heap cost is
-  // trivial. Cap at 8 KB so a malicious oversized POST can't OOM the device.
-  if (body.length() > 8192) {
-    server.send(413, "application/json", "{\"ok\":false,\"error\":\"Payload too large\"}");
-    return;
-  }
+// Apply a /api/settings JSON body. Returns a JSON ack string.
+// Sets settingsNeedRestart=true if the caller should restart after responding.
+static String applyApiSettingsBody(const String& body) {
+  settingsNeedRestart = false;
+
+  if (body.length() > 8192)
+    return "{\"ok\":false,\"error\":\"Payload too large\"}";
+
   DynamicJsonDocument doc(body.length() + 1024);
-  if (deserializeJson(doc, body)) {
-    server.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid JSON\"}");
-    return;
-  }
+  if (deserializeJson(doc, body))
+    return "{\"ok\":false,\"error\":\"Invalid JSON\"}";
 
-  // Helper: copy a JSON string into a fixed-size NUL-terminated buffer.
-  // Returns false (and sends a 400) if the source is longer than `maxLen-1`,
-  // so an over-long value is reported back to the caller instead of silently
-  // truncated. Caller checks the return and bails out on false.
-  auto copyChecked = [&](const char* src, char* dst, size_t maxLen,
-                         const char* fieldLabel) -> bool {
+  // Helper: validate length and copy string to fixed buffer.
+  // Returns empty string on success; returns an error JSON string on failure.
+  auto copyChecked = [](const char* src, char* dst, size_t maxLen,
+                        const char* fieldLabel) -> String {
     if (!src) src = "";
     size_t l = strlen(src);
     if (l >= maxLen) {
@@ -2240,33 +2848,30 @@ void handleApiSettingsPost() {
       snprintf(err, sizeof(err),
                "{\"ok\":false,\"error\":\"%s too long (max %u chars)\"}",
                fieldLabel, (unsigned)(maxLen - 1));
-      server.send(400, "application/json", err);
-      return false;
+      return String(err);
     }
     strncpy(dst, src, maxLen - 1);
     dst[maxLen - 1] = '\0';
-    return true;
+    return String();
   };
 
-  bool needRestart = false;
+  String err;
 
-  // WiFi credentials. Present-but-empty SSID is an error; absent SSID just
-  // means "leave WiFi config alone".
+  // WiFi credentials.
   if (doc.containsKey("wifi_ssid")) {
     const char* ssid = doc["wifi_ssid"] | "";
-    if (strlen(ssid) == 0) {
-      server.send(400, "application/json", "{\"ok\":false,\"error\":\"SSID empty\"}");
-      return;
-    }
+    if (strlen(ssid) == 0) return "{\"ok\":false,\"error\":\"SSID empty\"}";
     char tmp[65];
-    if (!copyChecked(ssid, tmp, sizeof(tmp), "wifi_ssid")) return;
+    err = copyChecked(ssid, tmp, sizeof(tmp), "wifi_ssid");
+    if (err.length()) return err;
     preferences.putString("ssid", tmp);
     const char* pass = doc["wifi_pass"] | "";
     char tmpPass[65];
-    if (!copyChecked(pass, tmpPass, sizeof(tmpPass), "wifi_pass")) return;
+    err = copyChecked(pass, tmpPass, sizeof(tmpPass), "wifi_pass");
+    if (err.length()) return err;
     preferences.putString("pass", tmpPass);
     LOG("[SETTINGS] WiFi credentials saved\n");
-    needRestart = true;
+    settingsNeedRestart = true;
   }
 
   // AP credentials.
@@ -2274,7 +2879,8 @@ void handleApiSettingsPost() {
     const char* aps = doc["ap_ssid"] | "";
     if (strlen(aps) > 0) {
       char tmp[sizeof(apSSID)];
-      if (!copyChecked(aps, tmp, sizeof(tmp), "ap_ssid")) return;
+      err = copyChecked(aps, tmp, sizeof(tmp), "ap_ssid");
+      if (err.length()) return err;
       preferences.putString("ap_ssid", tmp);
       strncpy(apSSID, tmp, sizeof(apSSID) - 1);
       apSSID[sizeof(apSSID) - 1] = '\0';
@@ -2282,13 +2888,11 @@ void handleApiSettingsPost() {
     if (doc.containsKey("ap_pass")) {
       const char* app = doc["ap_pass"] | "";
       size_t apl = strlen(app);
-      if (apl > 0 && apl < 8) {
-        server.send(400, "application/json",
-                    "{\"ok\":false,\"error\":\"AP password must be 8+ chars\"}");
-        return;
-      }
+      if (apl > 0 && apl < 8)
+        return "{\"ok\":false,\"error\":\"AP password must be 8+ chars\"}";
       char tmpPass[sizeof(apPass)];
-      if (!copyChecked(app, tmpPass, sizeof(tmpPass), "ap_pass")) return;
+      err = copyChecked(app, tmpPass, sizeof(tmpPass), "ap_pass");
+      if (err.length()) return err;
       preferences.putString("ap_pass", tmpPass);
       strncpy(apPass, tmpPass, sizeof(apPass) - 1);
       apPass[sizeof(apPass) - 1] = '\0';
@@ -2300,7 +2904,8 @@ void handleApiSettingsPost() {
   if (doc.containsKey("mqtt_host")) {
     const char* mh = doc["mqtt_host"] | "";
     char tmp[sizeof(mqttHost)];
-    if (!copyChecked(mh, tmp, sizeof(tmp), "mqtt_host")) return;
+    err = copyChecked(mh, tmp, sizeof(tmp), "mqtt_host");
+    if (err.length()) return err;
     preferences.putString("mqtt_host", tmp);
     strncpy(mqttHost, tmp, sizeof(mqttHost) - 1);
     mqttHost[sizeof(mqttHost) - 1] = '\0';
@@ -2310,11 +2915,11 @@ void handleApiSettingsPost() {
       preferences.putUShort("mqtt_port", (uint16_t)port);
       mqttPort = (uint16_t)port;
     }
-
     if (doc.containsKey("mqtt_user")) {
       const char* mu = doc["mqtt_user"] | "";
       char tmpUser[sizeof(mqttUser)];
-      if (!copyChecked(mu, tmpUser, sizeof(tmpUser), "mqtt_user")) return;
+      err = copyChecked(mu, tmpUser, sizeof(tmpUser), "mqtt_user");
+      if (err.length()) return err;
       preferences.putString("mqtt_user", tmpUser);
       strncpy(mqttUser, tmpUser, sizeof(mqttUser) - 1);
       mqttUser[sizeof(mqttUser) - 1] = '\0';
@@ -2322,44 +2927,31 @@ void handleApiSettingsPost() {
     if (doc.containsKey("mqtt_pass")) {
       const char* mp = doc["mqtt_pass"] | "";
       char tmpPass[sizeof(mqttBrokerPass)];
-      if (!copyChecked(mp, tmpPass, sizeof(tmpPass), "mqtt_pass")) return;
+      err = copyChecked(mp, tmpPass, sizeof(tmpPass), "mqtt_pass");
+      if (err.length()) return err;
       preferences.putString("mqtt_pass", tmpPass);
       strncpy(mqttBrokerPass, tmpPass, sizeof(mqttBrokerPass) - 1);
       mqttBrokerPass[sizeof(mqttBrokerPass) - 1] = '\0';
     }
     LOG("[SETTINGS] MQTT settings saved: %s:%d\n", mqttHost, mqttPort);
-    // Force MQTT reconnect with new settings
     mqttClient.disconnect();
   }
 
-  // MQTT TLS toggle + CA cert blob. Both can be sent together with the
-  // mqtt_host block above or independently. The cert is validated server-side
-  // by checking for the PEM markers; if invalid we reject the whole request
-  // rather than silently dropping the field. Enabling TLS with no cert
-  // currently stored (and none in this request) is also rejected — that
-  // would leave the device in a state where it logs "refusing to connect"
-  // forever, which is confusing UX.
+  // MQTT TLS toggle + CA cert.
   bool mqttSettingsTouched = doc.containsKey("mqtt_tls") || doc.containsKey("mqtt_ca");
   if (doc.containsKey("mqtt_ca")) {
     const char* ca = doc["mqtt_ca"] | "";
     size_t calen = strlen(ca);
     if (calen == 0) {
-      // Empty string explicitly clears the stored cert.
       mqttCaCert = "";
       preferences.remove("mqtt_ca");
       LOG("[SETTINGS] MQTT CA cert cleared\n");
     } else {
-      if (calen > 4096) {
-        server.send(400, "application/json",
-                    "{\"ok\":false,\"error\":\"CA cert too large (max 4 KB)\"}");
-        return;
-      }
+      if (calen > 4096)
+        return "{\"ok\":false,\"error\":\"CA cert too large (max 4 KB)\"}";
       if (!strstr(ca, "-----BEGIN CERTIFICATE-----") ||
-          !strstr(ca, "-----END CERTIFICATE-----")) {
-        server.send(400, "application/json",
-                    "{\"ok\":false,\"error\":\"CA cert must be PEM (BEGIN/END markers required)\"}");
-        return;
-      }
+          !strstr(ca, "-----END CERTIFICATE-----"))
+        return "{\"ok\":false,\"error\":\"CA cert must be PEM (BEGIN/END markers required)\"}";
       mqttCaCert = ca;
       preferences.putString("mqtt_ca", mqttCaCert);
       LOG("[SETTINGS] MQTT CA cert saved (%u bytes)\n", (unsigned)calen);
@@ -2367,19 +2959,13 @@ void handleApiSettingsPost() {
   }
   if (doc.containsKey("mqtt_tls")) {
     bool tls = doc["mqtt_tls"] | false;
-    if (tls && mqttCaCert.length() == 0) {
-      server.send(400, "application/json",
-                  "{\"ok\":false,\"error\":\"Cannot enable TLS without a CA cert. Upload one first.\"}");
-      return;
-    }
+    if (tls && mqttCaCert.length() == 0)
+      return "{\"ok\":false,\"error\":\"Cannot enable TLS without a CA cert. Upload one first.\"}";
     mqttTls = tls;
     preferences.putBool("mqtt_tls", tls);
     LOG("[SETTINGS] MQTT TLS: %s\n", tls ? "ON" : "off");
   }
-  if (mqttSettingsTouched) {
-    // Force the next mqttTask iteration to reconnect with the new transport.
-    mqttClient.disconnect();
-  }
+  if (mqttSettingsTouched) mqttClient.disconnect();
 
   // Charger count.
   if (doc.containsKey("charger_count")) {
@@ -2394,15 +2980,13 @@ void handleApiSettingsPost() {
     }
   }
 
-  // Boot default — charging enabled state.
+  // Boot defaults.
   if (doc.containsKey("charging_enabled_default")) {
     bool ce = doc["charging_enabled_default"] | false;
     ctrl.defaultEnabled = ce;
     preferences.putBool("def_chg_en", ce);
     LOG("[SETTINGS] Boot charging default: %s\n", ce ? "ON" : "OFF");
   }
-
-  // Boot default — power preset column index (0–4 in POWER_PRESETS).
   if (doc.containsKey("power_preset_default")) {
     int pi = doc["power_preset_default"] | -1;
     if (pi >= 0 && pi < MAX_PRESETS_PER_ROW) {
@@ -2411,8 +2995,6 @@ void handleApiSettingsPost() {
       LOG("[SETTINGS] Boot power preset index: %d\n", pi);
     }
   }
-
-  // Boot default — target voltage (dV); must be a valid preset or within range.
   if (doc.containsKey("target_volt_default")) {
     int tvd = doc["target_volt_default"] | -1;
     if (tvd >= (int)TARGET_VOLT_PRESETS[0].dv && tvd <= (int)MAX_CHARGE_VOLTAGE_DV) {
@@ -2422,7 +3004,7 @@ void handleApiSettingsPost() {
     }
   }
 
-  // Home WiFi boot defaults — same three settings, different NVS keys.
+  // Home WiFi boot defaults.
   if (doc.containsKey("home_charging_enabled_default")) {
     bool ce = doc["home_charging_enabled_default"] | false;
     ctrl.homeDefaultEnabled = ce;
@@ -2446,9 +3028,26 @@ void handleApiSettingsPost() {
     }
   }
 
-  server.send(200, "application/json", "{\"ok\":true}");
+  return "{\"ok\":true}";
+}
 
-  if (needRestart) {
+// POST /api/settings — saves settings to NVS (protected).
+// Body parsed via ArduinoJson (replaces a hand-rolled indexOf-based parser
+// that could match keys inside string values and silently truncate strings
+// larger than the destination buffer). All length-constrained string fields
+// now reject oversized input with a 400 instead of being silently clipped.
+void handleApiSettingsPost() {
+  if (!requireAuth(true)) return;   // API route
+  if (!server.hasArg("plain")) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"No body\"}");
+    return;
+  }
+  String result = applyApiSettingsBody(server.arg("plain"));
+  int code = 200;
+  if (result.indexOf("\"ok\":false") >= 0)
+    code = (result.indexOf("Payload too large") >= 0) ? 413 : 400;
+  server.send(code, "application/json", result);
+  if (settingsNeedRestart) {
     LOG("[SETTINGS] Restarting for WiFi changes...\n");
     delay(1500);
     ESP.restart();
@@ -2484,8 +3083,8 @@ void handleSave() {
 // Auth-gated: pack voltage, SoC and energy figures shouldn't be readable
 // by any device on the LAN. The browser caches the Basic Auth header from
 // the dashboard load and re-uses it on every poll without re-prompting.
-void handleApiStatus() {
-  if (!requireAuth(true)) return;   // API route — JS-side handles 401 redirect
+// Build the /api/status JSON string. Called by both HTTP and HTTPS handlers.
+static String buildApiStatusJson() {
   // Snapshot both data structs under their respective mutexes
   LiveData      liveSnap;
   ChargerBusData chargerSnap;
@@ -2639,9 +3238,13 @@ void handleApiStatus() {
     first = false;
   }
   response += "]}";
+  return response;
+}
 
+void handleApiStatus() {
+  if (!requireAuth(true)) return;   // API route — JS-side handles 401 redirect
   server.sendHeader("Cache-Control", "no-store");
-  server.send(200, "application/json", response);
+  server.send(200, "application/json", buildApiStatusJson());
 }
 
 // POST /api/control — sets target power, enabled state, charger count,
@@ -2652,19 +3255,11 @@ void handleApiStatus() {
 // match keys appearing inside string values elsewhere in the payload).
 // Only fields actually present in the body are applied; missing fields are
 // left unchanged.
-void handleApiControl() {
-  if (!requireAuth(true)) return;   // API route
-  if (!server.hasArg("plain")) {
-    server.send(400, "text/plain", "No body");
-    return;
-  }
-  String body = server.arg("plain");
-
+// Apply a /api/control JSON body string. Returns JSON ack.
+static String applyApiControlBody(const String& body) {
   StaticJsonDocument<256> doc;
-  if (deserializeJson(doc, body)) {
-    server.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid JSON\"}");
-    return;
-  }
+  if (deserializeJson(doc, body))
+    return "{\"ok\":false,\"error\":\"Invalid JSON\"}";
 
   bool hasEn   = doc.containsKey("enabled");
   bool en      = doc["enabled"]        | false;
@@ -2678,7 +3273,7 @@ void handleApiControl() {
     if (tw >= 0) ctrl.targetPowerW = (uint16_t)constrain(tw, 0, 13200);
     if (hasEn) {
       ctrl.enabled = en;
-      if (!en) ctrl.currentPowerW = 0; // immediate stop on disable
+      if (!en) ctrl.currentPowerW = 0;
     }
     if (cc >= 1 && cc <= 4) {
       ctrl.chargerCount = (uint8_t)cc;
@@ -2694,18 +3289,27 @@ void handleApiControl() {
     }
     xSemaphoreGive(controlMutex);
   }
-
   if (resetSession) {
     sessionReset();
     LOG("[CTRL] Session reset\n");
   }
-
   LOG("[CTRL] target=%dW enabled=%s chargers=%d ramp=%dW/s tgtV=%ddV\n",
       tw, hasEn ? (en ? "true" : "false") : "(unchanged)",
       cc > 0 ? cc : (int)ctrl.chargerCount,
       rr > 0 ? rr : (int)ctrl.rampStepW,
       tvd > 0 ? tvd : (int)ctrl.targetVoltDv);
-  server.send(200, "application/json", "{\"ok\":true}");
+  return "{\"ok\":true}";
+}
+
+void handleApiControl() {
+  if (!requireAuth(true)) return;   // API route
+  if (!server.hasArg("plain")) {
+    server.send(400, "text/plain", "No body");
+    return;
+  }
+  String result = applyApiControlBody(server.arg("plain"));
+  int code = (result.indexOf("\"ok\":true") >= 0) ? 200 : 400;
+  server.send(code, "application/json", result);
 }
 
 // ---------------------------------------------------------------------------
@@ -2850,6 +3454,11 @@ void handleOTAUpload() {
       otaUploadFailed = true;
       return;
     }
+    // Defensively clear any stale Update state from a prior interrupted upload
+    // (browser disconnect, network drop). Without this, the new ESP32 core's
+    // Update.begin() returns false with errorString()=="No Error" because its
+    // internal _size is still non-zero from the prior attempt.
+    Update.abort();
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
       LOG("[OTA] begin() error: %s\n", Update.errorString());
       otaUploadFailed = true;
@@ -3271,28 +3880,52 @@ void setup() {
     currentState = STATE_SETUP_MODE;
   }
 
-  server.on("/",                HTTP_GET,  handleRoot);
-  server.on("/login",           HTTP_GET,  handleLogin);   // Digest entry point
-  server.on("/logout",          HTTP_POST, handleLogout);  // POST so prefetchers can't trigger it
-  server.on("/save",            HTTP_POST, handleSave);
-  server.on("/settings",        HTTP_GET,  handleSettingsPage);
-  server.on("/api/settings",    HTTP_GET,  handleApiSettingsGet);
-  server.on("/api/settings",    HTTP_POST, handleApiSettingsPost);
-  server.on("/api/status",      HTTP_GET,  handleApiStatus);
-  server.on("/api/control",     HTTP_POST, handleApiControl);
-  server.on("/api/log/stream",  HTTP_GET,  handleLogStream);
-  server.on("/log",             HTTP_GET,  handleLogPage);
-  server.on("/update",          HTTP_GET,  handleOTAGet);
-  server.on("/update",          HTTP_POST, handleOTAPost, handleOTAUpload);
+  // Load HTTPS / TLS config from NVS and start the IDF httpd_ssl server.
+  httpsEnabled = preferences.getBool("https_en", false);
+  if (httpsEnabled) {
+    String cert = preferences.getString("tls_cert", "");
+    String key  = preferences.getString("tls_key",  "");
+    if (cert.length() > 0 && key.length() > 0) {
+      if (!startHTTPSServer(cert, key)) {
+        httpsEnabled = false;  // start failed — fall back to HTTP only
+      }
+    } else {
+      httpsEnabled = false;
+      LOG("[TLS] HTTPS enabled but no cert/key in NVS — falling back to HTTP\n");
+    }
+  }
+
+  // When HTTPS is active: port 80 only serves redirect; all real routes live
+  // on port 443 (served by the httpd_ssl FreeRTOS task).
+  // When HTTPS is inactive: register all routes on port 80 as normal.
+  if (httpsEnabled) {
+    server.onNotFound(handleHTTPSRedirect);
+    // Also allow /api/tls on HTTP so the user can disable HTTPS if they mess up
+    server.on("/api/tls", HTTP_POST, handleApiTlsPostWS);
+  } else {
+    server.on("/",                HTTP_GET,  handleRoot);
+    server.on("/login",           HTTP_GET,  handleLoginGet);   // serve the login form
+    server.on("/login",           HTTP_POST, handleLoginPost);  // validate credentials
+    server.on("/logout",          HTTP_POST, handleLogout);     // POST so prefetchers can't trigger it
+    server.on("/save",            HTTP_POST, handleSave);
+    server.on("/settings",        HTTP_GET,  handleSettingsPage);
+    server.on("/api/settings",    HTTP_GET,  handleApiSettingsGet);
+    server.on("/api/settings",    HTTP_POST, handleApiSettingsPost);
+    server.on("/api/status",      HTTP_GET,  handleApiStatus);
+    server.on("/api/control",     HTTP_POST, handleApiControl);
+    server.on("/api/log/stream",  HTTP_GET,  handleLogStream);
+    server.on("/log",             HTTP_GET,  handleLogPage);
+    server.on("/update",          HTTP_GET,  handleOTAGet);
+    server.on("/update",          HTTP_POST, handleOTAPost, handleOTAUpload);
+    server.on("/api/tls",         HTTP_POST, handleApiTlsPostWS);
+  }
 
   // Tell WebServer to keep these request headers — by default it discards
   // anything not on this list, so server.header()/hasHeader() return empty.
-  //   - Authorization : needed by server.authenticate() (Digest nonce+cnonce)
-  //                     on the /login route only.
-  //   - Cookie        : needed by sessionTouchOrFail() on every protected
-  //                     route to look up the current scs= session token.
-  static const char* collectedHeaders[] = { "Authorization", "Cookie" };
-  server.collectHeaders(collectedHeaders, 2);
+  //   - Cookie : needed by sessionTouchOrFail() on every protected route
+  //              to look up the current scs= session token.
+  static const char* collectedHeaders[] = { "Cookie" };
+  server.collectHeaders(collectedHeaders, 1);
 
   server.begin();
 
@@ -3325,6 +3958,7 @@ void loop() {
   }
 
   server.handleClient();
+  // HTTPS (port 443) runs in its own httpd_ssl FreeRTOS task — no polling here.
   sseFlush();
   handleCANBusTask();
   checkBootButton();

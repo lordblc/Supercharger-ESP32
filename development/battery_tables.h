@@ -78,7 +78,8 @@ const cutback_entry VOLTAGE_CUTBACK[] = {
   { .threshold = 1153, .c_rate_thousandths = 50 },
   { .threshold = 1156, .c_rate_thousandths = 30 },
   { .threshold = 1160, .c_rate_thousandths = 20 },
-  { .threshold = 1162, .c_rate_thousandths = 10 }
+  { .threshold = 1162, .c_rate_thousandths = 10 },
+  { .threshold = 1164, .c_rate_thousandths =  5 }  // 116.4 V design max — 0.005 C ceiling (~570 mA on 114 Ah)
 };
 
 // Battery-cold cutback table. Threshold is degrees C, as measured

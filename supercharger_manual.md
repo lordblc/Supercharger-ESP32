@@ -122,12 +122,14 @@ The BOOT button still doubles as the chip's bootloader entry button if you happe
 
 ## Logging In
 
-The dashboard is password protected. On first visit your browser will show a login dialog.
+The dashboard is password protected. On first visit your browser shows a login form.
 
 - **Username**: set in `arduino_secrets.h` as `SECRET_OTA_USER`
 - **Password**: set in `arduino_secrets.h` as `SECRET_OTA_PASS`
 
-The controller uses HTTP Digest authentication — your password is never sent over the wire, only a cryptographic hash. After a successful login the browser receives a session cookie that is valid for **6 hours of idle time**. While the dashboard tab is open and polling, the session stays alive indefinitely. The cookie is cleared when you click **Logout** (top of the dashboard), or when the session expires from 6 hours of inactivity.
+The login form works with your browser's built-in password manager — save the credentials once and it auto-fills on every return visit.
+
+After a successful login the controller sets a session cookie that is valid for **6 hours of idle time**. While the dashboard tab is open and polling, the session stays alive indefinitely. The cookie is set with `SameSite=Lax` so it arrives correctly when you return via a bookmark or a restored browser tab. The cookie is cleared when you click **Logout** (top of the dashboard), or when the session expires from 6 hours of inactivity.
 
 ### Login rate limiting and lock-out
 
@@ -333,6 +335,27 @@ Click **Save Home WiFi Defaults** to persist. These take effect on the next boot
 
 **Typical use**: set the AP / Road defaults conservatively (charging off, low preset, 80% target) for when the controller is connected to the bike at an unfamiliar location. Set the Home WiFi defaults to your preferred daily charging behaviour (charging on, your usual preset, 80% target) so you don't have to touch the dashboard each time you plug in at home.
 
+### HTTPS / TLS (Optional)
+
+The controller can serve the dashboard over HTTPS (port 443) with a TLS certificate you supply. When enabled, port 80 redirects all traffic to port 443.
+
+**Setup — one time per certificate:**
+
+1. Generate or obtain a certificate and private key in PEM format. A self-signed cert is fine for a LAN device.
+2. Open **Settings → HTTPS / TLS**.
+3. Paste the certificate PEM into the **Certificate** box and the private key PEM into the **Private Key** box.
+4. Click **Upload Cert & Key**. The PEM data is saved to NVS on the controller — it survives reboots and OTA updates.
+5. Tick **Enable HTTPS** and confirm. This saves a flag to NVS.
+6. Reboot the controller (RST button or power cycle). Port 443 starts automatically.
+
+**Notes:**
+
+- First browser visit to `https://<ip>/` will show a security warning for a self-signed cert. Accept it once (add a permanent exception). After that the browser connects silently.
+- To disable HTTPS: untick **Enable HTTPS** in Settings (or POST `{"enabled": false}` to `/api/tls`) and reboot. The controller falls back to plain HTTP on port 80.
+- `/update` (OTA) and the live log stream (`/api/log/stream`) remain HTTP-only even when HTTPS is active.
+- The HTTPS server runs in its own FreeRTOS task. No extra polling is needed; the plain HTTP port 80 also stays up to serve the redirect.
+- Cert and key are stored in NVS under keys `tls_cert`, `tls_key`, and `https_en`. A factory reset (10 s BOOT hold) clears them along with all other settings.
+
 ---
 
 ## For Builders: First Time Flashing
@@ -444,13 +467,23 @@ The same 8-character minimum applies to `SECRET_PASS` as to any WiFi password �
 
 Once the controller is on your WiFi:
 
-1. Compile a new firmware in the Arduino IDE and export the compiled `.bin` (Sketch > Export Compiled Binary).
-2. Go to **http://\<controller-ip\>/update** in a browser. (or just click the OTA link from Dashboard web page)
-3. Enter your OTA username and password (the ones you set in `arduino_secrets.h`).
-4. Pick the `.bin` file and click Upload.
-5. The controller flashes and reboots automatically.
+1. Compile a new firmware in the Arduino IDE. Use **Sketch → Export Compiled Binary** or just note the build output path shown in the IDE console.
+2. **Pick the right file.** The Arduino IDE 2.x produces two `.bin` files in the build folder:
+   - `Supercharger_ESP32S3.ino.bin` — ~1.2 MB. **This is the OTA file.**
+   - `Supercharger_ESP32S3.ino.merged.bin` — ~16 MB. This is a full flash image for USB flashing only. Do **not** upload this via the web — it will be rejected.
+3. The OTA `.bin` must be **HMAC-signed** before uploading (see below). If you have the post-build hook set up in `platform.local.txt`, this happens automatically every compile.
+4. Go to **http://\<controller-ip\>/update** in a browser (or click the OTA link from the dashboard).
+5. Log in with your OTA username and password.
+6. Select the signed `.bin` file and click Upload.
+7. The controller verifies the HMAC signature, flashes the new firmware, and reboots automatically.
 
-If the update fails mid way, the old firmware is kept. You won't brick the controller unless the flash itself is cut mid write (e.g. power loss during upload).
+If the update fails mid-way, the old firmware is kept. You won't brick the controller unless the flash is cut mid-write (e.g. power loss during upload). If the signature check fails, you'll see **"Update rejected: signature invalid or upload incomplete"** and the controller keeps running the previous firmware unchanged.
+
+### HMAC Signing
+
+Every `.bin` uploaded via the web must carry a 32-byte HMAC-SHA256 trailer produced by `sign_ota.py`. The key lives in `ota_secret.h`. See **BUILD_SETUP.md** in the sketch folder for full setup instructions, including how to install the post-build hook so signing happens automatically on every compile.
+
+If you set up a new build environment (new machine or new Arduino IDE install), re-check that `ota_secret.h` and `sign_ota.py` both contain the same key — a mismatch means the controller will reject every upload until they are resynchronised.
 
 ---
 
@@ -568,7 +601,7 @@ Each attempt has a 15 second timeout before falling through.
 
 - Heartbeat frame (controller to charger): ID `0x1806E5F4`, 1 Hz. Stops when charging is disabled.
 - Ramp rate: 50 W per 1 second tick.
-- Max charge voltage: capped by the highest threshold in the voltage cutback table (see `battery_tables.h`).
+- Max charge voltage: 116.4 V (1164 dV) — set by the highest threshold in the voltage cutback table (`battery_tables.h`). At 116.4 V the cutback table limits charging to 0.005 C (~570 mA on a 114 Ah pack), effectively a CV trickle finish.
 - Max total power: 13200 W (4 chargers at 3300 W each).
 
 ---
