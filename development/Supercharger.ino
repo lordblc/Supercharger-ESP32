@@ -48,7 +48,7 @@
 //   esp_https_server } built into Espressif ESP32 Arduino core - used for HTTPS port-443 serving
 // ==========================================================================
 
-#define VERSION 202605041608
+#define VERSION 202605041628
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -1739,8 +1739,15 @@ const char HTML_OTA[] PROGMEM = R"rawliteral(
       };
       xhr.onload=function(){
         if(xhr.status===200){
-          stat.innerText='Success! Restarting...';
           bar.style.width='100%';
+          var secs=6;
+          function tick(){
+            stat.innerText='Success! Rebooting… returning to dashboard in '+secs+' s';
+            if(secs<=0){ window.location.href='/'; return; }
+            secs--;
+            setTimeout(tick,1000);
+          }
+          tick();
         } else {
           stat.innerText='Failed (HTTP '+xhr.status+'): '+xhr.responseText;
           btn.disabled=false;
