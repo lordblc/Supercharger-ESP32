@@ -124,6 +124,8 @@ The BOOT button still doubles as the chip's bootloader entry button if you happe
 
 The dashboard is password protected. On first visit your browser shows a login form.
 
+<img src="pics/26-05-05 16-46-41 Login.png" width="360">
+
 - **Username**: set in `arduino_secrets.h` as `SECRET_OTA_USER`
 - **Password**: set in `arduino_secrets.h` as `SECRET_OTA_PASS`
 
@@ -168,7 +170,7 @@ If neither resolves (some corporate or guest networks block multicast and don't 
 
 Type the IP into any browser on the same network and the dashboard loads.
 
-![Dashboard Screenshot](pics/202604231420-Dashboard_Charging_Absorption_768.jpg)
+<img src="pics/26-05-05 16-46-54 Dashboard_1.png" width="360">
 
 ---
 
@@ -195,6 +197,8 @@ One card per detected charger, with voltage, current, and status. Chargers appea
 **NOTE:** The DigiNow pack this was programmed against, came with one(and same) ID programmed towards all 3 chargers. If you have this setup, the system will only detect one charger, but you can set this static as a work-around.
 
 ### Charging Control
+
+<img src="pics/26-05-05 16-47-04 Dashboard_2.png" width="360">
 
 **ON / OFF button**: enables or disables charging. When disabled, the controller commands zero power immediately, no ramp down.
 
@@ -234,12 +238,8 @@ The dashboard remembers your last selection across reboots. The same setting is 
 
 The controller runs a three stage automatic charge cycle, named after the standard solar/battery-charging convention so what's happening on the bike maps to what you'd expect from any other smart charger.
 
-![Dashboard Screenshot](pics/202604231420-Dashboard_Charging_Absorption_768.jpg)
-
 **Stage 1 — Bulk** *(internally CC, "Constant Current")*
 This is the main charging phase where most of the energy goes in. The controller commands the chargers to deliver the power you've set on the slider, ramping up at 50 W/s (adjustable). Pack voltage rises gradually as the cells absorb energy. The dashboard phase indicator reads **Bulk**. Voltage and temperature limits (see `battery_tables.h`) only apply in this phase — they trim power back as the pack gets close to full or warm.
-
-![Dashboard Screenshot](pics/202604231420-Dashboard_Charging_Float_768.jpg)
 
 **Stage 2 — Absorption** *(internally CV, "Constant Voltage")*
 When the pack reaches the target voltage, the controller switches to **Absorption**. It holds the pack at that voltage and lets the chargers reduce current as the cells equalize and finish topping up. You'll see the current target falling on the dashboard while charging continues at a lower level. This stage finishes when one of two things happens, whichever comes first:
@@ -248,8 +248,6 @@ When the pack reaches the target voltage, the controller switches to **Absorptio
 - **1 hour safety timeout** finishes.
 
 The 1 hour timeout is generous on purpose — better to give all cells a long, well-paced equalization than to cut absorption short. The absorption stage is short at 70–80 % targets and longer at 90–100 %, because higher charge levels need more time to equalize across the pack. Lower presets shorten or eliminate this stage entirely. That's why 70 % or 80 % charges take proportionally less time. Most cell stress happens during absorption at over 90 % charge — lower presets avoid most of it.
-
-![Dashboard Screenshot](pics/202604231420-Dashboard_Charging_Complete_768.jpg)
 
 **Stage 3 — Float** *(internally DONE)*
 Charging stops, the chargers go silent, and the cells rest. The dashboard shows **Float**. Energy totals (Wh, Ah) stop updating. The controller stays in this stage indefinitely until either the user turns charging off, or the pack sags below the re-engage threshold (see below) and a new cycle starts.
@@ -275,19 +273,23 @@ Screenshot from my Home Assistant power monitor. This monitor sits in front of t
 
 ### System Info
 
-At the bottom: uptime, WiFi signal, firmware version, CPU load per core, free heap. Useful when you're debugging.
+<img src="pics/26-05-05 16-47-08 Dashboard_3.png" width="360">
+
+At the bottom: uptime, WiFi signal, firmware version, CPU load per core, free heap, and the number of charge cycles logged to the on-device data file. Useful when you're debugging.
 
 ### Log Viewer
 
 Click the Log link, or go to **/log**. Live serial log in your browser, updated in real time. Good for diagnosing CAN bus issues without needing a USB cable.
 
-![Dashboard Screenshot](pics/202604231420-Log_768.jpg)
+<img src="pics/26-05-05 16-50-10 Log.png" width="360">
 
 ---
 
 ## Settings Page
 
 Click **Settings** in the dashboard navigation bar, or go to **/settings**. All settings are saved to non-volatile storage immediately — they survive reboots and OTA updates.
+
+<img src="pics/26-05-05 16-47-25 Settings_1.png" width="360">
 
 ### WiFi Network
 
@@ -305,11 +307,15 @@ Configure the broker address, port, username, and password for Home Assistant in
 
 Sets how many chargers the controller expects to see on the CAN bus (1 – 4). This controls which row of the preset table is used and divides the commanded current evenly across units.
 
+<img src="pics/26-05-05 16-47-36 Settings_2.png" width="360">
+
 ### Charging Behaviour
 
 **Ramp Rate (W/s)**: how many watts the controller adds or removes per second when stepping toward a new target. Lower values give a gentler ramp. Default is 100 W/s; valid range 10 – 500.
 
 ### Boot Defaults — AP / Road Mode
+
+<img src="pics/26-05-05 16-47-43 Settings_3.png" width="360">
 
 These settings define the charging state the controller wakes into on every boot **when no home WiFi connection is available** (AP/road mode). They are applied immediately in the boot sequence before any WiFi connection is attempted.
 
@@ -336,6 +342,8 @@ Click **Save Home WiFi Defaults** to persist. These take effect on the next boot
 **Typical use**: set the AP / Road defaults conservatively (charging off, low preset, 80% target) for when the controller is connected to the bike at an unfamiliar location. Set the Home WiFi defaults to your preferred daily charging behaviour (charging on, your usual preset, 80% target) so you don't have to touch the dashboard each time you plug in at home.
 
 ### HTTPS / TLS (Optional)
+
+<img src="pics/26-05-05 16-48-04 Settings_4.png" width="360">
 
 The controller can serve the dashboard over HTTPS (port 443) with a TLS certificate you supply. When enabled, port 80 redirects all traffic to port 443.
 
@@ -464,6 +472,8 @@ The same 8-character minimum applies to `SECRET_PASS` as to any WiFi password �
 ---
 
 ## OTA Firmware Updates
+
+<img src="pics/26-05-05 16-49-08 OTA.png" width="360">
 
 Once the controller is on your WiFi:
 

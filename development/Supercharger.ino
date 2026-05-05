@@ -48,7 +48,7 @@
 //   esp_https_server } built into Espressif ESP32 Arduino core - used for HTTPS port-443 serving
 // ==========================================================================
 
-#define VERSION 202605041628
+#define VERSION 202605051625
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -78,6 +78,11 @@
 // Must come before any .ino function definition so Arduino's prototype
 // generator can see the struct type.
 #include "https_ctx.h"
+// CycleRecord struct — must be in a header so Arduino's auto-prototype pass
+// sees the type before it emits the forward declaration for appendCycleRecord().
+#include "cycle_record.h"
+#include <FFat.h>
+#include <time.h>      // getLocalTime, struct tm — NTP timestamp for cycle records
 
 // ---------------------------------------------------------------------------
 // Logging — ring buffer mirrored to hardware serial and SSE stream
@@ -421,6 +426,9 @@ struct SessionData {
   float chargeAh  = 0.0f;  // cumulative Ah delivered this session
   unsigned long startMs = 0; // session start timestamp
 } session;
+
+// CycleRecord struct is in cycle_record.h (included at top with other headers).
+
 SemaphoreHandle_t sessionMutex = nullptr;
 
 // Helpers for cross-task session access. The mutex is created in rampInit();
@@ -530,6 +538,7 @@ struct MqttSnapshot {
   uint8_t  rampPhase         = 255;     // 255 = sentinel, forces first publish
   int16_t  etaMinutes        = -2;      // -2 = sentinel (firmware uses -1 for "unknown"); forces first publish
   float    monolithAhAvail   = -1.0f;   // forces first publish
+  uint16_t cycleCount        = 65535;   // 65535 = sentinel, forces first publish
 } mqttLast;
 
 // MQTT transport — both a plaintext and a TLS client live in BSS so we can
@@ -611,6 +620,10 @@ static String   mqttCaCert         = "";
 static bool            httpsEnabled  = false;
 static httpd_handle_t  g_httpsServer = nullptr;
 
+// FFat cycle-data logger state
+static bool     g_fatReady   = false;  // true after FFat.begin() succeeds
+static uint16_t g_cycleCount = 0;      // number of records in /cycles.csv (cached)
+
 // ---------------------------------------------------------------------------
 // Login page — standard HTML form so password managers can autofill.
 // The %s slot is replaced with an empty string (no error) or an error
@@ -619,7 +632,7 @@ static httpd_handle_t  g_httpsServer = nullptr;
 // ---------------------------------------------------------------------------
 
 const char HTML_LOGIN[] PROGMEM =
-  "<!DOCTYPE html><html><head><title>Supercharger \xe2\x80\x94 Login</title>"
+  "<!DOCTYPE html><html><head><title>Supercharger - Login</title>"
   "<meta name='viewport' content='width=device-width,initial-scale=1'>"
   "<style>"
   "body{font-family:sans-serif;background:#0a0a1a;color:#ccc;"
@@ -1132,7 +1145,7 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
   <h1>&#9889; Supercharger
     <span class="badge stale" id="badge">NO DATA</span>
   </h1>
-  <nav><a href="/settings">&#9881; Settings</a><a href="/update">&#128190; OTA Update</a><a href="/log">&#128220; Log</a><a href="#" onclick="logout();return false">&#128274; Logout</a></nav>
+  <nav><a href="/settings">&#9881; Settings</a><a href="/update">&#128190; OTA Update</a><a href="/log">&#128220; Log</a><a href="/api/cycles" download="cycles.csv">&#11015; Cycles</a><a href="#" onclick="logout();return false">&#128274; Logout</a></nav>
 
   <div id="apBanner" style="display:none;background:#0f3460;border:1px solid #e94560;
        border-radius:8px;padding:12px 16px;margin-top:12px;text-align:center">
@@ -1254,6 +1267,8 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
       <span class="val" id="cpu1">—</span></div>
     <div class="card"><div class="label">Free Heap</div>
       <span class="val" id="heap">—</span></div>
+    <div class="card"><div class="label">Cycles Logged</div>
+      <span class="val" id="cycleCount">—</span></div>
   </div>
 
   <footer id="footer">Waiting for first update...</footer>
@@ -1648,8 +1663,10 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
           document.getElementById('ver').textContent    = d.version;
           document.getElementById('cpu0').textContent   = d.cpu0 !== undefined ? d.cpu0 + ' %' : '—';
           document.getElementById('cpu1').textContent   = d.cpu1 !== undefined ? d.cpu1 + ' %' : '—';
-          document.getElementById('heap').textContent   = d.free_heap_kb !== undefined
-                                                          ? fmt(d.free_heap_kb, 1) + ' kB' : '—';
+          document.getElementById('heap').textContent       = d.free_heap_kb !== undefined
+                                                            ? fmt(d.free_heap_kb, 1) + ' kB' : '—';
+          document.getElementById('cycleCount').textContent = d.cycle_count !== undefined
+                                                            ? d.cycle_count : '—';
           document.getElementById('footer').textContent =
             'Last update: ' + new Date().toLocaleTimeString();
         })
@@ -3182,6 +3199,7 @@ static String buildApiStatusJson() {
       "\"target_power_w\":%d,"
       "\"current_power_w\":%d,"
       "\"thermal_throttle\":%s,"
+      "\"cycle_count\":%d,"
       "\"chargers\":[",
     liveSnap.dataFresh         ? "true" : "false",
     apIsBroadcasting()         ? "true" : "false",
@@ -3220,7 +3238,8 @@ static String buildApiStatusJson() {
     ctrl.enabled ? "true" : "false",
     (int)ctrl.targetPowerW,
     (int)ctrl.currentPowerW,
-    g_thermalThrottle ? "true" : "false"
+    g_thermalThrottle ? "true" : "false",
+    (int)g_cycleCount
   );
 
   // Build the charger array dynamically — one entry per present charger
@@ -3698,6 +3717,9 @@ void monitorWifiStatus() {
       if (hn && strlen(hn) > 0)
         snprintf(mqttHostname, sizeof(mqttHostname), "%s", hn);
       startMdns();
+      // Kick off NTP sync (non-blocking; result arrives in ~2 s via SNTP task).
+      // Timestamps are used by the cycle data logger (appendCycleRecord).
+      configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
       currentState = STATE_CONNECTED;
       applyHomeWifiBootDefaults();  // apply home WiFi profile once, on first STA connect
       return;
@@ -3781,6 +3803,32 @@ void monitorWifiStatus() {
 // AP fallback is reachable.
 static inline bool apIsBroadcasting() {
   return currentState == STATE_SETUP_MODE || currentState == STATE_AP_RETRYING;
+}
+
+// ---------------------------------------------------------------------------
+// Cycle data API — download / clear /cycles.csv from FFat
+// ---------------------------------------------------------------------------
+
+// GET /api/cycles — stream the cycle history CSV as a file download.
+// Returns 404 if no cycles have been recorded yet.
+void handleApiCyclesGet() {
+  if (!requireAuth(true)) return;
+  if (!g_fatReady) { server.send(503, "text/plain", "FAT not mounted"); return; }
+  File f = FFat.open("/cycles.csv", FILE_READ);
+  if (!f) { server.send(404, "text/plain", "No data yet"); return; }
+  server.sendHeader("Content-Disposition", "attachment; filename=\"cycles.csv\"");
+  server.streamFile(f, "text/csv");
+  f.close();
+}
+
+// DELETE /api/cycles — wipe cycle history (creates a clean slate for next cycle).
+void handleApiCyclesDelete() {
+  if (!requireAuth(true)) return;
+  if (!g_fatReady) { server.send(503, "text/plain", "FAT not mounted"); return; }
+  FFat.remove("/cycles.csv");
+  g_cycleCount = 0;
+  server.send(200, "text/plain", "Cleared");
+  LOG("[FAT] cycles.csv deleted by user\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -3925,6 +3973,8 @@ void setup() {
     server.on("/update",          HTTP_GET,  handleOTAGet);
     server.on("/update",          HTTP_POST, handleOTAPost, handleOTAUpload);
     server.on("/api/tls",         HTTP_POST, handleApiTlsPostWS);
+    server.on("/api/cycles",      HTTP_GET,    handleApiCyclesGet);
+    server.on("/api/cycles",      HTTP_DELETE, handleApiCyclesDelete);
   }
 
   // Tell WebServer to keep these request headers — by default it discards
@@ -3933,6 +3983,17 @@ void setup() {
   //              to look up the current scs= session token.
   static const char* collectedHeaders[] = { "Cookie" };
   server.collectHeaders(collectedHeaders, 1);
+
+  // Mount the FFat partition for cycle data logging (and later model storage).
+  // true = format partition if blank (first-boot only; no-op on subsequent boots).
+  g_fatReady = FFat.begin(true);
+  if (g_fatReady) {
+    g_cycleCount = countCycleRecords();
+    LOG("[FAT] Mounted. Free: %lu KB, %d cycles logged\n",
+        (unsigned long)(FFat.freeBytes() / 1024UL), (int)g_cycleCount);
+  } else {
+    LOG("[FAT] Mount failed — cycle logging disabled\n");
+  }
 
   server.begin();
 
@@ -4511,6 +4572,54 @@ void chargerBusInit() {
 // Session energy is accumulated each tick: Wh += P_W / 3600,  Ah += I_A / 3600
 // ---------------------------------------------------------------------------
 
+// Count the number of data rows in /cycles.csv (lines minus the header).
+// Called once at FFat mount; g_cycleCount is incremented cheaply thereafter.
+static uint16_t countCycleRecords() {
+  if (!g_fatReady) return 0;
+  File f = FFat.open("/cycles.csv", FILE_READ);
+  if (!f) return 0;
+  uint16_t newlines = 0;
+  while (f.available()) {
+    if (f.read() == '\n') newlines++;
+  }
+  f.close();
+  // Header line accounts for one '\n'; remainder are data rows.
+  return (newlines > 0) ? newlines - 1 : 0;
+}
+
+// Append one completed charge cycle to /cycles.csv on FFat.
+// Called once per cycle from rampTask when phase transitions to PHASE_DONE.
+// Thread-safety: only ever called from rampTask; g_cycle is task-local.
+static void appendCycleRecord(const CycleRecord& r) {
+  if (!g_fatReady) return;
+  File f = FFat.open("/cycles.csv", FILE_APPEND);
+  if (!f) { LOG("[FAT] Cannot open /cycles.csv for append\n"); return; }
+  // Write CSV header if this is a brand-new file (size 0 before the write)
+  if (f.size() == 0) {
+    f.println("timestamp,preset_pct,start_v,end_v,start_soc,end_soc,"
+              "start_temp,end_temp,total_ah,total_wh,bulk_min,"
+              "absorption_min,charger_count,abort_reason");
+  }
+  char line[180];
+  snprintf(line, sizeof(line),
+    "%s,%d,%.1f,%.1f,%d,%d,%d,%d,%.2f,%.1f,%d,%d,%d,%d",
+    r.timestamp,
+    (int)r.preset_pct,
+    r.start_v_dv / 10.0f,       r.end_v_dv / 10.0f,
+    (int)r.start_soc,            (int)r.end_soc,
+    (int)r.start_temp,           (int)r.end_temp,
+    r.total_ah_x100 / 100.0f,
+    r.total_wh_x10  / 10.0f,
+    (int)r.bulk_min,
+    (int)r.absorption_min,
+    (int)r.charger_count,
+    (int)r.abort_reason);
+  f.println(line);
+  f.close();
+  g_cycleCount++;
+  LOG("[FAT] Cycle record appended (#%d): %s\n", (int)g_cycleCount, line);
+}
+
 void rampTask(void* /*pvParameters*/) {
   LOG("[RAMP] rampTask running on core %d\n", xPortGetCoreID());
   session.startMs = millis();
@@ -4541,6 +4650,13 @@ void rampTask(void* /*pvParameters*/) {
   // duration crosses CC_TAPER_MS, we transition to CV regardless of pack
   // voltage. See Bugs 1/2 in [project_charging_bugs_2026-04-26.md].
   static unsigned long ccTaperStartMs = 0;
+
+  // Cycle data logger — record under construction and transition timestamps.
+  // All reads/writes are from rampTask only; no mutex needed.
+  static CycleRecord   g_cycle    = {};
+  static unsigned long ccEntryMs  = 0;   // millis() when current CC phase began
+  static unsigned long cvEntryMs  = 0;   // millis() when current CV phase began
+  static RampPhase     lastPhase  = PHASE_DONE; // phase at end of previous tick
 
   const unsigned long CV_HOLD_MS = 60UL * 60UL * 1000UL; // 1 h absorption safety timeout
   const unsigned long CV_MIN_MS  = 120000UL;              // don't terminate CV before 2 min
@@ -4750,6 +4866,37 @@ void rampTask(void* /*pvParameters*/) {
       ccTaperStartMs = 0;
     }
 
+    // ── Cycle data logger — phase-entry hooks ─────────────────────────────────
+    // CC entry: fire when transitioning into CC from any other phase, OR on
+    // the rising edge of 'enabled' while already in CC (covers disable/re-enable
+    // without a phase change that would update lastPhase).
+    if ((phase == PHASE_CC && lastPhase != PHASE_CC) ||
+        (justEnabled && phase == PHASE_CC)) {
+      ccEntryMs = millis();
+      g_cycle   = CycleRecord{};
+      struct tm ti;
+      if (getLocalTime(&ti, 100))
+        strftime(g_cycle.timestamp, sizeof(g_cycle.timestamp),
+                 "%Y-%m-%dT%H:%M:%S", &ti);
+      if (xSemaphoreTake(liveMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        g_cycle.start_v_dv = (uint16_t)live.monolithVoltageDv;
+        g_cycle.start_soc  = live.monolithBmsSoc;   // 255 if no BMS frame yet
+        g_cycle.start_temp = (int8_t)live.monolithMaxTemp;
+        xSemaphoreGive(liveMutex);
+      }
+      // Match target voltage to the nearest named preset percentage
+      uint8_t ppct = 0;
+      for (int pi = 0; pi < TARGET_VOLT_PRESET_COUNT; pi++)
+        if (TARGET_VOLT_PRESETS[pi].dv == targetVolt) { ppct = TARGET_VOLT_PRESETS[pi].pct; break; }
+      g_cycle.preset_pct    = ppct;
+      g_cycle.charger_count = nChargers;
+    }
+    // CV entry: transition from CC to CV
+    if (phase == PHASE_CV && lastPhase == PHASE_CC) {
+      cvEntryMs         = millis();
+      g_cycle.bulk_min  = (uint16_t)((cvEntryMs - ccEntryMs) / 60000UL);
+    }
+
     // ── Power cutback limits (CC phase only) ──────────────────────────────────
     float packAH = (monolithAH > 0) ? (float)monolithAH : 114.0f;
     float voltV  = (rawPackDv > 0) ? rawPackDv / 10.0f : voltCeiling / 10.0f;
@@ -4841,6 +4988,7 @@ void rampTask(void* /*pvParameters*/) {
           bool termTimeout = (elapsed >= CV_HOLD_MS);
           if (termCurrent || termTimeout) {
             phase = PHASE_DONE;
+            g_cycle.abort_reason = termTimeout ? 1 : 0;  // 0=taper, 1=timeout
             terminating = true;
             LOG("[RAMP] CV→DONE: %s after %lus (%.2fA actual)\n",
                 termTimeout ? "timeout" : "current taper",
@@ -4872,6 +5020,32 @@ void rampTask(void* /*pvParameters*/) {
 
       xSemaphoreGive(chargerMutex);
     }
+
+    // ── Cycle data logger — DONE entry hook ───────────────────────────────────
+    // Fires in the same tick that CV→DONE was set (abort_reason already set
+    // inside the charger mutex block above). Snapshots end-of-cycle values and
+    // writes one CSV row to /cycles.csv.
+    if (phase == PHASE_DONE && lastPhase != PHASE_DONE) {
+      if (xSemaphoreTake(liveMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        g_cycle.end_v_dv = (uint16_t)live.monolithVoltageDv;
+        g_cycle.end_soc  = live.monolithBmsSoc;
+        g_cycle.end_temp = (int8_t)live.monolithMaxTemp;
+        xSemaphoreGive(liveMutex);
+      }
+      if (xSemaphoreTake(sessionMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        g_cycle.total_ah_x100 = (uint16_t)(session.chargeAh * 100.0f);
+        g_cycle.total_wh_x10  = (uint32_t)(session.energyWh * 10.0f);
+        xSemaphoreGive(sessionMutex);
+      }
+      g_cycle.absorption_min = (cvEntryMs > 0)
+        ? (uint16_t)((millis() - cvEntryMs) / 60000UL)
+        : 0;
+      appendCycleRecord(g_cycle);
+    }
+
+    // Track previous phase for next tick's transition hooks.
+    // NOTE: updated AFTER all hooks so each hook sees the true transition.
+    lastPhase = phase;
 
     // Expose phase to API/dashboard (atomic uint8_t write, no mutex needed)
     g_rampPhase = (uint8_t)phase;
@@ -5459,6 +5633,8 @@ static void mqttPublishDiscovery() {
   mqttDiscoverSensor("ramp_phase",        "Charging Stage", "", "", "");
   // Estimated minutes until target voltage is reached (-1 when unknown / not charging)
   mqttDiscoverSensor("eta_minutes",       "Charging Time Remaining", "min", "duration", "measurement");
+  // Total charge cycles recorded in the on-device cycle log
+  mqttDiscoverSensor("cycle_count",       "Charge Cycles Logged",    "",    "",          "total_increasing");
 
   LOG("[MQTT] Discovery published\n");
 }
@@ -5749,6 +5925,9 @@ static bool mqttPublishChanges() {
     mqttLast.sessionAh = sessAh;
     published = true;
   }
+
+  // Cycle count — only changes when a cycle completes or the log is cleared
+  PUB_IF_CHANGED_I(cycleCount, "cycle_count", g_cycleCount)
 
   #undef PUB_IF_CHANGED_F
   #undef PUB_IF_CHANGED_I
