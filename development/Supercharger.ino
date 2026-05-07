@@ -48,7 +48,7 @@
 //   esp_https_server } built into Espressif ESP32 Arduino core - used for HTTPS port-443 serving
 // ==========================================================================
 
-#define VERSION 202605051625
+#define VERSION 202605071621
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -1093,8 +1093,8 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
     footer{margin-top:18px;font-size:0.70em;color:#444;text-align:center}
     .ctrl-box{background:#16213e;border-radius:8px;padding:16px;margin-top:2px}
     .ctrl-row{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px}
-    .big-btn{background:#e94560;color:#fff;border:none;padding:12px 22px;border-radius:6px;
-             font-size:1em;font-weight:bold;cursor:pointer;min-width:150px}
+    .big-btn{background:#e94560;color:#fff;border:none;padding:16px 28px;border-radius:6px;
+             font-size:1.15em;font-weight:bold;cursor:pointer;min-width:180px}
     .big-btn.off{background:#0f3460}
     .pwr-display{text-align:center;min-width:70px;display:flex;flex-direction:column;
                  align-items:center;align-self:flex-start;padding-top:3px}
@@ -1124,6 +1124,7 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
     .cc-btn.active{background:#e94560;border-color:#e94560}
     /* SOC card */
     .soc-card{grid-column:span 2}
+    .soc-val{font-size:2.2em!important}
     .soc-bar-wrap{background:#0f3460;border-radius:4px;height:6px;margin-top:8px;overflow:hidden}
     .soc-bar{height:100%;border-radius:4px;background:#e94560;width:0%;transition:width 0.6s ease}
     /* Session data grid */
@@ -1169,7 +1170,7 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
     <div class="card"><div class="label">Capacity <span style="font-size:0.7em;color:#888;font-weight:normal">avail / total</span></div>
       <span class="val" id="mAH">—</span></div>
     <div class="card soc-card"><div class="label">State of Charge <span id="mSOCSrc" style="font-size:0.7em;color:#888;font-weight:normal"></span></div>
-      <span class="val" id="mSOC">—</span>
+      <span class="val soc-val" id="mSOC">—</span>
       <div class="soc-bar-wrap"><div class="soc-bar" id="mSOCBar"></div></div></div>
     <div class="card"><div class="label">Temp Min / Max</div>
       <span class="val" id="mT">—</span></div>
@@ -1253,8 +1254,12 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
     <div id="tgtVoltBtns" class="tgt-volt-row"></div>
   </div>
 
-  <div class="section">System</div>
-  <div class="grid">
+  <div class="section">System
+    <a id="sysToggle" href="#" onclick="toggleSys();return false;"
+       style="font-size:0.75em;color:#e94560;text-transform:none;letter-spacing:0;
+              font-weight:bold;margin-left:10px;text-decoration:none">show</a>
+  </div>
+  <div id="sysGrid" class="grid" style="display:none">
     <div class="card"><div class="label">Uptime</div>
       <span class="val" id="uptime">—</span></div>
     <div class="card"><div class="label">WiFi RSSI</div>
@@ -1675,6 +1680,26 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
           b.textContent = 'OFFLINE'; b.className = 'badge stale';
         });
     }
+    // ---- Collapsible System section ----
+    // Default: hidden.  User's choice persisted in localStorage key 'sysVis'.
+    function toggleSys() {
+      var grid = document.getElementById('sysGrid');
+      var lnk  = document.getElementById('sysToggle');
+      var vis  = grid.style.display !== 'none';
+      grid.style.display = vis ? 'none' : '';
+      lnk.textContent    = vis ? 'show' : 'hide';
+      try { localStorage.setItem('sysVis', vis ? '0' : '1'); } catch(e) {}
+    }
+    // Restore saved state on load
+    (function(){
+      try {
+        if (localStorage.getItem('sysVis') === '1') {
+          document.getElementById('sysGrid').style.display = '';
+          document.getElementById('sysToggle').textContent = 'hide';
+        }
+      } catch(e) {}
+    })();
+
     refresh();
     setInterval(refresh, 2000);
   </script>

@@ -217,6 +217,8 @@ Presets per charger count:
 
 The preset number (1–5) stays consistent across charger counts — Preset 2 always represents the second-lowest power level for however many chargers you have. This is also the column used for the Boot Defaults preset setting (see Settings page below).
 
+**Chargers 1 / 2 / 3 / 4 buttons**: these set how many chargers the controller accounts for when scaling the preset table and the slider's maximum. They have **no effect on what the chargers actually do** — the controller broadcasts a single CAN command and all chargers that share the same CAN ID respond to it simultaneously, regardless of this setting. This is the typical DigiNow setup where all chargers are programmed with the same ID. If your chargers each have a *distinct* CAN ID, this count would become meaningful and the button should be left at the number physically connected rather than adjusted freely.
+
 **Auto behavior**: when chargers first appear, the controller auto enables charging at the lowest preset. When they all disappear (e.g. you unplug), it auto disables. You don't have to babysit it.
 
 ### Charge Limit Presets (% of Full)
@@ -525,7 +527,7 @@ With MQTT credentials set, the controller auto publishes HA discovery topics und
 | `charging_enabled` | switch | On/off master switch (same as the dashboard ON/OFF button) |
 | `target_power_w` | number | Target charging power in watts (0 – 13200) |
 | `target_volt_v` | number | Target pack voltage in volts (106.0 – 116.4, 0.1 V steps) — for fine-grained control outside the four presets |
-| `charger_count` | number | How many chargers the controller should expect (1 – 4) |
+| `charger_count` | number | Scales the dashboard's preset table and power slider max (1 – 4). Does **not** affect what the chargers physically do — see note in Charging Control section. |
 | `ramp_rate_wps` | number | Power ramp rate in W per second (10 – 500) |
 
 ### Buttons
