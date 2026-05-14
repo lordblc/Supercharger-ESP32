@@ -4,12 +4,14 @@
 
 A WiFi connected CAN bus controller for charging a Zero motorcycle with up to 4 Elcon TC HK-J 3300W chargers in parallel. You get a web dashboard, optional Home Assistant integration, and firmware updates over the air.
 
+The chargers can be powered from any AC source — a standard home outlet, a dedicated EVSE, or a public charge point. Tested at 3-phase 400 V via an **Easee charge robot** with full functionality.
+
 ---
 
 ## What You'll Need
 
 - Supercharger 2.5 controller (LilyGo T-2CAN, ESP32-S3 based)
-- 1 to 4 Elcon TC HK-J 3300W chargers
+- 1 to 4 Elcon TC HK-J 3300W chargers (powered from any AC source — home outlet, EVSE, or public charge point; tested at 3-phase 400 V on an Easee charge robot)
 - Zero motorcycle with CAN bus access to the BMS
 - A 2.4 GHz WiFi network (optional, but recommended)
 - A phone, tablet, or laptop with a browser for setup
@@ -180,9 +182,18 @@ The dashboard auto refreshes every 2 seconds.
 
 ### Battery Sections
 
-**Monolith Pack** shows voltage, current, capacity, state of charge, and temperature. Always visible. The State of Charge value is read straight from the BMS (CAN frame `0x188` byte 0) — the same coulomb-counted number the bike's own dashboard uses, so the two should agree closely. If the BMS hasn't broadcast a status frame yet (typically the first few seconds after the bike wakes), the card falls back to a voltage-curve estimate and is labelled `(est.)` until the BMS catches up. The Capacity card shows `available / total Ah` — the available number is the nominal pack AH multiplied by the current SoC, so it tracks how much charge is actually left in the pack right now (e.g. `57.0 / 114 Ah` at 50%) rather than just printing the constant nameplate value.
+**Monolith Pack** shows voltage, current, capacity, state of charge, temperature, cell balance, and BMS board temperature. Always visible.
 
-**PowerTank Pack** shows the same if a PowerTank is present. It's auto detected within 10 seconds of the first bike CAN frame. If it doesn't show up in that window, the section stays hidden.
+- **State of Charge** is read straight from the BMS (CAN frame `0x188` byte 0) — the same coulomb-counted number the bike's own dashboard uses, so the two should agree closely. If the BMS hasn't broadcast a status frame yet (typically the first few seconds after the bike wakes), the card falls back to a voltage-curve estimate and is labelled `(est.)` until the BMS catches up.
+- **Capacity** shows `available / total Ah` — the available number is the nominal pack AH multiplied by the current SoC, so it tracks how much charge is actually left in the pack right now (e.g. `57.0 / 114 Ah` at 50%) rather than just printing the constant nameplate value.
+- **Cell Balance** shows the spread between the highest and lowest individual cell voltage in the pack (max − min, in mV). The BMS broadcasts one cell at a time on CAN frame `0x388`, cycling through all 28 cells roughly every 3 seconds; the controller accumulates all readings and keeps the balance current. The value is colour-coded:
+  - 🟢 **Green** — less than 10 mV: cells are well-balanced, no action needed.
+  - 🟡 **Amber** — 10 – 50 mV: mild imbalance, worth watching over time.
+  - 🔴 **Red** — more than 50 mV: significant imbalance; consider a full charge to 100 % to let the BMS balance.
+  The tile shows "—" for the first few seconds after the bike is connected, while the controller is still collecting the first full round of cell readings.
+- **BMS Temp** shows the temperature of the BMS circuit board itself (CAN frame `0x488` byte 1 — reported as "Controller Temp" by third-party diagnostic tools). This is separate from the min/max cell temperatures in the Temp card, which reflect the cell pack interior.
+
+**PowerTank Pack** shows the same fields (except cell balance and BMS Temp, which are not decoded for the PowerTank) if a PowerTank is present. It's auto detected within 10 seconds of the first bike CAN frame. If it doesn't show up in that window, the section stays hidden.
 
 ### Status Banners
 
@@ -519,6 +530,9 @@ With MQTT credentials set, the controller auto publishes HA discovery topics und
 | `thermal_throttle` | — | `"true"` while the hot-cutback is reducing charging power, `"false"` otherwise. Use as a binary template sensor for HA notifications |
 | `ramp_phase` | — | Current charging stage: `"bulk"`, `"absorption"`, or `"float"`. Pin to a Lovelace card or use as the trigger for "charging finished" automations (`ramp_phase` transitions to `"float"`) |
 | `eta_minutes` | min | Estimated time remaining until the pack reaches the active target voltage. Coulomb-counting estimate during Bulk (smoothed with a 0.2 EMA), absorption-timer countdown during Absorption, `-1` when not charging or the value can't be computed yet (current too low / pack already above target) |
+| `cell_balance_mv` | mV | Spread between the highest and lowest individual cell voltage (max − min across all 28 cells). The BMS rotates through cells on CAN frame `0x388`; full coverage takes ~3 s. Not published until at least two cell readings have been received |
+| `bms_board_temp` | °C | Temperature of the BMS circuit board (CAN frame `0x488` byte 1 — labelled "Controller Temp" by third-party diagnostic tools). Separate from the cell-interior min/max temperatures in `monolith_tmin` / `monolith_tmax`. Not published until the first `0x488` frame arrives |
+| `cycle_count` | — | Total completed charge cycles recorded in the on-device cycle log (`/cycles.csv`). Increments once per session when the controller transitions to Float. Use `state_class: total_increasing` in HA for a running total card |
 
 ### Controls (read / write)
 

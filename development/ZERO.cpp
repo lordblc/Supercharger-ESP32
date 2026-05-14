@@ -219,7 +219,15 @@ byte Zero::hasPowerTankPackStatus(short &canId){
     return 0;
 }
 
+// All raw-byte decoders below: validate `len` before reading. CAN frames are
+// nominally 8 bytes, but a malformed / short frame from a buggy node — or
+// stack garbage in the driver's buffer past `len` — would otherwise yield
+// random values that get fed straight into the charging algorithm.
+// A 0 return on a short frame is a safe-ish "ignore" for accumulators and
+// thresholding (rampTask treats 0/uninitialised pack values as "skip tick").
+
 short Zero::throttle(byte &len,byte buf[ZERO_MESSAGE_LENGTH]){
+  if (len < 6) return 0;
   ByteToShort throttleVoltage;
 
   throttleVoltage.bytes[0]=buf[4];
@@ -231,6 +239,7 @@ short Zero::throttle(byte &len,byte buf[ZERO_MESSAGE_LENGTH]){
 }
 
 short Zero::amps(byte &len,byte buf[ZERO_MESSAGE_LENGTH]){
+  if (len < 5) return 0;
   ByteToShort amps;
 
   amps.bytes[0]=buf[3];
@@ -242,6 +251,7 @@ short Zero::amps(byte &len,byte buf[ZERO_MESSAGE_LENGTH]){
 }
 
 long Zero::voltage(byte &len,byte buf[ZERO_MESSAGE_LENGTH]){
+  if (len < 7) return 0;
   ByteToLong voltage;
 
   voltage.bytes[0]=buf[3];
@@ -255,6 +265,7 @@ long Zero::voltage(byte &len,byte buf[ZERO_MESSAGE_LENGTH]){
 }
 
 short Zero::sagAdjust(byte &len,byte buf[ZERO_MESSAGE_LENGTH]){
+  if (len < 2) return 0;
   ByteToShort sagAdjust;
 
   sagAdjust.bytes[0]=buf[0];
@@ -266,6 +277,7 @@ short Zero::sagAdjust(byte &len,byte buf[ZERO_MESSAGE_LENGTH]){
 }
 
 short Zero::maxCRate(byte &len,byte buf[ZERO_MESSAGE_LENGTH]){
+  if (len < 8) return 0;
   ByteToShort CRate;
 
   // Bytes 0-3 of BMS_PACK_TIME (0x508) are a 32-bit runtime counter.
@@ -277,6 +289,7 @@ short Zero::maxCRate(byte &len,byte buf[ZERO_MESSAGE_LENGTH]){
 }
 
 short Zero::AH(byte &len,byte buf[ZERO_MESSAGE_LENGTH]){
+  if (len < 7) return 0;
   ByteToShort AH;
 
   AH.bytes[0]=buf[5];

@@ -48,7 +48,7 @@
 //   esp_https_server } built into Espressif ESP32 Arduino core - used for HTTPS port-443 serving
 // ==========================================================================
 
-#define VERSION 202605071621
+#define VERSION 202605101611
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -221,6 +221,20 @@ struct LiveData {
   // BMS-reported SoC % from BMS_PACK_STATUS (0x188 byte 0). 255 = no frame
   // received yet; falls back to voltage-curve estimate in that case.
   byte  monolithBmsSoc      = 255;
+
+  // Per-cell voltages decoded from 0x388 rotating frame:
+  //   byte 0 = cell index (0..27), bytes 1-2 = cell voltage uint16 LE (mV)
+  // The BMS cycles through all 28 cells at ~10 Hz, so full coverage arrives
+  // in about 3 s. cellSeenMask bit i is set once cell i has been received at
+  // least once. cellBalanceMv = max − min across all seen cells (mV), 0 while
+  // fewer than 2 cells have been seen.
+  uint16_t cellVoltsMv[28]  = {};   // per-cell mV; 0 = not yet received
+  uint32_t cellSeenMask     = 0;    // bitmask — bit i set when cell i received
+  uint16_t cellBalanceMv    = 0;    // max − min (mV); 0 = insufficient data
+
+  // BMS board temperature — 0x488 byte 1 (signed °C).
+  // ZeroSpy labels this "Controller Temp". -128 = not yet received.
+  int8_t   bmsBoardTempC    = -128;
 
   // PowerTank (BMS1)
   long  powerTankVoltageDv  = 0;
@@ -539,6 +553,8 @@ struct MqttSnapshot {
   int16_t  etaMinutes        = -2;      // -2 = sentinel (firmware uses -1 for "unknown"); forces first publish
   float    monolithAhAvail   = -1.0f;   // forces first publish
   uint16_t cycleCount        = 65535;   // 65535 = sentinel, forces first publish
+  uint16_t cellBalanceMv     = 65535;   // sentinel, forces first publish
+  int16_t  bmsBoardTempC     = -256;    // sentinel (outside int8 range), forces first publish
 } mqttLast;
 
 // MQTT transport — both a plaintext and a TLS client live in BSS so we can
@@ -1174,6 +1190,10 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
       <div class="soc-bar-wrap"><div class="soc-bar" id="mSOCBar"></div></div></div>
     <div class="card"><div class="label">Temp Min / Max</div>
       <span class="val" id="mT">—</span></div>
+    <div class="card"><div class="label">Cell Balance <span style="font-size:0.7em;color:#888;font-weight:normal">max&#8722;min</span></div>
+      <span class="val" id="mCellBal">—</span></div>
+    <div class="card"><div class="label">BMS Temp</div>
+      <span class="val" id="mBmsTemp">—</span></div>
   </div>
 
   <div id="ptSection" style="display:none">
@@ -1542,6 +1562,22 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
             : (d.monolith_ah + ' Ah');
           document.getElementById('mT').textContent  = fmt(d.monolith_tmin, 0)
                                                + ' / ' + fmt(d.monolith_tmax, 0) + ' \u00B0C';
+
+          // Cell balance tile \u2014 colour-coded: green <10 mV, amber 10\u201350 mV, red >50 mV
+          var balEl = document.getElementById('mCellBal');
+          if (d.cell_balance_mv !== undefined && d.cell_balance_mv > 0) {
+            var balMv = d.cell_balance_mv;
+            balEl.textContent = balMv + ' mV';
+            balEl.style.color = balMv < 10 ? '#4caf50' : balMv < 50 ? '#ff9800' : '#f44336';
+          } else {
+            balEl.textContent = '\u2014';
+            balEl.style.color = '';
+          }
+
+          // BMS board temperature (0x488 byte 1 \u2014 "Controller Temp" in ZeroSpy)
+          var bmsEl = document.getElementById('mBmsTemp');
+          bmsEl.textContent = (d.bms_board_temp !== undefined && d.bms_board_temp !== -128)
+            ? (d.bms_board_temp + ' \u00B0C') : '\u2014';
 
           // SOC card
           var soc = d.monolith_soc !== undefined ? d.monolith_soc : null;
@@ -3288,7 +3324,13 @@ static String buildApiStatusJson() {
     response += entry;
     first = false;
   }
-  response += "]}";
+  // Append cell balance and BMS board temp then close the object
+  char cellBuf[80];
+  snprintf(cellBuf, sizeof(cellBuf),
+    "],\"cell_balance_mv\":%u,\"bms_board_temp\":%d}",
+    (unsigned)liveSnap.cellBalanceMv,
+    (int)liveSnap.bmsBoardTempC);
+  response += cellBuf;
   return response;
 }
 
@@ -3745,6 +3787,8 @@ void monitorWifiStatus() {
       // Kick off NTP sync (non-blocking; result arrives in ~2 s via SNTP task).
       // Timestamps are used by the cycle data logger (appendCycleRecord).
       configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
+      setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1); // Europe/Oslo
+      tzset();
       currentState = STATE_CONNECTED;
       applyHomeWifiBootDefaults();  // apply home WiFi profile once, on first STA connect
       return;
@@ -4157,6 +4201,43 @@ void processBikeFrame(const twai_message_t &msg) {
       LOG("[CAN] %s len=%d  %02X %02X %02X %02X %02X %02X %02X %02X\n",
           name, (int)len,
           buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]);
+
+      // ── Extra interpretation for frames under active byte-mapping ────────────
+      // Cross-reference these against ZeroSpy to identify cell voltage / temp
+      // fields. All candidate readings printed so we can pick the right one.
+
+      if (id == 0x388 || id == 0x389) {
+        // Candidates for cell voltage min/max (ZeroSpy shows ~4065-4068 mV idle):
+        //   b[0-1] as uint16 LE   — likely cell min mV
+        //   b[2]   as uint8       — possible delta (max-min), fits in 1 byte
+        //   b[2-3] as uint16 LE   — possible cell max mV (conflicts with pack b[3])
+        //   pack confirmed b[3-6] as uint32 LE (mV) and alt b[4-7]
+        uint16_t b01 = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+        uint16_t b23 = (uint16_t)buf[2] | ((uint16_t)buf[3] << 8);
+        uint32_t b36 = (uint32_t)buf[3] | ((uint32_t)buf[4] << 8)
+                     | ((uint32_t)buf[5] << 16) | ((uint32_t)buf[6] << 24);
+        uint32_t b47 = (uint32_t)buf[4] | ((uint32_t)buf[5] << 8)
+                     | ((uint32_t)buf[6] << 16) | ((uint32_t)buf[7] << 24);
+        LOG("[CAN]  +-388 b[0-1]=%u mV  b[2]=%u  b[2-3]=%u mV  "
+            "pack(b3-6)=%u mV  pack(b4-7)=%u mV\n",
+            b01, (unsigned)buf[2], b23, b36, b47);
+      }
+
+      if (id == 0x488 || id == 0x489) {
+        // 0x488 BMS_PACK_TEMP_DATA — layout unknown; print all interpretations.
+        // Signed bytes: possible temperature fields (°C, signed).
+        // uint16 LE pairs: possible mV / dV fields.
+        LOG("[CAN]  +-488 signed:  %4d %4d %4d %4d %4d %4d %4d %4d\n",
+            (int)(int8_t)buf[0], (int)(int8_t)buf[1],
+            (int)(int8_t)buf[2], (int)(int8_t)buf[3],
+            (int)(int8_t)buf[4], (int)(int8_t)buf[5],
+            (int)(int8_t)buf[6], (int)(int8_t)buf[7]);
+        uint16_t w01 = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+        uint16_t w23 = (uint16_t)buf[2] | ((uint16_t)buf[3] << 8);
+        uint16_t w45 = (uint16_t)buf[4] | ((uint16_t)buf[5] << 8);
+        uint16_t w67 = (uint16_t)buf[6] | ((uint16_t)buf[7] << 8);
+        LOG("[CAN]  +-488 u16LE:   %5u  %5u  %5u  %5u\n", w01, w23, w45, w67);
+      }
     }
   }
 
@@ -4168,12 +4249,33 @@ void processBikeFrame(const twai_message_t &msg) {
 
   // --- Monolith (BMS0) ---
   if (zeroDecoder.hasMonolithVoltage(id)) {
-    // BMS_CELL_VOLTAGE (0x388): voltage in bytes 3-6 (units: 0.001 V → store as dV)
-    // NOTE: bytes 0-1 are NOT sagAdjust — sagAdjust lives in BMS_PACK_CONFIG (0x288)
+    // BMS_CELL_VOLTAGE (0x388) frame layout (confirmed from CAN capture):
+    //   byte 0      : cell index 0..27 (BMS cycles through all cells at ~10 Hz)
+    //   bytes 1-2   : cell voltage, uint16 LE, mV  (e.g. E2 0F → 4066 mV)
+    //   bytes 3-6   : pack voltage, uint32 LE, mV  → dV stored in monolithVoltageDv
+    //   byte 7      : 0x00 padding
     live.monolithVoltageDv = zeroDecoder.voltage(len, buf) / 100;
     if (!live.dataFresh) {
       live.dataFresh   = true;
       live.bms0FirstMs = now;
+    }
+    // Decode rotating cell voltage and update per-cell array + balance
+    if (len >= 3 && buf[0] < 28) {
+      uint8_t  cellIdx = buf[0];
+      uint16_t cellMv  = (uint16_t)buf[1] | ((uint16_t)buf[2] << 8);
+      if (cellMv > 1000 && cellMv < 6000) {  // sanity: 1–6 V per cell
+        live.cellVoltsMv[cellIdx]  = cellMv;
+        live.cellSeenMask         |= (1UL << cellIdx);
+        // Recompute balance (max − min) from all seen cells
+        uint16_t cMin = 0xFFFF, cMax = 0;
+        for (int ci = 0; ci < 28; ci++) {
+          if (live.cellSeenMask & (1UL << ci)) {
+            if (live.cellVoltsMv[ci] < cMin) cMin = live.cellVoltsMv[ci];
+            if (live.cellVoltsMv[ci] > cMax) cMax = live.cellVoltsMv[ci];
+          }
+        }
+        if (cMin != 0xFFFF) live.cellBalanceMv = cMax - cMin;
+      }
     }
   }
   else if (zeroDecoder.hasMonolithAmps(id)) {
@@ -4206,7 +4308,15 @@ void processBikeFrame(const twai_message_t &msg) {
     byte soc = zeroDecoder.stateOfCharge(len, buf);
     if (soc != 255) live.monolithBmsSoc = soc;  // 255 = bad/short frame, keep last good
   }
-  // 0x488 (BMS_PACK_TEMP_DATA) intentionally NOT decoded for temps — see note above.
+  else if (id == 0x488) {
+    // BMS_PACK_TEMP_DATA (0x488) — partial decode (confirmed via ZeroSpy capture):
+    //   byte 1 : BMS board temperature, signed int8, °C  (ZeroSpy: "Controller Temp")
+    //   byte 2 : 0xFE = -2 (second probe, appears disconnected / invalid)
+    //   byte 3 : 0x7F (sentinel/invalid marker)
+    //   Other bytes: rotating index + cell voltage candidate — layout unconfirmed.
+    // We only extract byte 1 (the only confirmed field).
+    if (len >= 2) live.bmsBoardTempC = (int8_t)buf[1];
+  }
 
   // --- PowerTank (BMS1) ---
   else if (zeroDecoder.hasPowerTankVoltage(id)) {
@@ -4676,6 +4786,16 @@ void rampTask(void* /*pvParameters*/) {
   // voltage. See Bugs 1/2 in [project_charging_bugs_2026-04-26.md].
   static unsigned long ccTaperStartMs = 0;
 
+  // VCB voltage-plateau CC→CV trigger — companion to the current-taper trigger.
+  // When the voltage cutback table (VcbON) is actively limiting power AND the
+  // pack is below the voltage ceiling, the current-taper trigger won't fire
+  // (the charger IS delivering all VCB-allowed current; the pack just can't
+  // reach the ceiling physically). Instead watch for the pack voltage to
+  // stabilise within ±VCB_PLATEAU_BAND_DV for VCB_PLATEAU_MS; a stable
+  // voltage under VcbON means the pack has saturated at the VCB knee.
+  static unsigned long voltPlateauStartMs = 0;
+  static long          plateauRefDv       = 0;
+
   // Cycle data logger — record under construction and transition timestamps.
   // All reads/writes are from rampTask only; no mutex needed.
   static CycleRecord   g_cycle    = {};
@@ -4695,6 +4815,9 @@ void rampTask(void* /*pvParameters*/) {
   const float         CC_TAPER_FLOOR_A = 0.5f;
   const float         CC_TAPER_FRAC    = 0.10f;
   const unsigned long CC_TAPER_MS      = 90000UL;   // 90 s sustained low-current
+  // VCB voltage-plateau trigger thresholds (see voltPlateauStartMs above).
+  const long           VCB_PLATEAU_BAND_DV = 5;        // ±0.5 V stability window
+  const unsigned long  VCB_PLATEAU_MS      = 300000UL; // 5 min sustained plateau
 
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(1000)); // 1 s ramp tick
@@ -4724,10 +4847,13 @@ void rampTask(void* /*pvParameters*/) {
     bool justEnabled = enabled && !prevEnabled;
     prevEnabled = enabled;
 
-    // Disabled: reset to CC, stop charger, skip rest of tick
+    // Disabled: reset to CC, stop charger, clear all per-session state, skip tick
     if (!enabled) {
-      phase = PHASE_CC;
-      g_thermalThrottle = false;
+      phase              = PHASE_CC;
+      g_thermalThrottle  = false;
+      ccTaperStartMs     = 0;
+      voltPlateauStartMs = 0;
+      plateauRefDv       = 0;
       if (xSemaphoreTake(chargerMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
         chargerBus.cmdVoltDv = 0;
         chargerBus.cmdAmpsDa = 0;
@@ -4820,6 +4946,40 @@ void rampTask(void* /*pvParameters*/) {
       phase = PHASE_CC;
       LOG("[RAMP] CV→CC: pack dropped to %ld dV (load sag)\n", rawPackDv);
     }
+    // ── Power cutback limits — compute BEFORE taper check ────────────────────
+    // effectiveTarget must be known here so the atRamp gate in the taper
+    // check below can compare current against the VCB-limited ceiling rather
+    // than the user's raw target. Without this, VcbON causes current to be
+    // clamped (e.g. 657 W) while target stays at 9900 W, making atRamp
+    // permanently FALSE and the taper watch never starts.
+    float packAH = (monolithAH > 0) ? (float)monolithAH : 114.0f;
+    float voltV  = (rawPackDv > 0) ? rawPackDv / 10.0f : voltCeiling / 10.0f;
+
+    uint32_t voltCbK  = find_cutback((int)rawPackDv, CUTBACK_AT_OR_ABOVE, VOLTAGE_CUTBACK);
+    uint32_t voltPwrW = (voltCbK == UINT32_MAX) ? UINT32_MAX
+                       : (uint32_t)(voltCbK / 1000.0f * packAH * voltV);
+
+    uint32_t hotCbK   = find_cutback((int)maxTemp,   CUTBACK_AT_OR_ABOVE, HOT_CUTBACK);
+    uint32_t hotPwrW  = (hotCbK  == UINT32_MAX) ? UINT32_MAX
+                       : (uint32_t)(hotCbK  / 1000.0f * packAH * voltV);
+
+    // Effective CC target (cutbacks only apply in CC; CV/DONE ramp current to 0)
+    uint32_t powerLimit = (uint32_t)target;
+    if (phase == PHASE_CC) {
+      if (voltPwrW != UINT32_MAX) powerLimit = min(powerLimit, voltPwrW);
+      if (hotPwrW  != UINT32_MAX) powerLimit = min(powerLimit, hotPwrW);
+    } else {
+      powerLimit = 0; // CV/DONE: ramp CC current display to 0
+    }
+
+    // Update thermal-throttle indicator: true only when the hot cutback is
+    // the active limiter in CC phase (drops the requested target below `target`).
+    g_thermalThrottle = (phase == PHASE_CC) &&
+                        (hotPwrW != UINT32_MAX) &&
+                        (hotPwrW <  (uint32_t)target);
+    uint16_t effectiveTarget = (uint16_t)min(powerLimit, (uint32_t)UINT16_MAX);
+    bool cutbackActive = (phase == PHASE_CC) && (effectiveTarget < target);
+
     // CC → CV : two triggers
     //  (a) **voltage trigger** — pack reached the configured ceiling. This is
     //      the textbook CC/CV transition.
@@ -4827,20 +4987,24 @@ void rampTask(void* /*pvParameters*/) {
     //      (e.g. 100 % preset is 116.4 V but the user's pack physically
     //      tops out at ~115.1 V). Without this we'd stay in CC forever
     //      because the voltage trigger is unreachable. Heuristic: while
-    //      we've ramped up to ≥90 % of the user's setpoint, if measured
-    //      charger amps stay below max(0.5 A, 10 % of expected) for a
-    //      sustained 90 s, the pack isn't accepting more current — call it
-    //      done with CC and drop into CV. (Note: low-target sessions
-    //      already have low expected amps; the floor keeps the trigger
-    //      from firing prematurely on small targets.)
+    //      we've ramped up to ≥90 % of the effective (VCB-limited) setpoint,
+    //      if measured charger amps stay below max(0.5 A, 10 % of expected)
+    //      for a sustained 90 s, the pack isn't accepting more current — call
+    //      it done with CC and drop into CV. (Note: using effectiveTarget not
+    //      target here is critical — when VcbON clamps current below the user
+    //      setpoint, atRamp must compare against the clamped ceiling or it
+    //      stays permanently FALSE.)
     bool ccTriggerVoltage = (phase == PHASE_CC && rawPackDv > 0 &&
                              rawPackDv >= (long)voltCeiling);
 
     bool ccTriggerTaper = false;
     if (phase == PHASE_CC && current > 0 && rawPackDv > 0) {
-      // 90 %-of-target gate ensures we don't sample taper during the
-      // initial ramp-up (when actualA is naturally still climbing).
-      bool atRamp = (current * 10u >= ((uint32_t)target * 9u));
+      // 90 %-of-effective-target gate ensures we don't sample taper during
+      // the initial ramp-up (when actualA is naturally still climbing).
+      // Using effectiveTarget (VCB-limited) not target: when VcbON clamps
+      // current to e.g. 657 W, comparing against 9900 W would always be
+      // FALSE and the taper watch would never start.
+      bool atRamp = (current * 10u >= ((uint32_t)effectiveTarget * 9u));
       if (atRamp) {
         float expectedA  = (float)current / (rawPackDv / 10.0f);
         float threshA    = max(CC_TAPER_FLOOR_A, expectedA * CC_TAPER_FRAC);
@@ -4867,7 +5031,41 @@ void rampTask(void* /*pvParameters*/) {
       ccTaperStartMs = 0;
     }
 
-    if (ccTriggerVoltage || ccTriggerTaper) {
+    // (c) **VCB plateau trigger** — voltage-cutback specific saturation check.
+    //     Current-taper (b) can't detect the case where VcbON is limiting power
+    //     and the pack is accepting all VCB-allowed current but still can't rise
+    //     to the voltage ceiling.  Here we use *voltage stability* instead:
+    //     when the voltage cutback table is the active limiter (not just thermal)
+    //     and the pack is measurably below the ceiling, a ±0.5 V window stable
+    //     for 5 min means the pack has physically saturated at the VCB knee.
+    bool voltCutbackActive = (phase == PHASE_CC) &&
+                             (voltPwrW != UINT32_MAX) &&
+                             (voltPwrW < (uint32_t)target);
+    bool ccTriggerPlateau = false;
+    if (voltCutbackActive && rawPackDv > 0 && rawPackDv < (long)voltCeiling) {
+      if (voltPlateauStartMs == 0) {
+        // First tick with conditions met — start the plateau watch
+        voltPlateauStartMs = now0;
+        plateauRefDv       = rawPackDv;
+        LOG("[RAMP] VCB plateau watch started: pack %ld dV, "
+            "cutback→%u W, ceil %d dV\n",
+            rawPackDv, (unsigned)effectiveTarget, voltCeiling);
+      } else if (labs(rawPackDv - plateauRefDv) > VCB_PLATEAU_BAND_DV) {
+        // Voltage shifted outside the ±0.5 V band — rebase the timer
+        plateauRefDv       = rawPackDv;
+        voltPlateauStartMs = now0;
+      } else if ((now0 - voltPlateauStartMs) >= VCB_PLATEAU_MS) {
+        ccTriggerPlateau = true;
+      }
+    } else {
+      if (voltPlateauStartMs != 0) {
+        LOG("[RAMP] VCB plateau watch cancelled (conditions no longer met)\n");
+      }
+      voltPlateauStartMs = 0;
+      plateauRefDv       = 0;
+    }
+
+    if (ccTriggerVoltage || ccTriggerTaper || ccTriggerPlateau) {
       phase = PHASE_CV;
       cvMs  = millis();
       // CV amps ceiling: at least as generous as last CC command so the charger
@@ -4882,13 +5080,20 @@ void rampTask(void* /*pvParameters*/) {
       if (ccTriggerVoltage) {
         LOG("[RAMP] CC→CV (voltage) @ %ld dV (ceil %d dV), cvAmpsDa=%d/ch\n",
             rawPackDv, voltCeiling, (int)cvAmpsDa);
-      } else {
+      } else if (ccTriggerTaper) {
         LOG("[RAMP] CC→CV (current taper): %lus of %.2fA actual at %dW "
             "commanded, pack at %ld dV (ceil %d dV), cvAmpsDa=%d/ch\n",
             (now0 - ccTaperStartMs) / 1000UL,
             actualA, current, rawPackDv, voltCeiling, (int)cvAmpsDa);
+      } else {
+        LOG("[RAMP] CC→CV (VCB plateau): pack %ld dV stable %lus "
+            "(ceil %d dV, cutback→%u W), cvAmpsDa=%d/ch\n",
+            rawPackDv, (now0 - voltPlateauStartMs) / 1000UL,
+            voltCeiling, (unsigned)effectiveTarget, (int)cvAmpsDa);
       }
-      ccTaperStartMs = 0;
+      ccTaperStartMs     = 0;
+      voltPlateauStartMs = 0;
+      plateauRefDv       = 0;
     }
 
     // ── Cycle data logger — phase-entry hooks ─────────────────────────────────
@@ -4922,36 +5127,8 @@ void rampTask(void* /*pvParameters*/) {
       g_cycle.bulk_min  = (uint16_t)((cvEntryMs - ccEntryMs) / 60000UL);
     }
 
-    // ── Power cutback limits (CC phase only) ──────────────────────────────────
-    float packAH = (monolithAH > 0) ? (float)monolithAH : 114.0f;
-    float voltV  = (rawPackDv > 0) ? rawPackDv / 10.0f : voltCeiling / 10.0f;
-
-    uint32_t voltCbK  = find_cutback((int)rawPackDv, CUTBACK_AT_OR_ABOVE, VOLTAGE_CUTBACK);
-    uint32_t voltPwrW = (voltCbK == UINT32_MAX) ? UINT32_MAX
-                       : (uint32_t)(voltCbK / 1000.0f * packAH * voltV);
-
-    uint32_t hotCbK   = find_cutback((int)maxTemp,   CUTBACK_AT_OR_ABOVE, HOT_CUTBACK);
-    uint32_t hotPwrW  = (hotCbK  == UINT32_MAX) ? UINT32_MAX
-                       : (uint32_t)(hotCbK  / 1000.0f * packAH * voltV);
-
-    // Effective CC target (cutbacks only apply in CC; CV/DONE ramp current to 0)
-    uint32_t powerLimit = (uint32_t)target;
-    if (phase == PHASE_CC) {
-      if (voltPwrW != UINT32_MAX) powerLimit = min(powerLimit, voltPwrW);
-      if (hotPwrW  != UINT32_MAX) powerLimit = min(powerLimit, hotPwrW);
-    } else {
-      powerLimit = 0; // CV/DONE: ramp CC current display to 0
-    }
-
-    // Update thermal-throttle indicator: true only when the hot cutback is
-    // the active limiter in CC phase (drops the requested target below `target`).
-    g_thermalThrottle = (phase == PHASE_CC) &&
-                        (hotPwrW != UINT32_MAX) &&
-                        (hotPwrW <  (uint32_t)target);
-    uint16_t effectiveTarget = (uint16_t)min(powerLimit, (uint32_t)UINT16_MAX);
-
     // ── Ramp step ─────────────────────────────────────────────────────────────
-    bool cutbackActive = (phase == PHASE_CC) && (effectiveTarget < target);
+    // effectiveTarget and cutbackActive already computed above (before taper check).
     if (current < effectiveTarget) {
       current = (uint16_t)min((uint32_t)(current + rampStep), (uint32_t)effectiveTarget);
     } else if (current > effectiveTarget) {
@@ -5660,6 +5837,10 @@ static void mqttPublishDiscovery() {
   mqttDiscoverSensor("eta_minutes",       "Charging Time Remaining", "min", "duration", "measurement");
   // Total charge cycles recorded in the on-device cycle log
   mqttDiscoverSensor("cycle_count",       "Charge Cycles Logged",    "",    "",          "total_increasing");
+  // Cell balance (max − min across all 28 cells, mV). Updates as the BMS rotates through cells.
+  mqttDiscoverSensor("cell_balance_mv",   "Cell Balance",            "mV",  "",          "measurement");
+  // BMS board temperature — byte 1 of 0x488 frame (ZeroSpy: "Controller Temp")
+  mqttDiscoverSensor("bms_board_temp",    "BMS Board Temp",          "\xB0""C", "temperature", "measurement");
 
   LOG("[MQTT] Discovery published\n");
 }
@@ -5953,6 +6134,22 @@ static bool mqttPublishChanges() {
 
   // Cycle count — only changes when a cycle completes or the log is cleared
   PUB_IF_CHANGED_I(cycleCount, "cycle_count", g_cycleCount)
+
+  // Cell balance (max − min across all seen cells). Only publish when we have
+  // data (>0 means at least 2 cells seen) to avoid spamming 0 at boot.
+  if (ls.cellBalanceMv > 0 && ls.cellBalanceMv != mqttLast.cellBalanceMv) {
+    mqttPublishSensorI("cell_balance_mv", (int)ls.cellBalanceMv);
+    mqttLast.cellBalanceMv = ls.cellBalanceMv;
+    published = true;
+  }
+
+  // BMS board temperature. Only publish once a valid reading has arrived
+  // (-128 is the "not yet received" sentinel stored in the LiveData int8).
+  if (ls.bmsBoardTempC != -128 && (int16_t)ls.bmsBoardTempC != mqttLast.bmsBoardTempC) {
+    mqttPublishSensorI("bms_board_temp", (int)ls.bmsBoardTempC);
+    mqttLast.bmsBoardTempC = (int16_t)ls.bmsBoardTempC;
+    published = true;
+  }
 
   #undef PUB_IF_CHANGED_F
   #undef PUB_IF_CHANGED_I
