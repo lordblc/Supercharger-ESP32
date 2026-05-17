@@ -48,7 +48,7 @@
 //   esp_https_server } built into Espressif ESP32 Arduino core - used for HTTPS port-443 serving
 // ==========================================================================
 
-#define VERSION 202605101611
+#define VERSION 202605171034
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -81,6 +81,8 @@
 // CycleRecord struct — must be in a header so Arduino's auto-prototype pass
 // sees the type before it emits the forward declaration for appendCycleRecord().
 #include "cycle_record.h"
+// LoginOutcome / LoginResult — same reason: tryLogin() returns LoginOutcome.
+#include "auth_types.h"
 #include <FFat.h>
 #include <time.h>      // getLocalTime, struct tm — NTP timestamp for cycle records
 
@@ -2093,8 +2095,59 @@ struct AuthSession {
   unsigned long lastUsedMs;
 };
 static const int           MAX_SESSIONS              = 4;
-static const unsigned long SESSION_IDLE_TIMEOUT_MS   = 60UL * 60UL * 6000UL; // 6 h
+static const unsigned long SESSION_IDLE_TIMEOUT_MS   = 6UL * 60UL * 60UL * 1000UL; // 6 h
 static AuthSession         authSessions[MAX_SESSIONS];
+
+// Mutex protecting authSessions[], authFailCount, authHardLocked,
+// hardLockSinceMs, and nextAllowedAttemptMs. Once HTTPS is enabled the same
+// auth state is touched by BOTH the Arduino WebServer task (Core 1) AND the
+// IDF esp_https_server worker thread, so concurrent mutation is real.
+// Created in setup() before any HTTP/HTTPS server starts. Hold for short
+// critical sections only — the table scan is O(MAX_SESSIONS) = trivial.
+static SemaphoreHandle_t authMutex = nullptr;
+
+static inline bool authLock() {
+  // pdMS_TO_TICKS(200) is generous — actual hold time is microseconds. We
+  // accept timeout-failed return rather than block forever to keep the
+  // WebServer responsive in the (impossible) case of a stuck holder.
+  return authMutex && xSemaphoreTake(authMutex, pdMS_TO_TICKS(200)) == pdTRUE;
+}
+static inline void authUnlock() {
+  if (authMutex) xSemaphoreGive(authMutex);
+}
+
+// Standardised response strings for the locked / rate-limited paths so both
+// HTTP and HTTPS handlers say the same thing.
+static const char* AUTH_LOCK_MSG =
+  "Locked: too many failed login attempts.\n\n"
+  "To unlock: hold the BOOT button on the device for 3-5 seconds, "
+  "reboot the device, or wait for the cooldown to expire.\n";
+static const char* AUTH_RATE_LIMIT_MSG =
+  "Too many failed attempts. Please wait and try again.\n";
+
+// LoginOutcome / LoginResult — returned by tryLogin(). Definitions live in
+// auth_types.h to dodge the Arduino IDE 2.x auto-prototype generator (which
+// emits `static LoginOutcome tryLogin(...);` near the top of the file,
+// before any inline struct here would be visible). On OK, `token` carries
+// the freshly-minted 32-hex session token for the Set-Cookie header. On
+// LOCKED / RATE_LIMITED, `retryAfterSec` populates the Retry-After header.
+
+// Format a Set-Cookie value for a session token. `secure` adds the Secure
+// flag (set only when responding over HTTPS).
+static void sessionBuildSetCookie(char* out, size_t outSz,
+                                  const char* token, bool secure) {
+  snprintf(out, outSz,
+           "scs=%s; Path=/; HttpOnly;%s SameSite=Lax; Max-Age=21600",
+           token, secure ? " Secure;" : "");
+}
+// Format a Set-Cookie value for clearing the session (logout). SameSite must
+// match the live cookie (Lax) so the browser pairs them up correctly across
+// versions.
+static void sessionBuildClearCookie(char* out, size_t outSz, bool secure) {
+  snprintf(out, outSz,
+           "scs=; Path=/; HttpOnly;%s SameSite=Lax; Max-Age=0",
+           secure ? " Secure;" : "");
+}
 
 // Returns seconds to wait before the next login attempt is permitted, given
 // how many consecutive failures have already accumulated. Schedule:
@@ -2115,9 +2168,10 @@ static unsigned long authDelaySec(uint8_t fails) {
   }
 }
 
-// Auto-clear hard lock if the cooldown has elapsed. Called lazily before
-// every login decision rather than via a timer task.
-static void hardLockMaybeAutoExpire() {
+// Auto-clear hard lock if the cooldown has elapsed. Internal — caller must
+// hold authMutex. Used by tryLogin() (which already holds the lock) and by
+// the public wrapper below.
+static void hardLockMaybeAutoExpire_nolock() {
   if (!authHardLocked) return;
   if ((millis() - hardLockSinceMs) >= HARD_LOCK_AUTO_CLEAR_MS) {
     authHardLocked       = false;
@@ -2127,12 +2181,47 @@ static void hardLockMaybeAutoExpire() {
   }
 }
 
-// Manual clear path (called from BOOT button handler).
+// Public auto-expire — used by the login-GET handlers to refresh the lock
+// state before rendering the page. Takes the lock internally.
+static void hardLockMaybeAutoExpire() {
+  if (!authLock()) return;
+  hardLockMaybeAutoExpire_nolock();
+  authUnlock();
+}
+
+// Atomic read of "is the hard lock active?" + remaining seconds. Used by the
+// /login GET handlers so the auto-expire + read pair can't race against a
+// concurrent failed-login attempt that just tripped the lock. Internally
+// performs the lazy auto-expire pass so callers don't need to also call
+// hardLockMaybeAutoExpire() first.
+static bool peekLockStatus(unsigned long& remSecOut) {
+  remSecOut = 0;
+  if (!authLock()) return false;
+  hardLockMaybeAutoExpire_nolock();
+  bool locked = authHardLocked;
+  if (locked) {
+    unsigned long lockedForMs = millis() - hardLockSinceMs;
+    unsigned long remMs       = (HARD_LOCK_AUTO_CLEAR_MS > lockedForMs)
+                                  ? (HARD_LOCK_AUTO_CLEAR_MS - lockedForMs) : 0;
+    remSecOut = (remMs + 999UL) / 1000UL;
+  }
+  authUnlock();
+  return locked;
+}
+
+// Manual clear path (called from BOOT button handler). Takes the lock
+// internally — BOOT button runs on the loopTask (Core 1) but the lock
+// protects against any concurrent login attempt that might be mid-mutation.
 static void hardLockManualClear(const char* reason) {
-  if (!authHardLocked && authFailCount == 0 && nextAllowedAttemptMs == 0) return;
+  if (!authLock()) return;
+  if (!authHardLocked && authFailCount == 0 && nextAllowedAttemptMs == 0) {
+    authUnlock();
+    return;
+  }
   authHardLocked       = false;
   authFailCount        = 0;
   nextAllowedAttemptMs = 0;
+  authUnlock();
   LOG("[AUTH] Hard lock + fail counter cleared (%s)\n", reason);
 }
 
@@ -2159,8 +2248,9 @@ static String sessionParseCookieToken() {
   return sessionParseCookieTokenStr(server.header("Cookie"));
 }
 
-// Core session-touch logic — takes a token string directly.
-static bool sessionTouchOrFailToken(const String& token) {
+// Core session-touch logic — takes a token string directly. Internal — caller
+// must hold authMutex. The public wrapper below takes the lock.
+static bool sessionTouchOrFailToken_nolock(const String& token) {
   if (token.length() != 32) return false;
   unsigned long now = millis();
   for (int i = 0; i < MAX_SESSIONS; i++) {
@@ -2178,6 +2268,14 @@ static bool sessionTouchOrFailToken(const String& token) {
   return false;
 }
 
+// Public wrapper — locks authMutex around the table scan.
+static bool sessionTouchOrFailToken(const String& token) {
+  if (!authLock()) return false;
+  bool r = sessionTouchOrFailToken_nolock(token);
+  authUnlock();
+  return r;
+}
+
 // If the request's Cookie maps to a non-expired session slot, refresh its
 // lastUsedMs and return true. Otherwise return false. Also lazily evicts
 // any session it encounters that's already past the idle timeout.
@@ -2191,8 +2289,11 @@ static bool sessionTouchOrFailStr(const String& cookieHeader) {
 }
 
 // Mint a new session — find a free slot, or evict the oldest. Writes the
-// new token into `outToken` (must be ≥33 chars).
-static void sessionMint(char* outToken) {
+// new token into `outToken` (must be ≥33 chars). Internal — caller must
+// hold authMutex (the slot scan and snprintf-into-slot must be atomic to
+// prevent a concurrent sessionTouchOrFailToken_nolock from matching against
+// a half-written token).
+static void sessionMint_nolock(char* outToken) {
   unsigned long now = millis();
   int           slot       = -1;
   unsigned long oldestUsed = ULONG_MAX;
@@ -2208,18 +2309,24 @@ static void sessionMint(char* outToken) {
     slot = oldestSlot;
     LOG("[AUTH] Session table full — evicting oldest slot %d\n", slot);
   }
-  // 16 random bytes → 32 hex chars
+  // Build the token in a local buffer first, then publish atomically to the
+  // slot. Prevents a concurrent reader from seeing a half-written token (we
+  // hold the mutex, but defensive: a future refactor that drops the lock
+  // here won't introduce a subtle TOCTOU).
+  char tmp[33];
   for (int i = 0; i < 16; i++) {
     uint8_t b = (uint8_t)(esp_random() & 0xFF);
-    snprintf(&authSessions[slot].token[i * 2], 3, "%02x", b);
+    snprintf(&tmp[i * 2], 3, "%02x", b);
   }
-  authSessions[slot].token[32] = '\0';
+  tmp[32] = '\0';
   authSessions[slot].lastUsedMs = now;
-  strncpy(outToken, authSessions[slot].token, 33);
+  memcpy(authSessions[slot].token, tmp, 33);  // publishes new token
+  strncpy(outToken, tmp, 33);
 }
 
-// Invalidate the session matching the given token string.
-static void sessionForgetToken(const String& token) {
+// Invalidate the session matching the given token string. Internal — caller
+// must hold authMutex.
+static void sessionForgetToken_nolock(const String& token) {
   if (token.length() != 32) return;
   for (int i = 0; i < MAX_SESSIONS; i++) {
     if (authSessions[i].token[0] != '\0' && token.equals(authSessions[i].token)) {
@@ -2228,6 +2335,13 @@ static void sessionForgetToken(const String& token) {
       return;
     }
   }
+}
+
+// Public wrapper — locks authMutex around the logout-side slot clear.
+static void sessionForgetToken(const String& token) {
+  if (!authLock()) return;
+  sessionForgetToken_nolock(token);
+  authUnlock();
 }
 
 // Invalidate the session matching the WebServer request's cookie (logout path).
@@ -2268,54 +2382,91 @@ static bool authValidNoChallenge() {
   return sessionTouchOrFail();
 }
 
-// Shared helper — mint session, set cookie, redirect to dashboard.
-static void loginSuccess() {
-  if (authFailCount > 0) {
-    LOG("[AUTH] Login OK — clearing fail counter (was %d)\n", (int)authFailCount);
+// tryLogin — shared between the HTTP and HTTPS login handlers. Performs all
+// auth-state checks and mutations atomically under authMutex:
+//   1. lazy-expire any active hard lock
+//   2. reject if still hard-locked
+//   3. reject if within the per-attempt rate-limit window
+//   4. validate credentials
+//   5. on success: clear fail counter, mint session token
+//   6. on failure: increment counter (with overflow guard), trip lock or
+//      schedule next-allowed time with jitter
+//
+// All counter mutations, lock trips, AND token mints happen under one lock
+// acquisition. The caller is just a thin response-dispatcher — see
+// handleLoginPost / httpsHandleLoginPost.
+static LoginOutcome tryLogin(const String& username, const String& password) {
+  LoginOutcome out{};
+  out.result = LOGIN_BAD_CREDS;
+
+  if (!authLock()) {
+    // Mutex timed out — should never happen with healthy tasks. Treat as a
+    // bad-creds response (fail closed) rather than letting the caller assume
+    // success or leak any state.
+    return out;
   }
+
+  hardLockMaybeAutoExpire_nolock();
+
+  if (authHardLocked) {
+    unsigned long lockedForMs = millis() - hardLockSinceMs;
+    unsigned long remMs       = (HARD_LOCK_AUTO_CLEAR_MS > lockedForMs)
+                                  ? (HARD_LOCK_AUTO_CLEAR_MS - lockedForMs) : 0;
+    out.result         = LOGIN_HARD_LOCKED;
+    out.retryAfterSec  = (remMs + 999UL) / 1000UL;
+    authUnlock();
+    return out;
+  }
+
+  unsigned long now = millis();
+  if (authFailCount >= AUTH_GRACE && now < nextAllowedAttemptMs) {
+    out.result         = LOGIN_RATE_LIMITED;
+    out.retryAfterSec  = (nextAllowedAttemptMs - now + 999UL) / 1000UL;
+    authUnlock();
+    return out;
+  }
+
+  // Credential check. These are short Arduino String compares (≪ 1 µs);
+  // safe to hold the mutex across them.
+  bool ok = username.equals(SECRET_OTA_USER) && password.equals(SECRET_OTA_PASS);
+
+  if (!ok) {
+    if (authFailCount < 255) authFailCount++;
+    if (authFailCount >= AUTH_HARD_LOCK_THRESHOLD && !authHardLocked) {
+      authHardLocked  = true;
+      hardLockSinceMs = millis();
+      authUnlock();
+      LOG("[AUTH] HARD LOCK tripped after %d failures — manual unlock required "
+          "(hold BOOT 3-5s, reboot, or wait %lu min)\n",
+          (int)authFailCount, HARD_LOCK_AUTO_CLEAR_MS / 60000UL);
+    } else {
+      unsigned long delaySec = authDelaySec(authFailCount);
+      delaySec += (unsigned long)(esp_random() % 3);  // 0–2 s jitter
+      nextAllowedAttemptMs = millis() + delaySec * 1000UL;
+      uint8_t fc = authFailCount;
+      authUnlock();
+      LOG("[AUTH] Failed login #%d — next attempt allowed in %lu s\n",
+          (int)fc, delaySec);
+    }
+    out.result = LOGIN_BAD_CREDS;
+    return out;
+  }
+
+  // Success — clear fail state and mint session token, still under lock so
+  // a concurrent failed-login attempt can't increment the counter against
+  // this just-succeeded user.
+  uint8_t prevFails = authFailCount;
   authFailCount        = 0;
   nextAllowedAttemptMs = 0;
+  sessionMint_nolock(out.token);
+  authUnlock();
 
-  char token[33];
-  sessionMint(token);
-
-  // Cookie attributes:
-  //  - HttpOnly        — JS can't read it (XSS defense)
-  //  - SameSite=Lax    — sent on top-level GET navigations (bookmarks, tab
-  //                      restore) but NOT on cross-site POST (CSRF safe).
-  //                      Strict was too aggressive: it prevented the cookie
-  //                      arriving on the first request when returning to the
-  //                      dashboard after using other browser tabs, causing
-  //                      spurious "idle logout" on every tab switch / restore.
-  //  - Path=/          — sent on every path
-  //  - Max-Age=21600   — 6 h client-side expiry; matches SESSION_IDLE_TIMEOUT_MS
-  //  - No `Secure`     — plain HTTP on a LAN
-  char cookieHdr[120];
-  snprintf(cookieHdr, sizeof(cookieHdr),
-           "scs=%s; Path=/; HttpOnly; SameSite=Lax; Max-Age=21600", token);
-  server.sendHeader("Set-Cookie", cookieHdr);
-  server.sendHeader("Location",   "/");
-  server.send(302, "text/plain", "");
-  LOG("[AUTH] Login OK — session minted (token suffix ...%s)\n", token + 26);
-}
-
-// HTTPS-path login success: mints session, sets Secure cookie, redirects to /.
-static void loginSuccessCtx(HttpCtx& ctx) {
-  if (authFailCount > 0) {
-    LOG("[AUTH] Login OK (TLS) — clearing fail counter (was %d)\n", (int)authFailCount);
+  if (prevFails > 0) {
+    LOG("[AUTH] Login OK — clearing fail counter (was %d)\n", (int)prevFails);
   }
-  authFailCount        = 0;
-  nextAllowedAttemptMs = 0;
-  char token[33];
-  sessionMint(token);
-  char cookieHdr[140];
-  // Add Secure flag because this path is always HTTPS
-  snprintf(cookieHdr, sizeof(cookieHdr),
-           "scs=%s; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=21600", token);
-  ctx.addRespHdr("Set-Cookie", String(cookieHdr));
-  ctx.addRespHdr("Location",   "/");
-  ctx.send(302, "text/plain", "");
-  LOG("[AUTH] Login OK (TLS) — session minted (...%s)\n", token + 26);
+  LOG("[AUTH] Login OK — session minted (token suffix ...%s)\n", out.token + 26);
+  out.result = LOGIN_OK;
+  return out;
 }
 
 // HTTPS-path auth gate. isApi behaves the same as requireAuth().
@@ -2341,19 +2492,12 @@ void handleLoginGet() {
     return;
   }
 
-  hardLockMaybeAutoExpire();
-
-  if (authHardLocked) {
-    unsigned long lockedForMs = millis() - hardLockSinceMs;
-    unsigned long remMs       = (HARD_LOCK_AUTO_CLEAR_MS > lockedForMs)
-                                  ? (HARD_LOCK_AUTO_CLEAR_MS - lockedForMs) : 0;
+  unsigned long lockRemSec = 0;
+  if (peekLockStatus(lockRemSec)) {
     char retryHdr[16];
-    snprintf(retryHdr, sizeof(retryHdr), "%lu", (remMs + 999UL) / 1000UL);
+    snprintf(retryHdr, sizeof(retryHdr), "%lu", lockRemSec);
     server.sendHeader("Retry-After", retryHdr);
-    server.send(423, "text/plain",
-      "Locked: too many failed login attempts.\n\n"
-      "To unlock: hold the BOOT button on the device for 3-5 seconds, "
-      "reboot the device, or wait for the cooldown to expire.\n");
+    server.send(423, "text/plain", AUTH_LOCK_MSG);
     return;
   }
 
@@ -2365,8 +2509,8 @@ void handleLoginGet() {
   server.send(200, "text/html", buf);
 }
 
-// POST /login — validate form credentials, apply rate-limit + hard-lock,
-// mint a session cookie on success, redirect back to /login?err=1 on failure.
+// POST /login — thin response dispatcher around tryLogin(). All auth-state
+// mutations happen atomically inside tryLogin under authMutex.
 void handleLoginPost() {
   if (sessionTouchOrFail()) {
     server.sendHeader("Location", "/");
@@ -2374,63 +2518,48 @@ void handleLoginPost() {
     return;
   }
 
-  hardLockMaybeAutoExpire();
+  LoginOutcome o = tryLogin(server.arg("username"), server.arg("password"));
+  char retryHdr[16];
+  char cookieHdr[140];
 
-  if (authHardLocked) {
-    unsigned long lockedForMs = millis() - hardLockSinceMs;
-    unsigned long remMs       = (HARD_LOCK_AUTO_CLEAR_MS > lockedForMs)
-                                  ? (HARD_LOCK_AUTO_CLEAR_MS - lockedForMs) : 0;
-    char retryHdr[16];
-    snprintf(retryHdr, sizeof(retryHdr), "%lu", (remMs + 999UL) / 1000UL);
-    server.sendHeader("Retry-After", retryHdr);
-    server.send(423, "text/plain",
-      "Locked: too many failed login attempts.\n\n"
-      "To unlock: hold the BOOT button on the device for 3-5 seconds, "
-      "reboot the device, or wait for the cooldown to expire.\n");
-    return;
+  switch (o.result) {
+    case LOGIN_HARD_LOCKED:
+      snprintf(retryHdr, sizeof(retryHdr), "%lu", o.retryAfterSec);
+      server.sendHeader("Retry-After", retryHdr);
+      server.send(423, "text/plain", AUTH_LOCK_MSG);
+      return;
+
+    case LOGIN_RATE_LIMITED:
+      snprintf(retryHdr, sizeof(retryHdr), "%lu", o.retryAfterSec);
+      server.sendHeader("Retry-After", retryHdr);
+      server.send(429, "text/plain", AUTH_RATE_LIMIT_MSG);
+      return;
+
+    case LOGIN_BAD_CREDS:
+      // Redirect back to the form with an error flag rather than re-serving
+      // the page here — avoids a browser "resubmit form?" warning on refresh.
+      server.sendHeader("Location", "/login?err=1");
+      server.send(303, "text/plain", "");
+      return;
+
+    case LOGIN_OK:
+      // Cookie attributes set by sessionBuildSetCookie:
+      //  - HttpOnly        — JS can't read it (XSS defense)
+      //  - SameSite=Lax    — sent on top-level GET navigations (bookmarks, tab
+      //                      restore) but NOT on cross-site POST (CSRF safe).
+      //                      Strict was too aggressive: it prevented the cookie
+      //                      arriving on the first request when returning to the
+      //                      dashboard after using other browser tabs, causing
+      //                      spurious "idle logout" on every tab switch / restore.
+      //  - Path=/          — sent on every path
+      //  - Max-Age=21600   — 6 h client-side expiry; matches SESSION_IDLE_TIMEOUT_MS
+      //  - No Secure       — plain HTTP on a LAN
+      sessionBuildSetCookie(cookieHdr, sizeof(cookieHdr), o.token, /*secure=*/false);
+      server.sendHeader("Set-Cookie", cookieHdr);
+      server.sendHeader("Location",   "/");
+      server.send(302, "text/plain", "");
+      return;
   }
-
-  // Immediate-reject rate limit — no vTaskDelay, no blocked WebServer task.
-  unsigned long now = millis();
-  if (authFailCount >= AUTH_GRACE && now < nextAllowedAttemptMs) {
-    unsigned long retrySec = (nextAllowedAttemptMs - now + 999UL) / 1000UL;
-    char retryHdr[16];
-    snprintf(retryHdr, sizeof(retryHdr), "%lu", retrySec);
-    server.sendHeader("Retry-After", retryHdr);
-    server.send(429, "text/plain",
-                "Too many failed attempts. Please wait and try again.\n");
-    return;
-  }
-
-  // Validate credentials from form body.
-  bool ok = server.arg("username").equals(SECRET_OTA_USER) &&
-            server.arg("password").equals(SECRET_OTA_PASS);
-
-  if (!ok) {
-    if (authFailCount < 255) authFailCount++;
-
-    if (authFailCount >= AUTH_HARD_LOCK_THRESHOLD && !authHardLocked) {
-      authHardLocked  = true;
-      hardLockSinceMs = millis();
-      LOG("[AUTH] HARD LOCK tripped after %d failures — manual unlock required "
-          "(hold BOOT 3-5s, reboot, or wait %lu min)\n",
-          (int)authFailCount, HARD_LOCK_AUTO_CLEAR_MS / 60000UL);
-    } else {
-      unsigned long delaySec = authDelaySec(authFailCount);
-      delaySec += (unsigned long)(esp_random() % 3);   // 0–2 s jitter
-      nextAllowedAttemptMs = millis() + delaySec * 1000UL;
-      LOG("[AUTH] Failed login #%d — next attempt allowed in %lu s\n",
-          (int)authFailCount, delaySec);
-    }
-
-    // Redirect back to the form with an error flag rather than re-serving
-    // the page here — avoids a browser "resubmit form?" warning on refresh.
-    server.sendHeader("Location", "/login?err=1");
-    server.send(303, "text/plain", "");
-    return;
-  }
-
-  loginSuccess();
 }
 
 // POST /logout — invalidates the current session and clears the cookie.
@@ -2443,7 +2572,13 @@ void handleLogout() {
   // credentials, silently minting a new session and bouncing back to the
   // dashboard.  Serving a page here breaks that loop: the browser shows
   // "logged out" and the user must take a deliberate action to log back in.
-  server.sendHeader("Set-Cookie", "scs=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");
+  // SameSite=Lax matches the live cookie minted at login — some browsers
+  // pair Set-Cookie clears with the matching SameSite attribute, so using
+  // Strict here could leave a stale cookie in the browser. Server-side the
+  // session is already gone (sessionForgetCurrent above).
+  char clearHdr[140];
+  sessionBuildClearCookie(clearHdr, sizeof(clearHdr), /*secure=*/false);
+  server.sendHeader("Set-Cookie", clearHdr);
   server.send(200, "text/html",
     "<!DOCTYPE html><html><head><title>Logged out</title>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -2506,17 +2641,12 @@ static void httpsHandleLoginGet(HttpCtx& ctx) {
     ctx.send(302, "text/plain", "");
     return;
   }
-  hardLockMaybeAutoExpire();
-  if (authHardLocked) {
-    unsigned long lockedForMs = millis() - hardLockSinceMs;
-    unsigned long remMs = (HARD_LOCK_AUTO_CLEAR_MS > lockedForMs)
-                            ? (HARD_LOCK_AUTO_CLEAR_MS - lockedForMs) : 0;
+  unsigned long lockRemSec = 0;
+  if (peekLockStatus(lockRemSec)) {
     char retryHdr[16];
-    snprintf(retryHdr, sizeof(retryHdr), "%lu", (remMs + 999UL) / 1000UL);
+    snprintf(retryHdr, sizeof(retryHdr), "%lu", lockRemSec);
     ctx.addRespHdr("Retry-After", String(retryHdr));
-    ctx.send(423, "text/plain",
-      "Locked: too many failed login attempts.\n\n"
-      "To unlock: hold the BOOT button for 3-5 s, reboot, or wait for cooldown.\n");
+    ctx.send(423, "text/plain", AUTH_LOCK_MSG);
     return;
   }
   const char* errFrag = ctx.hasArg("err")
@@ -2526,51 +2656,54 @@ static void httpsHandleLoginGet(HttpCtx& ctx) {
   ctx.send(200, "text/html", String(buf));
 }
 
-// POST /login (HTTPS)
+// POST /login (HTTPS) — uses the same tryLogin() helper as the HTTP path.
+// Only differences from handleLoginPost: ctx.* instead of server.*, and the
+// Secure flag on the cookie because the response is always HTTPS.
 static void httpsHandleLoginPost(HttpCtx& ctx) {
   if (sessionTouchOrFailStr(ctx.header("Cookie"))) {
     ctx.addRespHdr("Location", "/");
     ctx.send(302, "text/plain", "");
     return;
   }
-  hardLockMaybeAutoExpire();
-  if (authHardLocked) {
-    ctx.send(423, "text/plain", "Locked: too many failed login attempts.\n");
-    return;
+
+  LoginOutcome o = tryLogin(ctx.arg("username"), ctx.arg("password"));
+  char retryHdr[16];
+  char cookieHdr[160];
+
+  switch (o.result) {
+    case LOGIN_HARD_LOCKED:
+      snprintf(retryHdr, sizeof(retryHdr), "%lu", o.retryAfterSec);
+      ctx.addRespHdr("Retry-After", String(retryHdr));
+      ctx.send(423, "text/plain", AUTH_LOCK_MSG);
+      return;
+
+    case LOGIN_RATE_LIMITED:
+      snprintf(retryHdr, sizeof(retryHdr), "%lu", o.retryAfterSec);
+      ctx.addRespHdr("Retry-After", String(retryHdr));
+      ctx.send(429, "text/plain", AUTH_RATE_LIMIT_MSG);
+      return;
+
+    case LOGIN_BAD_CREDS:
+      ctx.addRespHdr("Location", "/login?err=1");
+      ctx.send(303, "text/plain", "");
+      return;
+
+    case LOGIN_OK:
+      sessionBuildSetCookie(cookieHdr, sizeof(cookieHdr), o.token, /*secure=*/true);
+      ctx.addRespHdr("Set-Cookie", String(cookieHdr));
+      ctx.addRespHdr("Location",   "/");
+      ctx.send(302, "text/plain", "");
+      return;
   }
-  unsigned long now = millis();
-  if (nextAllowedAttemptMs && (now < nextAllowedAttemptMs)) {
-    unsigned long retryMs = nextAllowedAttemptMs - now;
-    char retryHdr[16];
-    snprintf(retryHdr, sizeof(retryHdr), "%lu", (retryMs + 999UL) / 1000UL);
-    ctx.addRespHdr("Retry-After", String(retryHdr));
-    ctx.send(429, "text/plain", "Too many login attempts. Try again later.\n");
-    return;
-  }
-  bool ok = ctx.arg("username").equals(SECRET_OTA_USER) &&
-            ctx.arg("password").equals(SECRET_OTA_PASS);
-  if (!ok) {
-    authFailCount++;
-    LOG("[AUTH] TLS login fail #%d\n", (int)authFailCount);
-    if (authFailCount >= AUTH_HARD_LOCK_THRESHOLD) {
-      authHardLocked    = true;
-      hardLockSinceMs   = millis();
-      LOG("[AUTH] Hard lock engaged (TLS) after %d failures\n", (int)authFailCount);
-    } else if (authFailCount > AUTH_GRACE) {
-      uint32_t delay_ms = (1UL << min((int)(authFailCount - AUTH_GRACE), 10)) * 1000UL;
-      nextAllowedAttemptMs = millis() + delay_ms;
-    }
-    ctx.addRespHdr("Location", "/login?err=1");
-    ctx.send(303, "text/plain", "");
-    return;
-  }
-  loginSuccessCtx(ctx);
 }
 
 // POST /logout (HTTPS)
 static void httpsHandleLogout(HttpCtx& ctx) {
   sessionForgetStr(ctx.header("Cookie"));
-  ctx.addRespHdr("Set-Cookie", "scs=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0");
+  // SameSite=Lax matches the live cookie — see note in handleLogout.
+  char clearHdr[160];
+  sessionBuildClearCookie(clearHdr, sizeof(clearHdr), /*secure=*/true);
+  ctx.addRespHdr("Set-Cookie", String(clearHdr));
   ctx.send(200, "text/html",
     "<!DOCTYPE html><html><head><title>Logged out</title>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -2669,16 +2802,37 @@ static void handleApiTlsPost(HttpCtx& ctx) {
   if (doc.containsKey("cert") && doc.containsKey("key")) {
     const char* cert = doc["cert"] | "";
     const char* key  = doc["key"]  | "";
-    if (strlen(cert) < 64 || strstr(cert, "-----BEGIN CERTIFICATE-----") == nullptr) {
-      if (ctx.isWS) server.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid cert PEM\"}");
-      else ctx.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid cert PEM\"}");
+    size_t certLen = strlen(cert);
+    size_t keyLen  = strlen(key);
+    // NVS string values cap around 4000 bytes — reject above 4096 explicitly
+    // rather than letting putString() fail silently mid-write (which can
+    // leave the namespace in an indeterminate state).
+    const size_t PEM_MIN = 64;
+    const size_t PEM_MAX = 4096;
+    auto reject = [&](const char* msg) {
+      if (ctx.isWS) server.send(400, "application/json", msg);
+      else          ctx.send  (400, "application/json", msg);
+    };
+    if (certLen < PEM_MIN || certLen > PEM_MAX ||
+        strstr(cert, "-----BEGIN CERTIFICATE-----") == nullptr) {
+      reject("{\"ok\":false,\"error\":\"Invalid cert PEM (need BEGIN CERTIFICATE marker, 64-4096 bytes)\"}");
+      return;
+    }
+    // Private-key marker — accept PKCS#1 (BEGIN RSA PRIVATE KEY), PKCS#8
+    // (BEGIN PRIVATE KEY), SEC1 EC (BEGIN EC PRIVATE KEY), and the rare
+    // ENCRYPTED PRIVATE KEY form. All carry the suffix " PRIVATE KEY-----"
+    // after a "-----BEGIN " prefix.
+    if (keyLen < PEM_MIN || keyLen > PEM_MAX ||
+        strstr(key, "-----BEGIN ")        == nullptr ||
+        strstr(key, " PRIVATE KEY-----")  == nullptr) {
+      reject("{\"ok\":false,\"error\":\"Invalid key PEM (need BEGIN ... PRIVATE KEY marker, 64-4096 bytes)\"}");
       return;
     }
     preferences.putString("tls_cert", cert);
     preferences.putString("tls_key",  key);
     changed = true;
     LOG("[TLS] Cert+key stored in NVS (%u / %u bytes)\n",
-        (unsigned)strlen(cert), (unsigned)strlen(key));
+        (unsigned)certLen, (unsigned)keyLen);
   }
   if (doc.containsKey("enabled")) {
     bool en = doc["enabled"] | false;
@@ -3666,6 +3820,11 @@ void checkBootButton() {
       // after too many failed login attempts. Note: only takes effect on
       // release, so a press that grows past 5 s into AP-reset territory
       // wins instead. Sessions persist; only the lock + fail counter clear.
+      // Benign lock-free peek: if the values are mid-transition we'll either
+      // call hardLockManualClear() needlessly (it re-checks under the lock
+      // and returns early) or log "nothing to clear" one cycle late. Both
+      // are harmless — the real mutation is in hardLockManualClear which
+      // takes authMutex internally.
       if (authHardLocked || authFailCount > 0) {
         hardLockManualClear("BOOT button held 3-5s");
       } else {
@@ -3912,6 +4071,16 @@ void setup() {
 
   logBegin(115200);
   LOG("\n[BOOT] Supercharger firmware %lld\n", (long long)VERSION);
+
+  // authMutex protects authSessions[], authFailCount, authHardLocked,
+  // hardLockSinceMs, nextAllowedAttemptMs. Must exist BEFORE any HTTP or
+  // HTTPS handler can run — both call into the session helpers, which
+  // assume the mutex is available.
+  authMutex = xSemaphoreCreateMutex();
+  if (authMutex == nullptr) {
+    LOG("[BOOT] Failed to create authMutex — halting\n");
+    while (true) { delay(1000); }
+  }
 
   // BOOT button (GPIO 0). Strapping pin — safe to configure as input AFTER
   // boot completes. Internal pullup is enough; the button shorts to GND.
