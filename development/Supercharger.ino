@@ -48,7 +48,7 @@
 //   esp_https_server } built into Espressif ESP32 Arduino core - used for HTTPS port-443 serving
 // ==========================================================================
 
-#define VERSION 202605171034
+#define VERSION 202605171312
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -237,6 +237,13 @@ struct LiveData {
   // BMS board temperature — 0x488 byte 1 (signed °C).
   // ZeroSpy labels this "Controller Temp". -128 = not yet received.
   int8_t   bmsBoardTempC    = -128;
+
+  // Per-cell average voltage — 0x488 bytes 6-7 (uint16 LE, mV).
+  // Tracks pack_voltage / 28 within ±2 mV in practice (confirmed from a full
+  // 100% charge capture); BMS likely computes it independently rather than
+  // exposing the raw arithmetic mean. Useful as a single "cell health" number
+  // alongside cellBalanceMv. 0 = not yet received.
+  uint16_t cellAvgMv        = 0;
 
   // PowerTank (BMS1)
   long  powerTankVoltageDv  = 0;
@@ -557,6 +564,7 @@ struct MqttSnapshot {
   uint16_t cycleCount        = 65535;   // 65535 = sentinel, forces first publish
   uint16_t cellBalanceMv     = 65535;   // sentinel, forces first publish
   int16_t  bmsBoardTempC     = -256;    // sentinel (outside int8 range), forces first publish
+  uint16_t cellAvgMv         = 65535;   // sentinel, forces first publish
 } mqttLast;
 
 // MQTT transport — both a plaintext and a TLS client live in BSS so we can
@@ -1194,6 +1202,8 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
       <span class="val" id="mT">—</span></div>
     <div class="card"><div class="label">Cell Balance <span style="font-size:0.7em;color:#888;font-weight:normal">max&#8722;min</span></div>
       <span class="val" id="mCellBal">—</span></div>
+    <div class="card"><div class="label">Cell Avg <span style="font-size:0.7em;color:#888;font-weight:normal">BMS</span></div>
+      <span class="val" id="mCellAvg">—</span></div>
     <div class="card"><div class="label">BMS Temp</div>
       <span class="val" id="mBmsTemp">—</span></div>
   </div>
@@ -1580,6 +1590,11 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
           var bmsEl = document.getElementById('mBmsTemp');
           bmsEl.textContent = (d.bms_board_temp !== undefined && d.bms_board_temp !== -128)
             ? (d.bms_board_temp + ' \u00B0C') : '\u2014';
+
+          // Cell average voltage from BMS (0x488 bytes 6-7) \u2014 shown in V with 3 decimals
+          var avgEl = document.getElementById('mCellAvg');
+          avgEl.textContent = (d.cell_avg_mv !== undefined && d.cell_avg_mv > 0)
+            ? ((d.cell_avg_mv / 1000).toFixed(3) + ' V') : '\u2014';
 
           // SOC card
           var soc = d.monolith_soc !== undefined ? d.monolith_soc : null;
@@ -3478,12 +3493,13 @@ static String buildApiStatusJson() {
     response += entry;
     first = false;
   }
-  // Append cell balance and BMS board temp then close the object
-  char cellBuf[80];
+  // Append cell balance, BMS board temp, and per-cell avg then close the object
+  char cellBuf[100];
   snprintf(cellBuf, sizeof(cellBuf),
-    "],\"cell_balance_mv\":%u,\"bms_board_temp\":%d}",
+    "],\"cell_balance_mv\":%u,\"bms_board_temp\":%d,\"cell_avg_mv\":%u}",
     (unsigned)liveSnap.cellBalanceMv,
-    (int)liveSnap.bmsBoardTempC);
+    (int)liveSnap.bmsBoardTempC,
+    (unsigned)liveSnap.cellAvgMv);
   response += cellBuf;
   return response;
 }
@@ -4478,13 +4494,24 @@ void processBikeFrame(const twai_message_t &msg) {
     if (soc != 255) live.monolithBmsSoc = soc;  // 255 = bad/short frame, keep last good
   }
   else if (id == 0x488) {
-    // BMS_PACK_TEMP_DATA (0x488) — partial decode (confirmed via ZeroSpy capture):
-    //   byte 1 : BMS board temperature, signed int8, °C  (ZeroSpy: "Controller Temp")
-    //   byte 2 : 0xFE = -2 (second probe, appears disconnected / invalid)
-    //   byte 3 : 0x7F (sentinel/invalid marker)
-    //   Other bytes: rotating index + cell voltage candidate — layout unconfirmed.
-    // We only extract byte 1 (the only confirmed field).
+    // BMS_PACK_TEMP_DATA (0x488) — partial decode (confirmed via captures):
+    //   byte 0     : rotating counter 0..7
+    //   byte 1     : BMS board temperature, signed int8, °C
+    //                (ZeroSpy: "Controller Temp")
+    //   bytes 2-3  : usually 0x7FFE sentinel; otherwise descending counter.
+    //                Hypothesis: time-to-full estimate. Unconfirmed.
+    //   byte 4     : small rotating index 0..0x20 — cell index candidate but
+    //                range exceeds 27. Unconfirmed.
+    //   byte 5     : always 0x00 (padding/reserved)
+    //   bytes 6-7  : uint16 LE, mV → per-cell average voltage. Tracks
+    //                pack_voltage / 28 to within ±2 mV across an entire
+    //                100 % charge capture. Confirmed.
     if (len >= 2) live.bmsBoardTempC = (int8_t)buf[1];
+    if (len >= 8) {
+      uint16_t avgMv = (uint16_t)buf[6] | ((uint16_t)buf[7] << 8);
+      // Sanity-gate the same range as the 0x388 cell decode
+      if (avgMv > 1000 && avgMv < 6000) live.cellAvgMv = avgMv;
+    }
   }
 
   // --- PowerTank (BMS1) ---
@@ -4944,6 +4971,13 @@ void rampTask(void* /*pvParameters*/) {
   static RampPhase phase      = PHASE_CC;
   static unsigned long cvMs   = 0;   // millis() when CV phase was entered
   static uint16_t cvAmpsDa    = 0;   // per-charger amps ceiling during CV
+  // CV target voltage — set at CC→CV transition, used by both the charger
+  // command and the load-sag (CV→CC) detector. For voltage-triggered CV
+  // this is the ceiling. For taper- or plateau-triggered CV this is the
+  // ACTUAL pack voltage at transition time (the pack can't be pushed
+  // higher under VCB, so commanding the ceiling would immediately trip
+  // the load-sag detector and bounce back to CC). 0 = not in CV / unset.
+  static uint16_t cvTargetDv  = 0;
   static bool prevEnabled     = false; // for rising-edge detection on `enabled`
   // Current-taper CC→CV trigger: when the chargers can't push more current
   // into the pack despite us commanding power (because the pack has hit its
@@ -5023,6 +5057,7 @@ void rampTask(void* /*pvParameters*/) {
       ccTaperStartMs     = 0;
       voltPlateauStartMs = 0;
       plateauRefDv       = 0;
+      cvTargetDv         = 0;
       if (xSemaphoreTake(chargerMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
         chargerBus.cmdVoltDv = 0;
         chargerBus.cmdAmpsDa = 0;
@@ -5109,11 +5144,17 @@ void rampTask(void* /*pvParameters*/) {
       LOG("[RAMP] DONE→CC: pack at %ld dV ≤ floor %ld dV (ceil %d dV)\n",
           rawPackDv, doneReengageDv, voltCeiling);
     }
-    // CV → CC : voltage sag under load (bike in use) — re-enter CC to top up
+    // CV → CC : voltage sag under load (bike in use) — re-enter CC to top up.
+    // Compare against cvTargetDv, NOT voltCeiling: for taper- and plateau-
+    // triggered CV the pack is already below voltCeiling at transition time,
+    // so comparing against voltCeiling would immediately re-fire CV→CC every
+    // tick (the 100 % preset oscillation bug fixed v202605171800).
+    long cvSagFloor = (cvTargetDv > 0) ? (long)cvTargetDv : (long)voltCeiling;
     if (phase == PHASE_CV && rawPackDv > 0 &&
-        rawPackDv < (long)(voltCeiling - hyst)) {
+        rawPackDv < (cvSagFloor - hyst)) {
       phase = PHASE_CC;
-      LOG("[RAMP] CV→CC: pack dropped to %ld dV (load sag)\n", rawPackDv);
+      LOG("[RAMP] CV→CC: pack dropped to %ld dV (load sag, CV target %ld dV)\n",
+          rawPackDv, cvSagFloor);
     }
     // ── Power cutback limits — compute BEFORE taper check ────────────────────
     // effectiveTarget must be known here so the atRamp gate in the taper
@@ -5246,19 +5287,35 @@ void rampTask(void* /*pvParameters*/) {
       float  cvMaxPerCh   = (float)monolithAH * 0.2f / nChargers; // C/5
       cvAmpsDa = (uint16_t)(max(ccAmpsPerCh, cvMaxPerCh) * 10.0f);
       cvAmpsDa = max(cvAmpsDa, (uint16_t)10); // floor 1 A/charger
+      // CV target voltage:
+      //   - voltage trigger: pack reached the ceiling → hold at the ceiling
+      //   - taper / plateau:  pack saturated below ceiling under VCB →
+      //                       hold at the achievable plateau voltage so the
+      //                       load-sag detector doesn't immediately fire and
+      //                       the chargers don't fight an unreachable target.
       if (ccTriggerVoltage) {
-        LOG("[RAMP] CC→CV (voltage) @ %ld dV (ceil %d dV), cvAmpsDa=%d/ch\n",
-            rawPackDv, voltCeiling, (int)cvAmpsDa);
+        cvTargetDv = voltCeiling;
+      } else {
+        // clampedDv == min(rawPackDv, voltCeiling); under VCB rawPackDv < ceiling
+        cvTargetDv = (uint16_t)clampedDv;
+      }
+      if (ccTriggerVoltage) {
+        LOG("[RAMP] CC→CV (voltage) @ %ld dV (ceil %d dV), "
+            "cvTarget=%u dV, cvAmpsDa=%d/ch\n",
+            rawPackDv, voltCeiling, (unsigned)cvTargetDv, (int)cvAmpsDa);
       } else if (ccTriggerTaper) {
         LOG("[RAMP] CC→CV (current taper): %lus of %.2fA actual at %dW "
-            "commanded, pack at %ld dV (ceil %d dV), cvAmpsDa=%d/ch\n",
+            "commanded, pack at %ld dV (ceil %d dV), "
+            "cvTarget=%u dV, cvAmpsDa=%d/ch\n",
             (now0 - ccTaperStartMs) / 1000UL,
-            actualA, current, rawPackDv, voltCeiling, (int)cvAmpsDa);
+            actualA, current, rawPackDv, voltCeiling,
+            (unsigned)cvTargetDv, (int)cvAmpsDa);
       } else {
         LOG("[RAMP] CC→CV (VCB plateau): pack %ld dV stable %lus "
-            "(ceil %d dV, cutback→%u W), cvAmpsDa=%d/ch\n",
+            "(ceil %d dV, cutback→%u W), cvTarget=%u dV, cvAmpsDa=%d/ch\n",
             rawPackDv, (now0 - voltPlateauStartMs) / 1000UL,
-            voltCeiling, (unsigned)effectiveTarget, (int)cvAmpsDa);
+            voltCeiling, (unsigned)effectiveTarget,
+            (unsigned)cvTargetDv, (int)cvAmpsDa);
       }
       ccTaperStartMs     = 0;
       voltPlateauStartMs = 0;
@@ -5371,9 +5428,13 @@ void rampTask(void* /*pvParameters*/) {
           sessionAddCC(cvPwrW / 3600.0f, actualA / 3600.0f);
         }
 
-        // Keep charger alive in CV mode
+        // Keep charger alive in CV mode. Command cvTargetDv (the achievable
+        // plateau for taper/plateau-triggered CV, or the ceiling for voltage-
+        // triggered CV) — NOT voltCeiling unconditionally. Commanding an
+        // unreachable voltage and immediately bouncing back to CC is what the
+        // 100 %-preset oscillation looked like prior to v202605171800.
         if (phase == PHASE_CV && chargersPresent && packDv > 0) {
-          chargerBus.cmdVoltDv = voltCeiling;
+          chargerBus.cmdVoltDv = (cvTargetDv > 0) ? cvTargetDv : voltCeiling;
           chargerBus.cmdAmpsDa = cvAmpsDa;
           chargerBus.cmdStart  = true;
         } else {
@@ -5381,6 +5442,8 @@ void rampTask(void* /*pvParameters*/) {
           chargerBus.cmdVoltDv = 0;
           chargerBus.cmdAmpsDa = 0;
           chargerBus.cmdStart  = false;
+          // Clear CV target so a future cycle starts fresh
+          if (phase == PHASE_DONE) cvTargetDv = 0;
         }
       } else {
         // CC phase: start when current > 0 and pack is known; DONE: current == 0 stops it
@@ -6010,6 +6073,8 @@ static void mqttPublishDiscovery() {
   mqttDiscoverSensor("cell_balance_mv",   "Cell Balance",            "mV",  "",          "measurement");
   // BMS board temperature — byte 1 of 0x488 frame (ZeroSpy: "Controller Temp")
   mqttDiscoverSensor("bms_board_temp",    "BMS Board Temp",          "\xB0""C", "temperature", "measurement");
+  // Per-cell average voltage — bytes 6-7 of 0x488 (uint16 LE, mV). Tracks pack_v/28.
+  mqttDiscoverSensor("cell_avg_mv",       "Cell Average Voltage",    "mV",  "voltage",    "measurement");
 
   LOG("[MQTT] Discovery published\n");
 }
@@ -6317,6 +6382,13 @@ static bool mqttPublishChanges() {
   if (ls.bmsBoardTempC != -128 && (int16_t)ls.bmsBoardTempC != mqttLast.bmsBoardTempC) {
     mqttPublishSensorI("bms_board_temp", (int)ls.bmsBoardTempC);
     mqttLast.bmsBoardTempC = (int16_t)ls.bmsBoardTempC;
+    published = true;
+  }
+
+  // Per-cell average voltage (0x488 b[6-7]). Only publish once valid (>0).
+  if (ls.cellAvgMv > 0 && ls.cellAvgMv != mqttLast.cellAvgMv) {
+    mqttPublishSensorI("cell_avg_mv", (int)ls.cellAvgMv);
+    mqttLast.cellAvgMv = ls.cellAvgMv;
     published = true;
   }
 
