@@ -48,13 +48,24 @@
 //   esp_https_server } built into Espressif ESP32 Arduino core - used for HTTPS port-443 serving
 // ==========================================================================
 
-#define VERSION 202605171312
+#define VERSION 202605221633
 
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include <arduino_secrets.h>
+// Fixed AP-mode IP defines are optional — guard so a build host whose
+// arduino_secrets.h predates this feature still compiles. Empty = disabled.
+#ifndef SECRET_AP_IP
+  #define SECRET_AP_IP ""
+#endif
+#ifndef SECRET_AP_GATEWAY
+  #define SECRET_AP_GATEWAY ""
+#endif
+#ifndef SECRET_AP_SUBNET
+  #define SECRET_AP_SUBNET ""
+#endif
 #include "supercharger.h"
 #include "battery_tables.h"
 #include "ZERO.h"
@@ -583,6 +594,17 @@ static char              mqttHostname[32] = "supercharger";
 // Written by /api/settings POST handler; read by startAPMode() and mqttTask().
 static char     apSSID[33]         = "Supercharger";
 static char     apPass[65]         = "12345678";
+
+// Fixed AP-mode IP — optional override of the ESP32 default 192.168.4.1.
+// When enabled, WiFi.softAPConfig() is called before WiFi.softAP() so AP mode
+// serves the dashboard at a chosen fixed IP (lets one iOS home-screen shortcut
+// work both at home and in AP mode). Strings hold dotted-quad IPv4 — 15 chars
+// max + NUL. Loaded from NVS at boot, falling back to SECRET_AP_* defines.
+static bool     apStaticIpEnabled  = false;
+static char     apStaticIp[16]     = "";
+static char     apStaticGateway[16]= "";
+static char     apStaticSubnet[16] = "";
+
 static char     mqttHost[64]       = "";
 static uint16_t mqttPort           = 1883;
 static char     mqttUser[33]       = "";
@@ -676,6 +698,8 @@ const char HTML_LOGIN[] PROGMEM =
   "border-radius:6px;font-size:1rem;cursor:pointer;font-weight:bold}"
   "button:hover{background:#c73652}"
   ".err{color:#e94560;font-size:.9rem;text-align:center;margin:0}"
+  ".rem{display:flex;align-items:center;gap:8px;cursor:pointer;font-size:.85rem;color:#aaa}"
+  ".rem input{width:auto}"
   "</style></head><body>"
   "<h1>&#9889; Supercharger</h1>"
   "<form method='POST' action='/login' autocomplete='on'>"
@@ -683,6 +707,8 @@ const char HTML_LOGIN[] PROGMEM =
   "<input id='u' name='username' type='text' autocomplete='username' required>"
   "<label for='p'>Password</label>"
   "<input id='p' name='password' type='password' autocomplete='current-password' required>"
+  "<label class='rem'><input type='checkbox' name='remember' value='1' checked>"
+  "<span>Keep me signed in on this device</span></label>"
   "%s"   // error fragment — empty string or <p class='err'>…</p>
   "<button type='submit'>Log in</button>"
   "</form></body></html>";
@@ -744,6 +770,21 @@ const char HTML_SETTINGS[] PROGMEM = R"rawliteral(
     <input type="text" id="apSSID" placeholder="Supercharger">
     <label>AP Password</label>
     <input type="password" id="apPass" placeholder="Min 8 characters">
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:14px">
+      <input type="checkbox" id="apStaticEn" onchange="onApStaticToggle()">
+      <span>Use a fixed AP IP address</span>
+    </label>
+    <div id="apStaticWrap" style="display:none;margin-top:8px">
+      <label>AP IP Address</label>
+      <input type="text" id="apStaticIp" placeholder="192.168.1.50">
+      <label>Gateway</label>
+      <input type="text" id="apStaticGw" placeholder="192.168.1.1">
+      <label>Subnet Mask</label>
+      <input type="text" id="apStaticSn" placeholder="255.255.255.0">
+      <div class="hint">AP mode normally serves the dashboard at 192.168.4.1.
+        Set a fixed IP that mirrors your home network so one iOS home-screen
+        shortcut works both at home and on the road. Applies on next reboot.</div>
+    </div>
     <button onclick="saveAP()">Save AP Settings</button>
     <div class="hint">Used when WiFi is unavailable. Name and password for the local hotspot.</div>
   </div>
@@ -905,6 +946,11 @@ const char HTML_SETTINGS[] PROGMEM = R"rawliteral(
       if (d.ap_pass_set) {
         document.getElementById('apPass').placeholder = '(unchanged — leave blank to keep)';
       }
+      document.getElementById('apStaticEn').checked = !!d.ap_static_en;
+      document.getElementById('apStaticIp').value   = d.ap_ip || '';
+      document.getElementById('apStaticGw').value   = d.ap_gw || '';
+      document.getElementById('apStaticSn').value   = d.ap_sn || '';
+      onApStaticToggle();
       document.getElementById('ccCount').value    = d.charger_count || 3;
       document.getElementById('rampRate').value   = d.ramp_rate_wps || 50;
       document.getElementById('defChgEnabled').checked     = !!d.charging_enabled_default;
@@ -974,6 +1020,10 @@ const char HTML_SETTINGS[] PROGMEM = R"rawliteral(
       if (!ssid) { showMsg('SSID cannot be empty', false); return; }
       postSettings({wifi_ssid: ssid, wifi_pass: pass}, 'WiFi saved — restarting...', true);
     }
+    function onApStaticToggle() {
+      var on = document.getElementById('apStaticEn').checked;
+      document.getElementById('apStaticWrap').style.display = on ? 'block' : 'none';
+    }
     function saveAP() {
       var ssid = document.getElementById('apSSID').value.trim();
       var pass = document.getElementById('apPass').value;
@@ -981,6 +1031,20 @@ const char HTML_SETTINGS[] PROGMEM = R"rawliteral(
       if (pass.length > 0 && pass.length < 8) { showMsg('AP password must be 8+ characters', false); return; }
       var data = {ap_ssid: ssid};
       if (pass.length > 0) data.ap_pass = pass; // only send if user entered a new password
+      // Fixed AP IP. Always send the three fields so toggling off then on
+      // again keeps the typed values; only validate them when enabling.
+      var apEn = document.getElementById('apStaticEn').checked;
+      var aip  = document.getElementById('apStaticIp').value.trim();
+      var agw  = document.getElementById('apStaticGw').value.trim();
+      var asn  = document.getElementById('apStaticSn').value.trim();
+      if (apEn) {
+        var ipRe = /^(\d{1,3}\.){3}\d{1,3}$/;
+        if (!ipRe.test(aip)) { showMsg('AP IP address looks invalid', false); return; }
+        if (!ipRe.test(agw)) { showMsg('Gateway looks invalid', false); return; }
+        if (!ipRe.test(asn)) { showMsg('Subnet mask looks invalid', false); return; }
+      }
+      data.ap_static_en = apEn;
+      data.ap_ip = aip; data.ap_gw = agw; data.ap_sn = asn;
       postSettings(data, 'AP settings saved', false);
     }
     function saveMQTT() {
@@ -2060,11 +2124,14 @@ void sseFlush() {
 //
 // 1. **Session cookie** (`scs=<32-hex>`): on a successful login, the server
 //    mints a random 16-byte token, stores it in a small in-memory table,
-//    and returns it as `Set-Cookie: scs=...; HttpOnly; SameSite=Strict`.
+//    and returns it as `Set-Cookie: scs=...; HttpOnly; SameSite=Lax`.
 //    Subsequent requests just look up the cookie in the table. No Digest,
 //    no rate-limit logic, no delay — the dashboard's 2 s polling is cheap.
-//    Token table is RAM-only: a reboot invalidates every session, which is
-//    deliberate (clean state on every reset). Idle timeout 6 h.
+//    Ordinary sessions are RAM-only with a 6 h idle timeout. When the user
+//    ticks "keep me signed in", the session is flagged `persistent`: it is
+//    mirrored to NVS (key `auth_sess`) so it survives the reboot that
+//    happens every time the chargers are power-cycled, and it has no idle
+//    timeout — it lives until logout, table eviction, or factory reset.
 //
 // 2. **Immediate-reject rate limit** on POST /login only: failed attempts
 //    increment a counter and set `nextAllowedAttemptMs`. A subsequent
@@ -2104,14 +2171,27 @@ static bool          authHardLocked            = false;
 static unsigned long hardLockSinceMs           = 0;
 static const unsigned long HARD_LOCK_AUTO_CLEAR_MS = 15UL * 60UL * 1000UL;
 
-// Session store — fixed-size, RAM-only, never persisted
+// Session store — fixed-size RAM table. Slots flagged `persistent` are ALSO
+// mirrored to NVS so they survive a reboot (the controller cold-boots every
+// time the chargers are powered on). Non-persistent slots behave as before:
+// RAM-only, 6 h idle timeout.
 struct AuthSession {
   char          token[33];     // 32 hex + NUL; token[0]=='\0' → slot free
   unsigned long lastUsedMs;
+  bool          persistent;    // true → "keep me signed in": NVS-backed, no idle expiry
 };
 static const int           MAX_SESSIONS              = 4;
 static const unsigned long SESSION_IDLE_TIMEOUT_MS   = 6UL * 60UL * 60UL * 1000UL; // 6 h
 static AuthSession         authSessions[MAX_SESSIONS];
+
+// Set-Cookie Max-Age values. Short = ordinary login (6 h, matches the RAM
+// idle timeout). Long = "keep me signed in" (30 days). HttpOnly server-set
+// cookies are not subject to Safari ITP's 7-day script-cookie cap, so the
+// 30-day value sticks for the iOS home-screen shortcut.
+static const long SESSION_COOKIE_MAXAGE_SHORT = 21600L;     // 6 h
+static const long SESSION_COOKIE_MAXAGE_LONG  = 2592000L;   // 30 days
+// NVS key holding the comma-joined list of persistent session tokens.
+static const char* NVS_KEY_AUTH_SESS = "auth_sess";
 
 // Mutex protecting authSessions[], authFailCount, authHardLocked,
 // hardLockSinceMs, and nextAllowedAttemptMs. Once HTTPS is enabled the same
@@ -2148,12 +2228,14 @@ static const char* AUTH_RATE_LIMIT_MSG =
 // LOCKED / RATE_LIMITED, `retryAfterSec` populates the Retry-After header.
 
 // Format a Set-Cookie value for a session token. `secure` adds the Secure
-// flag (set only when responding over HTTPS).
-static void sessionBuildSetCookie(char* out, size_t outSz,
-                                  const char* token, bool secure) {
+// flag (set only when responding over HTTPS). `maxAgeSec` is the cookie
+// lifetime — SESSION_COOKIE_MAXAGE_SHORT for an ordinary login or
+// SESSION_COOKIE_MAXAGE_LONG when "keep me signed in" was ticked.
+static void sessionBuildSetCookie(char* out, size_t outSz, const char* token,
+                                  bool secure, long maxAgeSec) {
   snprintf(out, outSz,
-           "scs=%s; Path=/; HttpOnly;%s SameSite=Lax; Max-Age=21600",
-           token, secure ? " Secure;" : "");
+           "scs=%s; Path=/; HttpOnly;%s SameSite=Lax; Max-Age=%ld",
+           token, secure ? " Secure;" : "", maxAgeSec);
 }
 // Format a Set-Cookie value for clearing the session (logout). SameSite must
 // match the live cookie (Lax) so the browser pairs them up correctly across
@@ -2270,8 +2352,10 @@ static bool sessionTouchOrFailToken_nolock(const String& token) {
   unsigned long now = millis();
   for (int i = 0; i < MAX_SESSIONS; i++) {
     if (authSessions[i].token[0] == '\0') continue;
-    // Lazy expiry sweep
-    if ((now - authSessions[i].lastUsedMs) > SESSION_IDLE_TIMEOUT_MS) {
+    // Lazy expiry sweep — persistent ("keep me signed in") sessions never
+    // idle-expire; they live until logout, eviction, or factory reset.
+    if (!authSessions[i].persistent &&
+        (now - authSessions[i].lastUsedMs) > SESSION_IDLE_TIMEOUT_MS) {
       authSessions[i].token[0] = '\0';
       continue;
     }
@@ -2303,26 +2387,33 @@ static bool sessionTouchOrFailStr(const String& cookieHeader) {
   return sessionTouchOrFailToken(sessionParseCookieTokenStr(cookieHeader));
 }
 
-// Mint a new session — find a free slot, or evict the oldest. Writes the
-// new token into `outToken` (must be ≥33 chars). Internal — caller must
-// hold authMutex (the slot scan and snprintf-into-slot must be atomic to
-// prevent a concurrent sessionTouchOrFailToken_nolock from matching against
-// a half-written token).
-static void sessionMint_nolock(char* outToken) {
+// Mint a new session — find a free slot, or evict. Writes the new token into
+// `outToken` (must be ≥33 chars) and flags the slot `persistent`. Internal —
+// caller must hold authMutex (the slot scan and snprintf-into-slot must be
+// atomic to prevent a concurrent sessionTouchOrFailToken_nolock from matching
+// against a half-written token).
+//
+// Eviction prefers the oldest NON-persistent slot, so a "keep me signed in"
+// device isn't silently kicked out by an ordinary login on another device.
+// Only if every slot is persistent does it evict the oldest persistent one.
+static void sessionMint_nolock(char* outToken, bool persistent) {
   unsigned long now = millis();
-  int           slot       = -1;
-  unsigned long oldestUsed = ULONG_MAX;
-  int           oldestSlot = 0;
+  int           slot         = -1;
+  unsigned long oldestAny    = ULONG_MAX;  int oldestAnySlot = 0;
+  unsigned long oldestNp     = ULONG_MAX;  int oldestNpSlot  = -1;
   for (int i = 0; i < MAX_SESSIONS; i++) {
     if (authSessions[i].token[0] == '\0') { slot = i; break; }
-    if (authSessions[i].lastUsedMs < oldestUsed) {
-      oldestUsed = authSessions[i].lastUsedMs;
-      oldestSlot = i;
+    if (authSessions[i].lastUsedMs < oldestAny) {
+      oldestAny = authSessions[i].lastUsedMs; oldestAnySlot = i;
+    }
+    if (!authSessions[i].persistent && authSessions[i].lastUsedMs < oldestNp) {
+      oldestNp = authSessions[i].lastUsedMs; oldestNpSlot = i;
     }
   }
   if (slot < 0) {
-    slot = oldestSlot;
-    LOG("[AUTH] Session table full — evicting oldest slot %d\n", slot);
+    slot = (oldestNpSlot >= 0) ? oldestNpSlot : oldestAnySlot;
+    LOG("[AUTH] Session table full — evicting slot %d (%s)\n",
+        slot, (oldestNpSlot >= 0) ? "non-persistent" : "oldest persistent");
   }
   // Build the token in a local buffer first, then publish atomically to the
   // slot. Prevents a concurrent reader from seeing a half-written token (we
@@ -2335,8 +2426,49 @@ static void sessionMint_nolock(char* outToken) {
   }
   tmp[32] = '\0';
   authSessions[slot].lastUsedMs = now;
+  authSessions[slot].persistent = persistent;
   memcpy(authSessions[slot].token, tmp, 33);  // publishes new token
   strncpy(outToken, tmp, 33);
+}
+
+// Write every persistent session token to NVS as one comma-joined blob.
+// Internal — caller must hold authMutex. Called after any mint or after a
+// persistent slot is cleared, so the NVS copy always matches the RAM table.
+// NVS putString() de-dups identical writes, so a redundant call is cheap.
+static void sessionsPersistToNvs_nolock() {
+  String blob;
+  for (int i = 0; i < MAX_SESSIONS; i++) {
+    if (authSessions[i].token[0] != '\0' && authSessions[i].persistent) {
+      if (blob.length()) blob += ',';
+      blob += authSessions[i].token;
+    }
+  }
+  preferences.putString(NVS_KEY_AUTH_SESS, blob);
+}
+
+// Restore persistent session tokens from NVS into the RAM table. Called once
+// from setup() before any server task starts — single-threaded, so no lock.
+static void sessionsLoadFromNvs() {
+  String blob = preferences.getString(NVS_KEY_AUTH_SESS, "");
+  if (blob.length() == 0) return;
+  unsigned long now = millis();
+  int slot = 0, start = 0;
+  while (start < (int)blob.length() && slot < MAX_SESSIONS) {
+    int comma = blob.indexOf(',', start);
+    if (comma < 0) comma = blob.length();
+    String tok = blob.substring(start, comma);
+    tok.trim();
+    if (tok.length() == 32) {
+      strncpy(authSessions[slot].token, tok.c_str(), 33);
+      authSessions[slot].token[32] = '\0';
+      authSessions[slot].lastUsedMs = now;
+      authSessions[slot].persistent = true;
+      slot++;
+    }
+    start = comma + 1;
+  }
+  if (slot > 0)
+    LOG("[AUTH] Restored %d persistent session(s) from NVS\n", slot);
 }
 
 // Invalidate the session matching the given token string. Internal — caller
@@ -2345,8 +2477,12 @@ static void sessionForgetToken_nolock(const String& token) {
   if (token.length() != 32) return;
   for (int i = 0; i < MAX_SESSIONS; i++) {
     if (authSessions[i].token[0] != '\0' && token.equals(authSessions[i].token)) {
-      authSessions[i].token[0] = '\0';
+      bool wasPersistent = authSessions[i].persistent;
+      authSessions[i].token[0]   = '\0';
+      authSessions[i].persistent = false;
       LOG("[AUTH] Session slot %d invalidated by logout\n", i);
+      // Drop it from the NVS copy too, so it doesn't come back on reboot.
+      if (wasPersistent) sessionsPersistToNvs_nolock();
       return;
     }
   }
@@ -2410,7 +2546,8 @@ static bool authValidNoChallenge() {
 // All counter mutations, lock trips, AND token mints happen under one lock
 // acquisition. The caller is just a thin response-dispatcher — see
 // handleLoginPost / httpsHandleLoginPost.
-static LoginOutcome tryLogin(const String& username, const String& password) {
+static LoginOutcome tryLogin(const String& username, const String& password,
+                             bool remember) {
   LoginOutcome out{};
   out.result = LOGIN_BAD_CREDS;
 
@@ -2473,13 +2610,18 @@ static LoginOutcome tryLogin(const String& username, const String& password) {
   uint8_t prevFails = authFailCount;
   authFailCount        = 0;
   nextAllowedAttemptMs = 0;
-  sessionMint_nolock(out.token);
+  sessionMint_nolock(out.token, remember);
+  // Always re-sync NVS after a mint: writes the persistent set if `remember`,
+  // and also catches the case where minting evicted a persistent slot.
+  // putString() de-dups identical blobs so a no-op call costs nothing.
+  sessionsPersistToNvs_nolock();
   authUnlock();
 
   if (prevFails > 0) {
     LOG("[AUTH] Login OK — clearing fail counter (was %d)\n", (int)prevFails);
   }
-  LOG("[AUTH] Login OK — session minted (token suffix ...%s)\n", out.token + 26);
+  LOG("[AUTH] Login OK — session minted (token ...%s, %s)\n",
+      out.token + 26, remember ? "persistent" : "6 h");
   out.result = LOGIN_OK;
   return out;
 }
@@ -2533,7 +2675,9 @@ void handleLoginPost() {
     return;
   }
 
-  LoginOutcome o = tryLogin(server.arg("username"), server.arg("password"));
+  // The "remember" checkbox only appears in the POST body when ticked.
+  bool remember  = server.hasArg("remember");
+  LoginOutcome o = tryLogin(server.arg("username"), server.arg("password"), remember);
   char retryHdr[16];
   char cookieHdr[140];
 
@@ -2559,17 +2703,16 @@ void handleLoginPost() {
 
     case LOGIN_OK:
       // Cookie attributes set by sessionBuildSetCookie:
-      //  - HttpOnly        — JS can't read it (XSS defense)
-      //  - SameSite=Lax    — sent on top-level GET navigations (bookmarks, tab
-      //                      restore) but NOT on cross-site POST (CSRF safe).
-      //                      Strict was too aggressive: it prevented the cookie
-      //                      arriving on the first request when returning to the
-      //                      dashboard after using other browser tabs, causing
-      //                      spurious "idle logout" on every tab switch / restore.
-      //  - Path=/          — sent on every path
-      //  - Max-Age=21600   — 6 h client-side expiry; matches SESSION_IDLE_TIMEOUT_MS
-      //  - No Secure       — plain HTTP on a LAN
-      sessionBuildSetCookie(cookieHdr, sizeof(cookieHdr), o.token, /*secure=*/false);
+      //  - HttpOnly      — JS can't read it (XSS defense)
+      //  - SameSite=Lax  — sent on top-level GET navigations (bookmarks, tab
+      //                    restore, iOS home-screen shortcut) but NOT on
+      //                    cross-site POST (CSRF safe).
+      //  - Path=/        — sent on every path
+      //  - Max-Age       — 30 days when "keep me signed in" was ticked
+      //                    (session is NVS-backed, survives reboot), else 6 h
+      //  - No Secure     — plain HTTP on a LAN
+      sessionBuildSetCookie(cookieHdr, sizeof(cookieHdr), o.token, /*secure=*/false,
+        remember ? SESSION_COOKIE_MAXAGE_LONG : SESSION_COOKIE_MAXAGE_SHORT);
       server.sendHeader("Set-Cookie", cookieHdr);
       server.sendHeader("Location",   "/");
       server.send(302, "text/plain", "");
@@ -2681,7 +2824,8 @@ static void httpsHandleLoginPost(HttpCtx& ctx) {
     return;
   }
 
-  LoginOutcome o = tryLogin(ctx.arg("username"), ctx.arg("password"));
+  bool remember  = ctx.hasArg("remember");
+  LoginOutcome o = tryLogin(ctx.arg("username"), ctx.arg("password"), remember);
   char retryHdr[16];
   char cookieHdr[160];
 
@@ -2704,7 +2848,8 @@ static void httpsHandleLoginPost(HttpCtx& ctx) {
       return;
 
     case LOGIN_OK:
-      sessionBuildSetCookie(cookieHdr, sizeof(cookieHdr), o.token, /*secure=*/true);
+      sessionBuildSetCookie(cookieHdr, sizeof(cookieHdr), o.token, /*secure=*/true,
+        remember ? SESSION_COOKIE_MAXAGE_LONG : SESSION_COOKIE_MAXAGE_SHORT);
       ctx.addRespHdr("Set-Cookie", String(cookieHdr));
       ctx.addRespHdr("Location",   "/");
       ctx.send(302, "text/plain", "");
@@ -3047,9 +3192,10 @@ static String buildApiSettingsJson() {
   // TLS cert presence (for HTTPS section in settings UI)
   bool   tlsCertSet = preferences.getString("tls_cert", "").length() > 0;
 
-  char buf[920];
+  char buf[1100];
   snprintf(buf, sizeof(buf),
     "{\"ap_mode\":%s,\"wifi_ssid\":\"%s\",\"ap_ssid\":\"%s\",\"ap_pass_set\":%s,"
+    "\"ap_static_en\":%s,\"ap_ip\":\"%s\",\"ap_gw\":\"%s\",\"ap_sn\":\"%s\","
     "\"mqtt_host\":\"%s\",\"mqtt_port\":%d,\"mqtt_user\":\"%s\","
     "\"mqtt_tls\":%s,\"mqtt_ca_set\":%s,\"mqtt_ca_bytes\":%u,"
     "\"charger_count\":%d,\"ramp_rate_wps\":%d,"
@@ -3058,6 +3204,8 @@ static String buildApiSettingsJson() {
     "\"https_enabled\":%s,\"https_cert_set\":%s}",
     apIsBroadcasting() ? "true" : "false",
     jSsid.c_str(), jAps.c_str(), hasApPass ? "true" : "false",
+    apStaticIpEnabled ? "true" : "false",
+    apStaticIp, apStaticGateway, apStaticSubnet,
     jMh.c_str(), (int)mqttPort, jMu.c_str(),
     mqttTls ? "true" : "false", caSet ? "true" : "false", (unsigned)caBytes,
     (int)cc, (int)ctrl.rampStepW,
@@ -3152,6 +3300,43 @@ static String applyApiSettingsBody(const String& body) {
       apPass[sizeof(apPass) - 1] = '\0';
     }
     LOG("[SETTINGS] AP credentials saved: \"%s\"\n", apSSID);
+  }
+
+  // Fixed AP-mode IP. ap_static_en gates the feature; ap_ip/ap_gw/ap_sn are
+  // always persisted (even when disabled) so toggling off then on again keeps
+  // the user's typed values. IP strings are only parse-validated when the
+  // feature is being enabled.
+  if (doc.containsKey("ap_static_en")) {
+    bool        apEn = doc["ap_static_en"] | false;
+    const char* aip  = doc["ap_ip"] | "";
+    const char* agw  = doc["ap_gw"] | "";
+    const char* asn  = doc["ap_sn"] | "";
+    if (apEn) {
+      IPAddress t;
+      if (!t.fromString(aip))
+        return "{\"ok\":false,\"error\":\"AP IP address invalid\"}";
+      if (!t.fromString(agw))
+        return "{\"ok\":false,\"error\":\"AP gateway invalid\"}";
+      if (!t.fromString(asn))
+        return "{\"ok\":false,\"error\":\"AP subnet mask invalid\"}";
+    }
+    char tip[16], tgw[16], tsn[16];
+    err = copyChecked(aip, tip, sizeof(tip), "ap_ip");  if (err.length()) return err;
+    err = copyChecked(agw, tgw, sizeof(tgw), "ap_gw");  if (err.length()) return err;
+    err = copyChecked(asn, tsn, sizeof(tsn), "ap_sn");  if (err.length()) return err;
+    preferences.putBool("ap_ip_en", apEn);
+    preferences.putString("ap_ip", tip);
+    preferences.putString("ap_gw", tgw);
+    preferences.putString("ap_sn", tsn);
+    apStaticIpEnabled = apEn;
+    strncpy(apStaticIp,      tip, sizeof(apStaticIp) - 1);
+    apStaticIp[sizeof(apStaticIp) - 1] = '\0';
+    strncpy(apStaticGateway, tgw, sizeof(apStaticGateway) - 1);
+    apStaticGateway[sizeof(apStaticGateway) - 1] = '\0';
+    strncpy(apStaticSubnet,  tsn, sizeof(apStaticSubnet) - 1);
+    apStaticSubnet[sizeof(apStaticSubnet) - 1] = '\0';
+    LOG("[SETTINGS] AP fixed IP %s: %s gw %s mask %s\n",
+        apEn ? "enabled" : "disabled", tip, tgw, tsn);
   }
 
   // MQTT settings.
@@ -3876,11 +4061,33 @@ static void startMdns() {
   }
 }
 
+// Apply the fixed SoftAP IP configuration if enabled and valid. MUST be called
+// before WiFi.softAP(). When disabled, or any of the three stored strings
+// don't parse as IPv4, does nothing — the ESP32 default (192.168.4.1) stands.
+static void applyApStaticIp() {
+  if (!apStaticIpEnabled) return;
+  IPAddress ip, gw, sn;
+  if (!ip.fromString(apStaticIp) ||
+      !gw.fromString(apStaticGateway) ||
+      !sn.fromString(apStaticSubnet)) {
+    LOG("[AP] Fixed IP config invalid (%s / %s / %s) — using default\n",
+        apStaticIp, apStaticGateway, apStaticSubnet);
+    return;
+  }
+  if (WiFi.softAPConfig(ip, gw, sn)) {
+    LOG("[AP] Fixed SoftAP IP %s (gw %s, mask %s)\n",
+        apStaticIp, apStaticGateway, apStaticSubnet);
+  } else {
+    LOG("[AP] softAPConfig() rejected %s — using default\n", apStaticIp);
+  }
+}
+
 void startAPMode() {
   WiFi.disconnect(true);
   // Hostname must be set BEFORE softAP() so it goes into the AP DHCP server's
   // client-name advertisement (clients that join the AP see this name).
   WiFi.softAPsetHostname(MDNS_HOSTNAME);
+  applyApStaticIp();  // softAPConfig() — must precede softAP()
   WiFi.softAP(apSSID, apPass);
   LOG("[AP] Started \"%s\" — IP: %s\n", apSSID, WiFi.softAPIP().toString().c_str());
   startMdns();
@@ -3933,6 +4140,7 @@ void enterApRetrying() {
   WiFi.disconnect(true);
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAPsetHostname(MDNS_HOSTNAME);
+  applyApStaticIp();  // softAPConfig() — must precede softAP()
   WiFi.softAP(apSSID, apPass);
   WiFi.setHostname(MDNS_HOSTNAME);
   WiFi.setAutoReconnect(true);
@@ -4106,6 +4314,10 @@ void setup() {
   String savedSSID = preferences.getString("ssid", "");
   String savedPass = preferences.getString("pass", "");
 
+  // Restore "keep me signed in" sessions from NVS into the RAM session table.
+  // Safe to do unlocked — setup() is single-threaded, no server task running.
+  sessionsLoadFromNvs();
+
   // Load persistent charger count (default 3 if not set)
   uint8_t savedCC = (uint8_t)preferences.getUChar("charger_count", 3);
   if (savedCC >= 1 && savedCC <= 4) ctrl.chargerCount = savedCC;
@@ -4129,6 +4341,30 @@ void setup() {
       apPass[sizeof(apPass) - 1] = '\0';
     }
     LOG("[BOOT] AP: \"%s\"\n", apSSID);
+  }
+
+  // Load fixed AP-mode IP config: NVS first, then SECRET_AP_* compile-time
+  // fallback. A non-empty SECRET_AP_IP is itself the opt-in (enabled=true).
+  // The Settings page (NVS) always overrides the compile-time values.
+  {
+    String ip = preferences.getString("ap_ip", "");
+    String gw = preferences.getString("ap_gw", "");
+    String sn = preferences.getString("ap_sn", "");
+    bool   en = preferences.getBool("ap_ip_en", false);
+    if (ip.length() == 0 && strlen(SECRET_AP_IP) > 0) {
+      // Nothing saved via Settings — fall back to arduino_secrets.h
+      ip = SECRET_AP_IP;
+      gw = SECRET_AP_GATEWAY;
+      sn = SECRET_AP_SUBNET;
+      en = true;   // defining SECRET_AP_IP enables the feature
+    }
+    ip.toCharArray(apStaticIp,      sizeof(apStaticIp));
+    gw.toCharArray(apStaticGateway, sizeof(apStaticGateway));
+    sn.toCharArray(apStaticSubnet,  sizeof(apStaticSubnet));
+    apStaticIpEnabled = en;
+    if (apStaticIpEnabled)
+      LOG("[BOOT] AP fixed IP: %s gw %s mask %s\n",
+          apStaticIp, apStaticGateway, apStaticSubnet);
   }
 
   // Load MQTT settings from NVS, fallback to secrets
@@ -5053,11 +5289,23 @@ void rampTask(void* /*pvParameters*/) {
     // Disabled: reset to CC, stop charger, clear all per-session state, skip tick
     if (!enabled) {
       phase              = PHASE_CC;
+      g_rampPhase        = (uint8_t)PHASE_CC;  // keep dashboard/MQTT phase in sync
       g_thermalThrottle  = false;
       ccTaperStartMs     = 0;
       voltPlateauStartMs = 0;
       plateauRefDv       = 0;
       cvTargetDv         = 0;
+      // Zero the commanded power. The ramp task owns currentPowerW, so its
+      // disabled branch is the authoritative place to clear it — this covers
+      // EVERY disable path (dashboard button, MQTT, auto-disable when the
+      // chargers vanish, boot-default re-apply after an auto-enable), not just
+      // the two command handlers that also happen to zero it. Without this a
+      // stale ramped value (e.g. 800 W) lingers in the "Current" readout and
+      // the current_power_w MQTT sensor while charging is OFF.
+      if (xSemaphoreTake(controlMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        ctrl.currentPowerW = 0;
+        xSemaphoreGive(controlMutex);
+      }
       if (xSemaphoreTake(chargerMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
         chargerBus.cmdVoltDv = 0;
         chargerBus.cmdAmpsDa = 0;
@@ -6295,7 +6543,24 @@ static bool mqttPublishChanges() {
 
   // Charging control state
   PUB_IF_CHANGED_I(chargerCount,  "charger_count",   ks.chargerCount)
-  PUB_IF_CHANGED_I(currentPowerW, "current_power_w", ks.currentPowerW)
+  // Charging power. In CC (Bulk) the commanded ramp value is the useful
+  // figure. In CV (Absorption) that value ramps to 0 — the controller stops
+  // commanding current and the pack simply draws what it will — so publishing
+  // it makes HA's "Charging Power" read 0 W while the charger is still
+  // delivering. Mirror the dashboard: in absorption publish the actual pack
+  // power, V×|I|, summed across monolith + PowerTank.
+  {
+    int dispPowerW;
+    if (g_rampPhase == 1) {  // 1 = absorption / CV
+      float p = fabsf((float)ls.monolithAmps) * (ls.monolithVoltageDv / 10.0f);
+      if (ls.powerTankPresent)
+        p += fabsf((float)ls.powerTankAmps) * (ls.powerTankVoltageDv / 10.0f);
+      dispPowerW = (int)(p + 0.5f);
+    } else {
+      dispPowerW = ks.currentPowerW;
+    }
+    PUB_IF_CHANGED_I(currentPowerW, "current_power_w", dispPowerW)
+  }
   PUB_IF_CHANGED_I(targetPowerW,  "target_power_w",  ks.targetPowerW)
   PUB_IF_CHANGED_I(rampStepW,     "ramp_rate_wps",   ks.rampStepW)
   PUB_IF_CHANGED_F(targetVoltDv,  "target_volt_v",   ks.targetVoltDv / 10.0f, 1)

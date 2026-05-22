@@ -84,6 +84,22 @@ If the saved network is gone (moved house, router changed, etc), the controller 
 
 If the old network is still around and you want to force setup mode anyway, hold the **BOOT** button on the controller for 5 seconds (see the next section). This wipes the saved WiFi credentials and reboots straight into AP mode.
 
+### Fixed AP IP Address (optional)
+
+By default the dashboard lives at **192.168.4.1** in AP mode but at a different, router-assigned address on home WiFi. If you've saved the dashboard as an "app" on your phone's home screen (see the iOS shortcut tip under *Logging In*), that shortcut is pinned to one address — so it only works on one of the two networks.
+
+The **fixed AP IP** option solves this: it makes AP mode serve the dashboard at an IP you choose, so you can point it at the same address your home network gives the controller. One home-screen shortcut then works everywhere.
+
+To set it up: **Settings → Access Point → "Use a fixed AP IP address"**. Tick the box and enter:
+
+- **AP IP Address** — the address the dashboard should answer on (e.g. the address your home router reserves for the controller)
+- **Gateway** — usually your home router's IP
+- **Subnet Mask** — almost always `255.255.255.0`
+
+Save, then reboot for it to take effect. When the box is unticked, AP mode uses the standard `192.168.4.1`.
+
+Builders can also bake this in at compile time via `SECRET_AP_IP` / `SECRET_AP_GATEWAY` / `SECRET_AP_SUBNET` in `arduino_secrets.h` — see the builder section. The Settings page always overrides the compiled-in values.
+
 ### Using the Controller Without Home WiFi
 
 The controller works fine without internet. It'll sit in AP mode and you can use the dashboard by connecting straight to the AP (default **Supercharger**). Everything local still works:
@@ -133,7 +149,18 @@ The dashboard is password protected. On first visit your browser shows a login f
 
 The login form works with your browser's built-in password manager — save the credentials once and it auto-fills on every return visit.
 
-After a successful login the controller sets a session cookie that is valid for **6 hours of idle time**. While the dashboard tab is open and polling, the session stays alive indefinitely. The cookie is set with `SameSite=Lax` so it arrives correctly when you return via a bookmark or a restored browser tab. The cookie is cleared when you click **Logout** (top of the dashboard), or when the session expires from 6 hours of inactivity.
+### Keep me signed in
+
+The login form has a **"Keep me signed in on this device"** checkbox, ticked by default. It controls how long the controller remembers you:
+
+- **Ticked** — the session lasts **30 days** and, importantly, **survives a reboot**. The controller cold-boots every time you power the chargers on, so without this your login would be forgotten between every charge session. With it ticked, the controller saves the session to its internal flash and you stay logged in across power cycles. This is what you want for an iOS home-screen shortcut — open the "app" and it's just there, no login prompt.
+- **Unticked** — the session lasts **6 hours of idle time** and is **cleared on any reboot**. Use this on a shared or untrusted device.
+
+Either way the session is cleared when you click **Logout** (top of the dashboard). To revoke *all* remembered devices at once — e.g. if a phone is lost — do a factory reset (hold BOOT 10 s+), which wipes all saved sessions along with the rest of the configuration.
+
+While a dashboard tab is open and polling, the session stays alive regardless of the setting.
+
+> **iOS home-screen "app" tip:** open the dashboard in Safari, tap Share → *Add to Home Screen*. You get an app-like icon that opens the dashboard full-screen. Pair it with "Keep me signed in" and the **fixed AP IP** option (see *WiFi Setup*) and the shortcut works the same whether you're at home or charging on the road.
 
 ### Login rate limiting and lock-out
 
@@ -312,6 +339,8 @@ Set the SSID and password for the home WiFi network the controller should join. 
 
 The name and password for the controller's own hotspot, used when home WiFi is unavailable. Minimum 8 characters for the password. The built-in default is `Supercharger` / `12345678` — change this if the device will be used in shared spaces.
 
+**Use a fixed AP IP address** — tick this to make AP mode serve the dashboard at a specific IP instead of the default `192.168.4.1`. Enter the **AP IP Address**, **Gateway**, and **Subnet Mask** (usually `255.255.255.0`). The point is to mirror your home network so a single iOS home-screen shortcut works in both AP mode and on home WiFi — see *Fixed AP IP Address* under WiFi Setup. The change applies on the next reboot. Leave the box unticked to keep `192.168.4.1`.
+
 ### MQTT Broker
 
 Configure the broker address, port, username, and password for Home Assistant integration. TLS (SSL) can be enabled — if you enable it you must also paste the broker's CA certificate (PEM format) into the text area that appears. Saving reconnects the MQTT client immediately without a reboot.
@@ -459,7 +488,13 @@ If you're compiling this yourself, you have to set credentials in `arduino_secre
 
 #define SECRET_OTA_USER         "your-ota-username"
 #define SECRET_OTA_PASS         "your-ota-password"
+
+#define SECRET_AP_IP            ""   // fixed AP-mode IP, e.g. "192.168.1.50" (optional)
+#define SECRET_AP_GATEWAY       ""   // e.g. "192.168.1.1"
+#define SECRET_AP_SUBNET        ""   // e.g. "255.255.255.0"
 ```
+
+These three `SECRET_AP_*` lines are optional — if your copy of `arduino_secrets.h` predates this feature and doesn't have them, the firmware still compiles (they default to empty).
 
 ### Requirements
 
@@ -481,6 +516,18 @@ The full priority order for the AP credentials is:
 The point is to let a builder ship a unit with a stronger out-of-the-box AP password than `12345678`, without having to walk a new owner through the Settings page on first boot. If you don't care, just leave `SECRET_SSID` blank and you'll get the built-in defaults.
 
 The same 8-character minimum applies to `SECRET_PASS` as to any WiFi password — that's an ESP32 limitation.
+
+### Compile-time Fixed AP IP (`SECRET_AP_IP` / `SECRET_AP_GATEWAY` / `SECRET_AP_SUBNET`)
+
+These bake in a fixed AP-mode IP at compile time (see *Fixed AP IP Address* under WiFi Setup for what the feature does). Defining a non-empty `SECRET_AP_IP` automatically enables the feature; all three must be valid dotted-quad strings. Leave all three `""` to keep the default `192.168.4.1`.
+
+Priority order, same idea as the AP credentials:
+
+1. **NVS** — whatever was last saved via the **Settings** page (highest priority).
+2. **`SECRET_AP_*`** — compile-time defaults from `arduino_secrets.h`.
+3. **Built-in default** — `192.168.4.1`.
+
+If you've never touched the Settings page fields, the compile-time values are used. The moment you save the Access Point settings from the dashboard, the NVS values take over.
 
 ---
 
@@ -524,7 +571,7 @@ With MQTT credentials set, the controller auto publishes HA discovery topics und
 | `monolith_ah_avail` | Ah | Available capacity right now: nominal pack AH × current SoC. Tracks "how much charge is actually in the pack" rather than the constant nameplate value. Republishes when it changes by ≥0.5 Ah |
 | `powertank_v` / `powertank_a` | V / A | PowerTank pack voltage and current (only published while a PowerTank is detected) |
 | `powertank_tmin` / `powertank_tmax` | °C | PowerTank min/max cell temperature |
-| `current_power_w` | W | Actual charging power right now |
+| `current_power_w` | W | Actual charging power right now. In Bulk this is the commanded power; in Absorption it switches to the real pack power (V×current) since the commanded value tapers to zero there |
 | `session_wh` / `session_ah` | Wh / Ah | Energy and charge delivered since the last session reset |
 | `target_preset_pct` | % | Active preset percentage (`70`, `80`, `90`, `100`, or `0` if a non-preset custom voltage is set) |
 | `thermal_throttle` | — | `"true"` while the hot-cutback is reducing charging power, `"false"` otherwise. Use as a binary template sensor for HA notifications |
