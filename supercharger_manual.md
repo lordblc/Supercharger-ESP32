@@ -130,7 +130,7 @@ This is the one to remember. Four hold patterns are recognised:
 | --- | --- | --- |
 | **< 1 s** | Nothing | Ignored — prevents accidental triggers from packaging knocks. |
 | **1 – 3 s** | Nothing (logged) | Logged to serial/SSE but no action taken. |
-| **3 – 5 s** | Clear auth lock | If the dashboard login is hard-locked (5 failed password attempts), this clears the lock and the fail counter so the login page becomes responsive again. Has no effect if the lock is not currently active. |
+| **3 – 5 s** | Clear auth lock | If the dashboard login is hard-locked (5 failed password attempts from a device), this clears the lock and the fail counter **for every device** so the login page becomes responsive again. Has no effect if no lock is currently active. |
 | **5 – 10 s** | Clear WiFi & restart into AP mode | Wipes saved WiFi SSID/password only. AP credentials, MQTT settings, charger count, ramp rate, target voltage, and boot defaults all stay intact. Use this when you need to switch the controller to a new network. |
 | **10 s+** | Factory reset | Wipes the entire NVS configuration namespace — WiFi credentials, AP credentials, MQTT settings, charger count, ramp rate, target voltage, and boot defaults. The controller reboots immediately when the 10 s threshold is hit (you don't need to release), so you'll feel the reset rather than wonder if it took. Use this when re-homing the controller to another bike or troubleshooting a stuck configuration. |
 
@@ -164,24 +164,33 @@ While a dashboard tab is open and polling, the session stays alive regardless of
 
 ### Login rate limiting and lock-out
 
-Failed login attempts are tracked globally:
+Failed login attempts are tracked **per device** (by client IP address), so one
+device fumbling its password can't lock anyone else out:
 
-| Attempt | Delay before next try |
+| Attempt (from one device) | Delay before next try |
 | --- | --- |
 | 1 – 2 | None (free) |
 | 3 | 2 s |
 | 4 | 5 s |
-| 5 | 15 s — and the login is **hard-locked** |
+| 5 | 15 s — and that device is **hard-locked** |
 | 6 | 30 s |
 | 7+ | 60 s (cap) |
 
-After **5 failures** the login page returns **423 Locked** and refuses all further attempts regardless of waiting. Three ways to clear the lock:
+After **5 failures from the same device** the login page returns **423 Locked**
+for that device and refuses all further attempts from it regardless of waiting.
+Other devices on the network are unaffected and can still log in. Three ways to
+clear the lock:
 
-1. **BOOT button hold 3 – 5 s** — instant, no reboot required (see button section above).
-2. **15 minute auto-clear** — the lock clears itself after 15 minutes with no manual intervention.
-3. **Reboot** — power cycle or press RST.
+1. **BOOT button hold 3 – 5 s** — instant, no reboot required (see button
+   section above). This clears the lock and fail counter for **all** devices at
+   once.
+2. **15 minute auto-clear** — a device's lock clears itself 15 minutes after its
+   last failed attempt, with no manual intervention.
+3. **Reboot** — power cycle or press RST clears the lock for every device.
 
-Existing open sessions are not affected by a lock — if you are already logged in, the dashboard keeps working while the lock is active. Only new login attempts are blocked.
+Existing open sessions are not affected by a lock — if you are already logged
+in, the dashboard keeps working while the lock is active. Only new login
+attempts from a locked device are blocked.
 
 ---
 
@@ -227,7 +236,9 @@ The dashboard auto refreshes every 2 seconds.
 A coloured banner across the top of the dashboard tells you when something needs your attention:
 
 - **Red — "No WiFi"**: the controller can't reach your home WiFi and is running its own AP. Reach the dashboard via `http://<ap-ip>` or `http://supercharger.local`. Reconnects automatically when home WiFi comes back.
-- **Orange — "Thermal throttling"**: the pack temperature has crossed the hot-cutback threshold and the controller is reducing charging power to keep the cells safe. Charging continues, just slower. The banner clears on its own when the pack cools below the threshold.
+- **Orange — "Thermal throttling"**: the pack temperature has crossed the hot-cutback threshold and the controller is reducing charging power to keep the cells safe. Charging continues, just slower. The banner clears on its own when the pack cools below the threshold. If a PowerTank is fitted, this tracks whichever pack is hottest.
+
+> The controller **also** reduces power when the pack is *cold* (to avoid lithium plating, which permanently damages cells charged hard below ~10 °C). There is no dashboard banner for the cold limit — it shows up only in the serial/log viewer (a `COLD` tag on the ramp line) — but it works the same way: charging continues at a safe, reduced rate and opens back up as the pack warms.
 
 ### Chargers
 
@@ -259,6 +270,8 @@ The preset number (1–5) stays consistent across charger counts — Preset 2 al
 
 **Auto behavior**: when chargers first appear, the controller auto enables charging at the lowest preset. When they all disappear (e.g. you unplug), it auto disables. You don't have to babysit it.
 
+**Bike data safety stop**: charging decisions depend on live voltage and temperature from the bike's BMS. If that CAN data stops arriving mid-charge — bike powered down, charge plug pulled, a wiring fault — the controller commands the chargers to **STOP** within ~5 seconds rather than keep charging blind on stale readings. It resumes on its own once the bike data comes back.
+
 ### Charge Limit Presets (% of Full)
 
 Below the power slider you'll find a row of **70 / 80 / 90 / 100 %** buttons. These set the **target pack voltage** — i.e. how full the controller will let the pack get before it stops feeding it. They are the key knob for trading range against pack longevity, and they directly drive the CC / CV state machine described below.
@@ -279,7 +292,7 @@ The dashboard remembers your last selection across reboots. The same setting is 
 The controller runs a three stage automatic charge cycle, named after the standard solar/battery-charging convention so what's happening on the bike maps to what you'd expect from any other smart charger.
 
 **Stage 1 — Bulk** *(internally CC, "Constant Current")*
-This is the main charging phase where most of the energy goes in. The controller commands the chargers to deliver the power you've set on the slider, ramping up at 50 W/s (adjustable). Pack voltage rises gradually as the cells absorb energy. The dashboard phase indicator reads **Bulk**. Voltage and temperature limits (see `battery_tables.h`) only apply in this phase — they trim power back as the pack gets close to full or warm.
+This is the main charging phase where most of the energy goes in. The controller commands the chargers to deliver the power you've set on the slider, ramping up at 50 W/s (adjustable). Pack voltage rises gradually as the cells absorb energy. The dashboard phase indicator reads **Bulk**. Voltage and temperature limits (see `battery_tables.h`) only apply in this phase — they trim power back as the pack gets close to full, **warm, or cold**. The temperature limits key off the worst-case (hottest *and* coldest) thermocouple across the monolith and, if fitted, the PowerTank.
 
 **Stage 2 — Absorption** *(internally CV, "Constant Voltage")*
 When the pack reaches the target voltage, the controller switches to **Absorption**. It holds the pack at that voltage and lets the chargers reduce current as the cells equalize and finish topping up. You'll see the current target falling on the dashboard while charging continues at a lower level. This stage finishes when one of two things happens, whichever comes first:
@@ -555,6 +568,8 @@ Every `.bin` uploaded via the web must carry a 32-byte HMAC-SHA256 trailer produ
 
 If you set up a new build environment (new machine or new Arduino IDE install), re-check that `ota_secret.h` and `sign_ota.py` both contain the same key — a mismatch means the controller will reject every upload until they are resynchronised.
 
+**You must generate a real key.** The `ota_secret.h` shipped in the repo is an all-zero placeholder. If you flash firmware built with it, OTA is **disabled outright** — the controller refuses every upload (and logs a warning at boot) rather than "verifying" against a publicly-known key, which would let anyone push firmware. USB flashing still works regardless. Generate your key as described in **BUILD_SETUP.md** before relying on OTA.
+
 ---
 
 ## Home Assistant Integration
@@ -630,6 +645,9 @@ Note on channels: when STA reconnects, the SoftAP gets force-moved to the home W
 **Forgot the IP address**
 Try **http://supercharger.local** first — that's mDNS and works on most modern OSes. If that fails (corporate network, multicast disabled, ancient phone), plug in USB-C and check the serial log, or look at your router's DHCP client list.
 
+**Charging stops on its own mid-session**
+If the dashboard drops to **Float** / zero power while you still expect it to be charging, check the bike CAN link first. The controller stops the chargers within ~5 s if the bike's BMS data goes stale (bike asleep, charge plug loose, CAN wiring fault) rather than charge on stale readings — it resumes automatically when the data returns. A cold or hot pack will instead *reduce* power (not stop); look for a `COLD` tag or the "Thermal throttling" banner.
+
 **Dashboard blank or stuck**
 Reload the page. If that doesn't help, check `/log` for errors. You can also power cycle the controller by cutting the 12 V from the chargers.
 
@@ -676,5 +694,9 @@ Each attempt has a 15 second timeout before falling through.
 - Ramp rate: 50 W per 1 second tick.
 - Max charge voltage: 116.4 V (1164 dV) — set by the highest threshold in the voltage cutback table (`battery_tables.h`). At 116.4 V the cutback table limits charging to 0.005 C (~570 mA on a 114 Ah pack), effectively a CV trickle finish.
 - Max total power: 13200 W (4 chargers at 3300 W each).
+- Power cutbacks (`battery_tables.h`): voltage (`VOLTAGE_CUTBACK`), hot temperature (`HOT_CUTBACK`), and cold temperature (`COLD_CUTBACK`). The hot/cold limits use the worst-case thermocouple across the monolith and PowerTank, and apply during Bulk only.
+- Charger timeout: a charger not heard from for 10 s is dropped from the count.
+- Bike BMS staleness stop: if no monolith voltage frame arrives for 5 s during charging, the controller commands the chargers to STOP until the data returns.
+- Charger dead-man: if the ramp/control task stops advancing for 5 s, the heartbeat falls back to STOP so the chargers can't run on a stale command.
 
 ---

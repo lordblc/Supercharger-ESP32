@@ -16,6 +16,12 @@ varies per host — your HMAC key should not be the same as anyone else's.
 
 ## 1. Rotating the OTA key
 
+> **The repo ships an all-zero placeholder key, and firmware built with it has
+> OTA disabled.** The controller refuses every `/update` upload (and logs a
+> warning at boot) until you replace the placeholder with a real key — it will
+> not "verify" against the publicly-known all-zero key. USB flashing is
+> unaffected. Generate your key before you rely on OTA.
+
 Generate a new 32-byte hex string with `openssl rand -hex 32`, then update
 **both** of:
 
