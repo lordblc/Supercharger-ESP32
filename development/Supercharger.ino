@@ -48,7 +48,7 @@
 //   esp_https_server } built into Espressif ESP32 Arduino core - used for HTTPS port-443 serving
 // ==========================================================================
 
-#define VERSION 202605221633
+#define VERSION 202606211328
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -274,6 +274,10 @@ struct LiveData {
   // Detection window timestamps (ms) — not sent in JSON
   unsigned long bms0FirstMs = 0;
   unsigned long bms1FirstMs = 0;
+  // Timestamp of the most recent monolith voltage frame (0x388). Used by
+  // rampTask as a liveness/staleness check: if the bike CAN bus drops
+  // mid-charge this stops advancing and charging is halted. 0 = none yet.
+  unsigned long bms0LastMs  = 0;
 } live;
 
 // Detection window: if no BMS1 frame arrives within this many ms of the
@@ -4676,6 +4680,7 @@ void processBikeFrame(const twai_message_t &msg) {
     //   bytes 3-6   : pack voltage, uint32 LE, mV  → dV stored in monolithVoltageDv
     //   byte 7      : 0x00 padding
     live.monolithVoltageDv = zeroDecoder.voltage(len, buf) / 100;
+    live.bms0LastMs = now;   // liveness timestamp for rampTask staleness guard
     if (!live.dataFresh) {
       live.dataFresh   = true;
       live.bms0FirstMs = now;
@@ -5322,6 +5327,10 @@ void rampTask(void* /*pvParameters*/) {
     bool  ptPresent  = false;
     short monolithAH = 114; // nominal fallback
     short maxTemp    = -127;
+    short minTemp    = -127; // coldest thermocouple — drives COLD_CUTBACK
+    short ptMaxTemp  = -127; // PowerTank hottest thermocouple (finding #4)
+    short ptMinTemp  = -127; // PowerTank coldest thermocouple (finding #4)
+    unsigned long bmsLastMs = 0; // last monolith voltage frame (staleness, #3)
 
     if (xSemaphoreTake(liveMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
       monolithDv = live.monolithVoltageDv;
@@ -5330,6 +5339,10 @@ void rampTask(void* /*pvParameters*/) {
       ptPresent  = live.powerTankPresent;
       if (live.monolithAH > 0) monolithAH = live.monolithAH;
       maxTemp    = live.monolithMaxTemp;
+      minTemp    = live.monolithMinTemp;
+      ptMaxTemp  = live.powerTankMaxTemp;
+      ptMinTemp  = live.powerTankMinTemp;
+      bmsLastMs  = live.bms0LastMs;
       xSemaphoreGive(liveMutex);
     }
 
@@ -5358,6 +5371,42 @@ void rampTask(void* /*pvParameters*/) {
         }
       }
       xSemaphoreGive(chargerMutex);
+    }
+
+    // ── Bike BMS staleness guard (finding #3) ─────────────────────────────────
+    // The monolith broadcasts voltage frames (0x388) at ~10 Hz. If the bike CAN
+    // bus drops mid-charge (charge connector pulled, bike powered down, wiring
+    // fault) live.* would otherwise freeze at its last values and we'd keep
+    // commanding the chargers from stale voltage/temperature readings forever —
+    // unlike the chargers themselves, which have CHARGER_TIMEOUT_MS. Treat data
+    // older than BMS_STALE_TIMEOUT_MS — or never received (bmsLastMs == 0) — as
+    // unsafe: command STOP and skip the rest of the tick. This mirrors the
+    // charger's own 5 s heartbeat cutoff and is fail-safe. millis() subtraction
+    // is rollover-safe. Charging resumes automatically once fresh frames return.
+    const unsigned long BMS_STALE_TIMEOUT_MS = 5000UL;
+    if ((now0 - bmsLastMs) > BMS_STALE_TIMEOUT_MS) {
+      g_thermalThrottle  = false;
+      g_etaMinutes       = -1;
+      ccTaperStartMs     = 0;
+      voltPlateauStartMs = 0;
+      plateauRefDv       = 0;
+      if (xSemaphoreTake(controlMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        ctrl.currentPowerW = 0;
+        xSemaphoreGive(controlMutex);
+      }
+      if (xSemaphoreTake(chargerMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        chargerBus.cmdVoltDv = 0;
+        chargerBus.cmdAmpsDa = 0;
+        chargerBus.cmdStart  = false;
+        xSemaphoreGive(chargerMutex);
+      }
+      static unsigned long lastStaleLogMs = 0;
+      if (now0 - lastStaleLogMs >= 5000UL) {
+        lastStaleLogMs = now0;
+        LOG("[RAMP] Bike BMS data stale (%lus since last frame) — charger STOP, "
+            "waiting for bike CAN\n", (now0 - bmsLastMs) / 1000UL);
+      }
+      continue;
     }
 
     // ── Skip charge if pack is already at or above target ────────────────────
@@ -5417,15 +5466,40 @@ void rampTask(void* /*pvParameters*/) {
     uint32_t voltPwrW = (voltCbK == UINT32_MAX) ? UINT32_MAX
                        : (uint32_t)(voltCbK / 1000.0f * packAH * voltV);
 
-    uint32_t hotCbK   = find_cutback((int)maxTemp,   CUTBACK_AT_OR_ABOVE, HOT_CUTBACK);
+    // Worst-case temps across both packs for the thermal cutbacks (finding #4).
+    // When a PowerTank is present and live (reporting voltage — the same "PT is
+    // really here" gate used for the voltage sum above), fold its hottest /
+    // coldest thermocouple in so the hot and cold limits track whichever pack
+    // is nearest its limit. Boot caveat (as for the monolith): a present pack
+    // momentarily reading 0 °C before its first temp frame is benign because
+    // the ramp is far slower than the ~3 s it takes real telemetry to arrive.
+    short hotTemp  = maxTemp;
+    short coldTemp = minTemp;
+    if (ptPresent && ptDv > 0) {
+      if (ptMaxTemp > hotTemp)  hotTemp  = ptMaxTemp;
+      if (ptMinTemp < coldTemp) coldTemp = ptMinTemp;
+    }
+
+    uint32_t hotCbK   = find_cutback((int)hotTemp,  CUTBACK_AT_OR_ABOVE, HOT_CUTBACK);
     uint32_t hotPwrW  = (hotCbK  == UINT32_MAX) ? UINT32_MAX
                        : (uint32_t)(hotCbK  / 1000.0f * packAH * voltV);
+
+    // Cold cutback — limit charge C-rate at low pack temperature to avoid
+    // lithium plating. Keyed off the COLDEST cell thermocouple across both
+    // packs, the conservative choice for a plating limit. COLD_CUTBACK uses
+    // CUTBACK_AT_OR_BELOW semantics: colder pack → lower allowed C-rate. The
+    // table tops out at 40 °C / 3 C, well above the system's ~1 C ceiling, so
+    // it only actually constrains power once a pack is genuinely cold.
+    uint32_t coldCbK  = find_cutback((int)coldTemp, CUTBACK_AT_OR_BELOW, COLD_CUTBACK);
+    uint32_t coldPwrW = (coldCbK == UINT32_MAX) ? UINT32_MAX
+                       : (uint32_t)(coldCbK / 1000.0f * packAH * voltV);
 
     // Effective CC target (cutbacks only apply in CC; CV/DONE ramp current to 0)
     uint32_t powerLimit = (uint32_t)target;
     if (phase == PHASE_CC) {
       if (voltPwrW != UINT32_MAX) powerLimit = min(powerLimit, voltPwrW);
       if (hotPwrW  != UINT32_MAX) powerLimit = min(powerLimit, hotPwrW);
+      if (coldPwrW != UINT32_MAX) powerLimit = min(powerLimit, coldPwrW);
     } else {
       powerLimit = 0; // CV/DONE: ramp CC current display to 0
     }
@@ -5802,10 +5876,14 @@ void rampTask(void* /*pvParameters*/) {
       LOG("[RAMP] %s +%lus | %ddV %ddA/ch | raw %lddV ceil %ddV\n",
           ps, (millis()-cvMs)/1000UL, voltCeiling, (int)cvAmpsDa, rawPackDv, voltCeiling);
     } else if (current > 0 || phase == PHASE_DONE) {
-      LOG("[RAMP] %s %dW(eff) tgt%dW cmd %ddV/%ddA raw %lddV%s%s\n",
+      // COLD_CUTBACK returns a value at nearly any temperature (table runs up
+      // to 40 °C), so flag it only when it actually limits power below target —
+      // unlike HOT, where a non-MAX result already means "genuinely hot".
+      LOG("[RAMP] %s %dW(eff) tgt%dW cmd %ddV/%ddA raw %lddV%s%s%s\n",
           ps, current, target, cmdVoltDv, cmdAmpsDa, rawPackDv,
           voltCbK != UINT32_MAX ? " VcbON" : "",
-          hotCbK  != UINT32_MAX ? " HOT"   : "");
+          hotCbK  != UINT32_MAX ? " HOT"   : "",
+          (coldPwrW != UINT32_MAX && coldPwrW < (uint32_t)target) ? " COLD" : "");
     }
   }
 }
