@@ -27,3 +27,19 @@ struct LoginOutcome {
   unsigned long retryAfterSec;
   char          token[33];   // 32 hex chars + NUL — valid only when result == LOGIN_OK
 };
+
+// Per-client-IP login lockout slot (finding #9). Defined here, not in the .ino,
+// for the SAME Arduino auto-prototype reason as LoginOutcome: the helpers
+// authIpSlot_nolock()/hardLockMaybeAutoExpire_nolock()/peekLockStatus() take or
+// return AuthIpSlot, and their auto-generated prototypes are emitted near the
+// top of the .ino — before any struct defined inline there would be visible.
+struct AuthIpSlot {
+  bool          inUse                = false;
+  uint32_t      ip                   = 0;   // client IPv4 key (0 = unknown client)
+  uint8_t       failCount            = 0;
+  unsigned long nextAllowedAttemptMs = 0;
+  bool          hardLocked           = false;
+  unsigned long hardLockSinceMs      = 0;
+  unsigned long lastSeenMs           = 0;   // for LRU eviction
+};
+

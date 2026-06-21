@@ -2190,15 +2190,9 @@ static const uint8_t AUTH_GRACE                = 2;   // free attempts before ba
 static const uint8_t AUTH_HARD_LOCK_THRESHOLD  = 5;   // failures that trip the hard lock
 static const unsigned long HARD_LOCK_AUTO_CLEAR_MS = 15UL * 60UL * 1000UL;
 
-struct AuthIpSlot {
-  bool          inUse                = false;
-  uint32_t      ip                   = 0;   // client IPv4 key (0 = unknown client)
-  uint8_t       failCount            = 0;
-  unsigned long nextAllowedAttemptMs = 0;
-  bool          hardLocked           = false;
-  unsigned long hardLockSinceMs      = 0;
-  unsigned long lastSeenMs           = 0;   // for LRU eviction
-};
+// AuthIpSlot is defined in auth_types.h (included at the top) so the Arduino
+// auto-prototype pass sees the type before it emits prototypes for the helpers
+// that take/return it.
 static const int  MAX_AUTH_IPS = 8;
 static AuthIpSlot authIpSlots[MAX_AUTH_IPS];
 
