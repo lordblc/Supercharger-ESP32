@@ -181,4 +181,40 @@ Both done in the local working tree (owner handles the git commit/push).
     data arrives (~3 s) well before commanded power reaches that limit, so
     the boot-time ambiguity is benign. Cold cutback still uses ONLY the
     monolith min temp — PowerTank temps remain unconsidered (finding #4,
-    still open).
+    still open).  [SUPERSEDED 2026-06-16: #4 now folds PowerTank temps into
+    BOTH hot and cold cutbacks — see below.]
+
+---
+
+## Fixes 2026-06-16 (safety findings #3, #4)
+
+Done in the local working tree; pushed to `claude/jolly-ptolemy-xnajyd`.
+
+- **#3 RESOLVED — bike BMS staleness guard** (`Supercharger.ino`):
+  - `LiveData` gains `bms0LastMs`; `processBikeFrame()` stamps it `= now` on
+    every monolith voltage frame (0x388, ~10 Hz) — the safety-critical
+    control signal.
+  - rampTask snapshots it as `bmsLastMs` and, right after the charger
+    snapshot (before any phase/cutback/command logic), checks
+    `(now0 - bmsLastMs) > BMS_STALE_TIMEOUT_MS` (5 s). If stale — or never
+    received (bmsLastMs == 0, the boot state) — it commands STOP
+    (cmdVolt/Amps=0, cmdStart=false), zeroes currentPowerW, clears throttle/
+    ETA/taper/plateau state, rate-logs once per 5 s, and `continue`s. Uses
+    rollover-safe millis() subtraction (unlike finding #11). Charging resumes
+    automatically when fresh frames return. `phase`/`lastPhase` are untouched
+    during a stall, so no spurious phase-entry hooks fire on resume.
+  - Note: only the monolith voltage frame refreshes the timestamp. If 0x388
+    keeps flowing but temp/amps frames (0x408) stop, staleness won't trip —
+    judged acceptable since the whole bike bus drops together in practice and
+    voltage is the essential control input.
+- **#4 RESOLVED — PowerTank temps now limit power** (`Supercharger.ino`
+  rampTask): snapshots `powerTankMaxTemp`/`powerTankMinTemp`; computes
+  `hotTemp`/`coldTemp` as the worst case across both packs, folding the
+  PowerTank in only when `ptPresent && ptDv > 0` (the same "PT is really
+  here/live" gate already used for the voltage sum). HOT_CUTBACK now keys off
+  `hotTemp`, COLD_CUTBACK off `coldTemp`. Because the fold uses max()/min(),
+  a PowerTank reading 0 (no data / disconnected sensor) can never create a
+  false HOT trigger; for COLD a momentary 0 is benign at boot for the same
+  slow-ramp reason as the monolith. `g_thermalThrottle` now also reflects a
+  hot PowerTank (banner text "pack temperature high" stays accurate).
+  - Cold-side UI visibility (finding #2 note) is unchanged: still log-only.
