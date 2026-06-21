@@ -151,3 +151,34 @@ No prior audit memory existed; this section is the baseline.
 - JSON parsing uses ArduinoJson with size caps (replaced indexOf parsers).
 - WiFi fallback state machine (STA→secrets→AP+STA retry→AP) is sound;
   AP teardown only after 90 s stable STA.
+
+---
+
+## Fixes 2026-06-15 (safety findings #1, #2)
+
+Both done in the local working tree (owner handles the git commit/push).
+
+- **#1 RESOLVED — `find_cutback()` signedness** (`battery_tables.h`): both
+  threshold comparisons now cast `entries[i].threshold` to `int`, so a
+  negative `measurement` (sub-zero temp) compares as signed instead of
+  wrapping to a huge unsigned value. All thresholds are small positive
+  values, so the cast is lossless. This also makes COLD_CUTBACK behave
+  correctly for negative temps (see #2).
+- **#2 RESOLVED — COLD_CUTBACK now applied** (`Supercharger.ino` rampTask):
+  reads `live.monolithMinTemp` into a local `minTemp`, computes
+  `coldCbK`/`coldPwrW` via `find_cutback(minTemp, CUTBACK_AT_OR_BELOW,
+  COLD_CUTBACK)`, and folds `coldPwrW` into `powerLimit` alongside the
+  voltage and hot limits (CC phase only). Keyed off the coldest thermocouple
+  (conservative for a plating limit). Ramp log gains a " COLD" annotation,
+  shown only when the cold limit actually constrains power below target
+  (the table returns a value at nearly any temp, so a bare non-MAX check
+  would flag COLD at room temperature).
+  - Notes for future sessions: the `g_thermalThrottle` dashboard banner is
+    deliberately left HOT-only (its text says "temperature high"), so cold
+    limiting is currently visible only in the ramp log, not the UI. At boot
+    before the first 0x408 frame, `monolithMinTemp` defaults to 0 → cold
+    table allows 0.2 C (~2.5 kW); with the default 100 W/s ramp, real temp
+    data arrives (~3 s) well before commanded power reaches that limit, so
+    the boot-time ambiguity is benign. Cold cutback still uses ONLY the
+    monolith min temp — PowerTank temps remain unconsidered (finding #4,
+    still open).

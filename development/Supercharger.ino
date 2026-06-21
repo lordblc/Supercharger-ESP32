@@ -5322,6 +5322,7 @@ void rampTask(void* /*pvParameters*/) {
     bool  ptPresent  = false;
     short monolithAH = 114; // nominal fallback
     short maxTemp    = -127;
+    short minTemp    = -127; // coldest thermocouple — drives COLD_CUTBACK
 
     if (xSemaphoreTake(liveMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
       monolithDv = live.monolithVoltageDv;
@@ -5330,6 +5331,7 @@ void rampTask(void* /*pvParameters*/) {
       ptPresent  = live.powerTankPresent;
       if (live.monolithAH > 0) monolithAH = live.monolithAH;
       maxTemp    = live.monolithMaxTemp;
+      minTemp    = live.monolithMinTemp;
       xSemaphoreGive(liveMutex);
     }
 
@@ -5421,11 +5423,22 @@ void rampTask(void* /*pvParameters*/) {
     uint32_t hotPwrW  = (hotCbK  == UINT32_MAX) ? UINT32_MAX
                        : (uint32_t)(hotCbK  / 1000.0f * packAH * voltV);
 
+    // Cold cutback — limit charge C-rate at low pack temperature to avoid
+    // lithium plating. Keyed off the COLDEST cell thermocouple (minTemp), the
+    // conservative choice for a plating limit. COLD_CUTBACK uses
+    // CUTBACK_AT_OR_BELOW semantics: colder pack → lower allowed C-rate. The
+    // table tops out at 40 °C / 3 C, well above the system's ~1 C ceiling, so
+    // it only actually constrains power once the pack is genuinely cold.
+    uint32_t coldCbK  = find_cutback((int)minTemp,   CUTBACK_AT_OR_BELOW, COLD_CUTBACK);
+    uint32_t coldPwrW = (coldCbK == UINT32_MAX) ? UINT32_MAX
+                       : (uint32_t)(coldCbK / 1000.0f * packAH * voltV);
+
     // Effective CC target (cutbacks only apply in CC; CV/DONE ramp current to 0)
     uint32_t powerLimit = (uint32_t)target;
     if (phase == PHASE_CC) {
       if (voltPwrW != UINT32_MAX) powerLimit = min(powerLimit, voltPwrW);
       if (hotPwrW  != UINT32_MAX) powerLimit = min(powerLimit, hotPwrW);
+      if (coldPwrW != UINT32_MAX) powerLimit = min(powerLimit, coldPwrW);
     } else {
       powerLimit = 0; // CV/DONE: ramp CC current display to 0
     }
@@ -5802,10 +5815,14 @@ void rampTask(void* /*pvParameters*/) {
       LOG("[RAMP] %s +%lus | %ddV %ddA/ch | raw %lddV ceil %ddV\n",
           ps, (millis()-cvMs)/1000UL, voltCeiling, (int)cvAmpsDa, rawPackDv, voltCeiling);
     } else if (current > 0 || phase == PHASE_DONE) {
-      LOG("[RAMP] %s %dW(eff) tgt%dW cmd %ddV/%ddA raw %lddV%s%s\n",
+      // COLD_CUTBACK returns a value at nearly any temperature (table runs up
+      // to 40 °C), so flag it only when it actually limits power below target —
+      // unlike HOT, where a non-MAX result already means "genuinely hot".
+      LOG("[RAMP] %s %dW(eff) tgt%dW cmd %ddV/%ddA raw %lddV%s%s%s\n",
           ps, current, target, cmdVoltDv, cmdAmpsDa, rawPackDv,
           voltCbK != UINT32_MAX ? " VcbON" : "",
-          hotCbK  != UINT32_MAX ? " HOT"   : "");
+          hotCbK  != UINT32_MAX ? " HOT"   : "",
+          (coldPwrW != UINT32_MAX && coldPwrW < (uint32_t)target) ? " COLD" : "");
     }
   }
 }

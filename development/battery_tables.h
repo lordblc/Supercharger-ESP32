@@ -18,15 +18,21 @@ uint32_t find_cutback(
   const cutback_entry *entries,
   size_t entry_count
 ) {
+  // `threshold` is uint32_t but `measurement` is a signed int (temperatures
+  // can be negative). Compare as signed: an unsigned comparison would convert
+  // a negative measurement to a huge value, so e.g. a sub-zero pack temp would
+  // match the highest HOT_CUTBACK entry and clamp charge power to 0. All
+  // thresholds in the tables are small positive values, so the (int) cast is
+  // lossless.
   if (mode == CUTBACK_AT_OR_ABOVE) {
     for (ssize_t i = entry_count - 1; i >= 0; i--) {
-      if (entries[i].threshold <= measurement) {
+      if ((int)entries[i].threshold <= measurement) {
         return entries[i].c_rate_thousandths;
       }
     }
   } else {
     for (ssize_t i = 0; i < entry_count; i++) {
-      if (entries[i].threshold >= measurement) {
+      if ((int)entries[i].threshold >= measurement) {
         return entries[i].c_rate_thousandths;
       }
     }
