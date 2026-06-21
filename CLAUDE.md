@@ -218,3 +218,90 @@ Done in the local working tree; pushed to `claude/jolly-ptolemy-xnajyd`.
   slow-ramp reason as the monolith. `g_thermalThrottle` now also reflects a
   hot PowerTank (banner text "pack temperature high" stays accurate).
   - Cold-side UI visibility (finding #2 note) is unchanged: still log-only.
+
+---
+
+## Fixes 2026-06-14 (remaining findings #5–#19)
+
+All done in the local working tree and pushed to `claude/jolly-ptolemy-xnajyd`.
+Owner answered two decision points first: **#5 → PowerTank is PARALLEL** (stop
+summing) and **#9 → implement per-IP lockout**.
+
+NOT compiled/flashed in this environment — review-only. The auth, OTA, and MQTT
+changes especially should be validated on the bench before being relied on.
+
+- **#5 RESOLVED — PowerTank parallel** (`Supercharger.ino` rampTask): removed
+  `rawPackDv += ptDv`. On stock Zeros the Power Tank is in parallel at the same
+  rail voltage, so the monolith reading already IS the pack voltage; summing
+  doubled it. `ptDv` is still read (used as the "PT live" gate for #4 temps).
+  NOTE: C-rate→watts conversion still uses only `monolithAH` (conservative; a
+  parallel PT roughly doubles real capacity, so charging is slower than it
+  could be — safe, left as a future refinement).
+- **#6 RESOLVED — rampTask→chargerBusTask dead-man** (`Supercharger.ino`):
+  new `g_rampHeartbeat` counter bumped at the top of every rampTask tick
+  (before any `continue`). `sendHeartbeat()` forces STOP (v/a=0, start=false)
+  if the counter hasn't advanced for RAMP_DEADMAN_MS (5 s), so a wedged
+  rampTask can't leave the charger running on the last command forever.
+- **#7 RESOLVED — PubSubClient / mqttCaCert cross-task race**
+  (`Supercharger.ino`): settings handlers no longer call
+  `mqttClient.disconnect()` — they set `mqttReconnectRequested` and mqttTask
+  (the sole owner of mqttClient) consumes it. `mqttConnect()` now snapshots the
+  whole broker config (host/port/user/pass/tls/CA) into TASK-LOCAL statics
+  under `settingsLock()` and points setServer()/setCACert() at THOSE — the old
+  code passed `mqttCaCert.c_str()` directly, a use-after-free if the String was
+  reassigned mid-handshake.
+- **#8 RESOLVED — settings globals unsynchronised**: new `settingsMutex`
+  serialises config mutation across the HTTP WebServer task and the IDF httpd
+  task. Taken around `applyApiSettingsBody()` in both POST handlers, around the
+  global snapshot in `buildApiSettingsJson()`, and around the mqttConnect
+  snapshot. Lock order is always settingsMutex→controlMutex (never reversed),
+  so no deadlock. (Control/TLS handlers left unwrapped — they touch only
+  controlMutex-guarded ctrl.* and thread-safe NVS, not the shared char arrays.)
+- **#9 RESOLVED — per-IP login lockout**: replaced the four global lockout vars
+  with `authIpSlots[MAX_AUTH_IPS=8]`, keyed by client IPv4 (LRU-evicted; IP 0 =
+  "couldn't determine" shares one bucket, which only tightens limits). HTTP IP
+  via `server.client().remoteIP()`, HTTPS via `idfClientIp()` (lwip
+  getpeername, handles IPv4-mapped IPv6 — needs `<lwip/sockets.h>`). tryLogin /
+  peekLockStatus take the IP; the BOOT-button clear (`hardLockManualClear`)
+  wipes ALL slots; `authAnyLockOrFails()` backs the button's "anything to
+  clear?" check.
+- **#10 RESOLVED — constant-time compares**: `authConstTimeStrEqual()` for
+  credentials (bitwise &, no short-circuit; loop length = secret length) and
+  `authConstTimeTokenEqual()` for the 32-char session tokens (replaces
+  `String.equals` in sessionTouchOrFailToken_nolock / sessionForgetToken_nolock).
+- **#11 RESOLVED — rollover-safe rate-limit**: deadline check is now
+  `(long)(nextAllowed - now) > 0` instead of `now < nextAllowed`.
+- **#12 RESOLVED — open-redirect hardening** (`handleHTTPSRedirect`): Host
+  header is charset-validated (hostname/IP-literal chars only) before being
+  reflected into Location; bad host → fall back to `WiFi.localIP()`. Query
+  string is no longer reflected.
+- **#13 RESOLVED — placeholder OTA key guard**: `otaSecretIsPlaceholder()`
+  (all-zero check) refuses OTA in `otaHmacBegin()` and logs a loud warning at
+  boot. Runtime refusal (not `#error`) so the repo still builds and USB flashing
+  is unaffected; the placeholder key can no longer silently "verify" uploads.
+- **#14 RESOLVED — status JSON buffer**: `buf[1024]`→`[1536]` and the snprintf
+  return value is checked; on truncation it returns a small valid JSON error
+  stub instead of malformed output.
+- **#15 RESOLVED — SSE never blocks loop()**: `sseFlush()` bails for the round
+  if `sseClient.availableForWrite() < 1460` (one MSS), so a stalled log viewer
+  can't block the WebServer on a slow TCP write. Worst case the viewer misses a
+  few lines.
+- **#16 RESOLVED — charger presence decay**: chargerBusTask now sweeps once a
+  second, clearing `present` for any unit not seen within CHARGER_TIMEOUT_MS and
+  recomputing `chargerCount`, so cmdStart gating can't act on a stale-high count.
+- **#17 RESOLVED — cycles.csv bounded**: `appendCycleRecord()` refuses to append
+  (rate-limited warning, no silent FFat-full failure) when free space drops
+  below 32 KB. User reclaims space via the existing download/clear endpoints.
+- **#18 RESOLVED — OTA block I/O**: `otaProcessChunk()` rewritten to hash+flash
+  in contiguous blocks instead of byte-at-a-time. Same byte ranges are hashed
+  and written, so any bug can only cause an HMAC mismatch (→ reject, no flash
+  commit) — never a corrupt/partial image.
+- **#19 RESOLVED — HTTPS oversize body → 413**: `HttpCtx.bodyTooLarge` set by
+  `initFromIDFReq()` when content_len > 8 KB; the settings/control/TLS IDF
+  handlers return 413 instead of the misleading "Invalid JSON".
+
+### Still open / deliberately not done
+- **#5 capacity refinement**: parallel PT capacity not folded into the C-rate
+  basis (safe, just slower). Owner to decide if worth it.
+- Cold-cutback dashboard banner is still log-only (no UI element); `g_thermal
+  Throttle` remains HOT-only by design.

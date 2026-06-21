@@ -36,6 +36,11 @@ struct HttpCtx {
   bool         isWS;     // WebServer path (HTTP port 80)
   bool         isIDF;    // ESP-IDF httpd path (HTTPS port 443)
 
+  // Set by initFromIDFReq() when the request body exceeds the 8 KB cap, so
+  // handlers can return 413 instead of treating the (unread) body as empty /
+  // invalid JSON (finding #19).
+  bool         bodyTooLarge;
+
   // Request body — populated by initFromIDFReq() for IDF POSTs.
   String       body;
 
@@ -51,7 +56,7 @@ struct HttpCtx {
   int     nRespHdrs;
   bool    respStarted;
 
-  HttpCtx() : isWS(false), isIDF(false), idfReq(nullptr),
+  HttpCtx() : isWS(false), isIDF(false), bodyTooLarge(false), idfReq(nullptr),
               nArgs(0), nRespHdrs(0), respStarted(false) {}
 
   // ----- request accessors (IDF path) -----
@@ -205,6 +210,9 @@ inline void initFromIDFReq(httpd_req_t* req, HttpCtx& ctx) {
 
   // POST body. httpd_req_recv may return short reads, so loop until full.
   int bodyLen = req->content_len;
+  // Flag oversized bodies so handlers can return 413 rather than silently
+  // seeing an empty body and reporting "Invalid JSON" (finding #19).
+  if (bodyLen > 8192) ctx.bodyTooLarge = true;
   if (bodyLen > 0 && bodyLen <= 8192) {
     char* bodyBuf = (char*)malloc(bodyLen + 1);
     if (bodyBuf) {

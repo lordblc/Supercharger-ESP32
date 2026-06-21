@@ -96,6 +96,7 @@
 #include "auth_types.h"
 #include <FFat.h>
 #include <time.h>      // getLocalTime, struct tm — NTP timestamp for cycle records
+#include <lwip/sockets.h>  // lwip_getpeername — per-IP login lockout on the HTTPS path
 
 // ---------------------------------------------------------------------------
 // Logging — ring buffer mirrored to hardware serial and SSE stream
@@ -343,6 +344,11 @@ struct ChargerBusData {
 // Charge phase exposed to the API without a mutex (uint8_t write is atomic on ARM).
 // 0 = CC / Absorption,  1 = CV / Float,  2 = Done / Complete
 static volatile uint8_t g_rampPhase = 0;
+// Dead-man liveness counter — rampTask bumps this once per tick (~1 Hz).
+// chargerBusTask watches it: if it stops advancing, rampTask is wedged and the
+// charger is forced to STOP rather than left charging on the last command
+// forever. 32-bit read/write is atomic on the ESP32, so no mutex needed.
+static volatile uint32_t g_rampHeartbeat = 0;
 // True while CC-phase power is being clamped by the hot-temperature cutback.
 // Read by the dashboard to display a "thermal throttling" banner.
 static volatile bool    g_thermalThrottle = false;
@@ -2086,6 +2092,13 @@ void sseFlush() {
     sseActive = false;
     return;
   }
+  // Don't write unless the socket has room for a full round's output. A stalled
+  // log viewer must never block the whole WebServer on a slow TCP write
+  // (finding #15). If the send buffer is backed up we skip this round and retry
+  // next loop(); worst case the viewer misses a few log lines, never the
+  // dashboard. One MSS (1460 B) comfortably covers the ≤256-byte read even with
+  // the per-line "data: …\n\n" overhead.
+  if (sseClient.availableForWrite() < 1460) return;
   if (sseReadPos >= logHead) return; // nothing new
 
   // Read up to 256 bytes at a time to keep loop() responsive
@@ -2138,20 +2151,22 @@ void sseFlush() {
 //    timeout — it lives until logout, table eviction, or factory reset.
 //
 // 2. **Immediate-reject rate limit** on POST /login only: failed attempts
-//    increment a counter and set `nextAllowedAttemptMs`. A subsequent
-//    attempt while now < nextAllowedAttemptMs is rejected with 429 +
+//    increment a per-client-IP counter and set that client's next-allowed
+//    time. A subsequent attempt before then is rejected with 429 +
 //    Retry-After *immediately* — no vTaskDelay, no blocked WebServer task.
 //    Client sees the rate-limit, doesn't time out, dashboard polls (which
 //    use the cookie path) keep working uninterrupted.
 //
 // 3. **State-based hard lock**: after AUTH_HARD_LOCK_THRESHOLD failed
-//    attempts, `authHardLocked` becomes true. Login attempts return 423
-//    Locked until either (a) HARD_LOCK_AUTO_CLEAR_MS elapses, (b) a
-//    BOOT-button hold of 3–5 s clears it, or (c) the device is rebooted.
-//    Existing valid sessions are NOT invalidated by the lock — only NEW
-//    logins are blocked. Defensible because brute-forcers can't have a
-//    valid session (no cookie without the password), so honouring active
-//    sessions during a lock can't aid an attacker.
+//    attempts FROM ONE CLIENT IP, that IP's slot becomes hard-locked
+//    (finding #9 — tracked per IP so one bad LAN device can't lock everyone
+//    out). Login attempts from it return 423 Locked until either
+//    (a) HARD_LOCK_AUTO_CLEAR_MS elapses, (b) a BOOT-button hold of 3–5 s
+//    clears ALL clients, or (c) the device is rebooted. Existing valid
+//    sessions are NOT invalidated by the lock — only NEW logins are blocked.
+//    Defensible because brute-forcers can't have a valid session (no cookie
+//    without the password), so honouring active sessions during a lock can't
+//    aid an attacker.
 //
 // Login form vs Digest: the form sends credentials in plaintext over HTTP
 // (same as every consumer router / embedded device login page on a LAN).
@@ -2166,14 +2181,48 @@ void sseFlush() {
 // ---------------------------------------------------------------------------
 
 
-// Login rate-limit + hard-lock state
-static uint8_t       authFailCount             = 0;
-static unsigned long nextAllowedAttemptMs      = 0;
+// Login rate-limit + hard-lock state — tracked PER CLIENT IP (finding #9) so
+// one misbehaving LAN device can't lock everyone else out of new logins.
+// Each slot holds the back-off/hard-lock state for one client address. The
+// table is small and LRU-evicted; an unknown/undeterminable IP (0) shares a
+// single slot, which only ever makes the limit STRICTER, never weaker.
 static const uint8_t AUTH_GRACE                = 2;   // free attempts before back-off
 static const uint8_t AUTH_HARD_LOCK_THRESHOLD  = 5;   // failures that trip the hard lock
-static bool          authHardLocked            = false;
-static unsigned long hardLockSinceMs           = 0;
 static const unsigned long HARD_LOCK_AUTO_CLEAR_MS = 15UL * 60UL * 1000UL;
+
+struct AuthIpSlot {
+  bool          inUse                = false;
+  uint32_t      ip                   = 0;   // client IPv4 key (0 = unknown client)
+  uint8_t       failCount            = 0;
+  unsigned long nextAllowedAttemptMs = 0;
+  bool          hardLocked           = false;
+  unsigned long hardLockSinceMs      = 0;
+  unsigned long lastSeenMs           = 0;   // for LRU eviction
+};
+static const int  MAX_AUTH_IPS = 8;
+static AuthIpSlot authIpSlots[MAX_AUTH_IPS];
+
+// Constant-time string compare (finding #10) — no early-out on first mismatch,
+// so an attacker can't learn how many leading characters were correct from the
+// response timing. The loop length is the SECRET's length (constant per build),
+// not the attacker-supplied input's, so timing doesn't vary with their guess.
+static bool authConstTimeStrEqual(const char* a, const char* b) {
+  size_t la = strlen(a), lb = strlen(b);
+  uint8_t diff = (uint8_t)((la - lb) | (lb - la));  // nonzero if lengths differ
+  for (size_t i = 0; i < lb; i++) {
+    uint8_t ca = (i < la) ? (uint8_t)a[i] : 0;
+    diff |= (uint8_t)(ca ^ (uint8_t)b[i]);
+  }
+  return diff == 0;
+}
+
+// Constant-time compare of two 32-char session tokens (caller has already
+// length-checked to 32; length is not secret).
+static bool authConstTimeTokenEqual(const char* a, const char* b) {
+  uint8_t diff = 0;
+  for (int i = 0; i < 32; i++) diff |= (uint8_t)(a[i] ^ b[i]);
+  return diff == 0;
+}
 
 // Session store — fixed-size RAM table. Slots flagged `persistent` are ALSO
 // mirrored to NVS so they survive a reboot (the controller cold-boots every
@@ -2197,12 +2246,12 @@ static const long SESSION_COOKIE_MAXAGE_LONG  = 2592000L;   // 30 days
 // NVS key holding the comma-joined list of persistent session tokens.
 static const char* NVS_KEY_AUTH_SESS = "auth_sess";
 
-// Mutex protecting authSessions[], authFailCount, authHardLocked,
-// hardLockSinceMs, and nextAllowedAttemptMs. Once HTTPS is enabled the same
-// auth state is touched by BOTH the Arduino WebServer task (Core 1) AND the
-// IDF esp_https_server worker thread, so concurrent mutation is real.
-// Created in setup() before any HTTP/HTTPS server starts. Hold for short
-// critical sections only — the table scan is O(MAX_SESSIONS) = trivial.
+// Mutex protecting authSessions[] and the per-IP authIpSlots[] lockout table.
+// Once HTTPS is enabled the same auth state is touched by BOTH the Arduino
+// WebServer task (Core 1) AND the IDF esp_https_server worker thread, so
+// concurrent mutation is real. Created in setup() before any HTTP/HTTPS server
+// starts. Hold for short critical sections only — the table scans are
+// O(MAX_SESSIONS) / O(MAX_AUTH_IPS) = trivial.
 static SemaphoreHandle_t authMutex = nullptr;
 
 static inline bool authLock() {
@@ -2214,6 +2263,28 @@ static inline bool authLock() {
 static inline void authUnlock() {
   if (authMutex) xSemaphoreGive(authMutex);
 }
+
+// ---------------------------------------------------------------------------
+// Settings mutex (findings #7, #8) — serialises mutation of the shared config
+// globals (mqttHost/apSSID/mqttCaCert/… and the NVS writes around them). When
+// HTTPS is enabled the Arduino WebServer task AND the IDF httpd task can both
+// run a settings/control/TLS POST concurrently, and those globals are plain
+// char arrays / Strings (NVS itself is thread-safe; the buffers are not). The
+// settings/control/TLS handlers take this around the whole apply; mqttTask
+// takes it briefly to snapshot the broker config.
+static SemaphoreHandle_t settingsMutex = nullptr;
+
+static inline bool settingsLock() {
+  return settingsMutex && xSemaphoreTake(settingsMutex, pdMS_TO_TICKS(200)) == pdTRUE;
+}
+static inline void settingsUnlock() {
+  if (settingsMutex) xSemaphoreGive(settingsMutex);
+}
+
+// Set by the settings handlers when broker config changed; consumed by
+// mqttTask, which is the ONLY task allowed to touch mqttClient (finding #7).
+// Replaces the old cross-task mqttClient.disconnect() calls from the web tasks.
+static volatile bool mqttReconnectRequested = false;
 
 // Standardised response strings for the locked / rate-limited paths so both
 // HTTP and HTTPS handlers say the same thing.
@@ -2269,39 +2340,53 @@ static unsigned long authDelaySec(uint8_t fails) {
   }
 }
 
-// Auto-clear hard lock if the cooldown has elapsed. Internal — caller must
-// hold authMutex. Used by tryLogin() (which already holds the lock) and by
-// the public wrapper below.
-static void hardLockMaybeAutoExpire_nolock() {
-  if (!authHardLocked) return;
-  if ((millis() - hardLockSinceMs) >= HARD_LOCK_AUTO_CLEAR_MS) {
-    authHardLocked       = false;
-    authFailCount        = 0;
-    nextAllowedAttemptMs = 0;
-    LOG("[AUTH] Hard lock auto-cleared after cooldown\n");
+// Find (or allocate) the lockout slot for a client IP. Internal — caller must
+// hold authMutex. Reuses an existing slot for the IP, else a free slot, else
+// evicts the least-recently-used one. Never returns nullptr.
+static AuthIpSlot* authIpSlot_nolock(uint32_t ip) {
+  unsigned long now = millis();
+  int free = -1, lru = -1;
+  for (int i = 0; i < MAX_AUTH_IPS; i++) {
+    if (authIpSlots[i].inUse && authIpSlots[i].ip == ip) {
+      authIpSlots[i].lastSeenMs = now;
+      return &authIpSlots[i];
+    }
+    if (!authIpSlots[i].inUse) {
+      if (free < 0) free = i;
+    } else if (lru < 0 || authIpSlots[i].lastSeenMs < authIpSlots[lru].lastSeenMs) {
+      lru = i;
+    }
+  }
+  int idx = (free >= 0) ? free : lru;
+  AuthIpSlot& s = authIpSlots[idx];
+  s.inUse = true; s.ip = ip; s.failCount = 0; s.nextAllowedAttemptMs = 0;
+  s.hardLocked = false; s.hardLockSinceMs = 0; s.lastSeenMs = now;
+  return &s;
+}
+
+// Auto-clear one slot's hard lock if its cooldown has elapsed. Internal —
+// caller must hold authMutex.
+static void hardLockMaybeAutoExpire_nolock(AuthIpSlot* s) {
+  if (!s->hardLocked) return;
+  if ((millis() - s->hardLockSinceMs) >= HARD_LOCK_AUTO_CLEAR_MS) {
+    s->hardLocked           = false;
+    s->failCount            = 0;
+    s->nextAllowedAttemptMs = 0;
+    LOG("[AUTH] Hard lock auto-cleared after cooldown (ip slot)\n");
   }
 }
 
-// Public auto-expire — used by the login-GET handlers to refresh the lock
-// state before rendering the page. Takes the lock internally.
-static void hardLockMaybeAutoExpire() {
-  if (!authLock()) return;
-  hardLockMaybeAutoExpire_nolock();
-  authUnlock();
-}
-
-// Atomic read of "is the hard lock active?" + remaining seconds. Used by the
-// /login GET handlers so the auto-expire + read pair can't race against a
-// concurrent failed-login attempt that just tripped the lock. Internally
-// performs the lazy auto-expire pass so callers don't need to also call
-// hardLockMaybeAutoExpire() first.
-static bool peekLockStatus(unsigned long& remSecOut) {
+// Atomic read of "is this client's hard lock active?" + remaining seconds.
+// Used by the /login GET handlers so the auto-expire + read pair can't race
+// against a concurrent failed-login attempt that just tripped the lock.
+static bool peekLockStatus(uint32_t ip, unsigned long& remSecOut) {
   remSecOut = 0;
   if (!authLock()) return false;
-  hardLockMaybeAutoExpire_nolock();
-  bool locked = authHardLocked;
+  AuthIpSlot* s = authIpSlot_nolock(ip);
+  hardLockMaybeAutoExpire_nolock(s);
+  bool locked = s->hardLocked;
   if (locked) {
-    unsigned long lockedForMs = millis() - hardLockSinceMs;
+    unsigned long lockedForMs = millis() - s->hardLockSinceMs;
     unsigned long remMs       = (HARD_LOCK_AUTO_CLEAR_MS > lockedForMs)
                                   ? (HARD_LOCK_AUTO_CLEAR_MS - lockedForMs) : 0;
     remSecOut = (remMs + 999UL) / 1000UL;
@@ -2310,20 +2395,36 @@ static bool peekLockStatus(unsigned long& remSecOut) {
   return locked;
 }
 
-// Manual clear path (called from BOOT button handler). Takes the lock
-// internally — BOOT button runs on the loopTask (Core 1) but the lock
-// protects against any concurrent login attempt that might be mid-mutation.
+// True if ANY client currently has an active hard lock or accumulated
+// failures. Used by the BOOT-button handler to decide whether a manual clear
+// has anything to do.
+static bool authAnyLockOrFails() {
+  if (!authLock()) return false;
+  bool any = false;
+  for (int i = 0; i < MAX_AUTH_IPS; i++) {
+    if (authIpSlots[i].inUse &&
+        (authIpSlots[i].hardLocked || authIpSlots[i].failCount > 0)) {
+      any = true; break;
+    }
+  }
+  authUnlock();
+  return any;
+}
+
+// Manual clear path (called from BOOT button handler). Clears the lockout state
+// for ALL client IPs — the physical button is a deliberate global unlock.
 static void hardLockManualClear(const char* reason) {
   if (!authLock()) return;
-  if (!authHardLocked && authFailCount == 0 && nextAllowedAttemptMs == 0) {
-    authUnlock();
-    return;
+  bool any = false;
+  for (int i = 0; i < MAX_AUTH_IPS; i++) {
+    AuthIpSlot& s = authIpSlots[i];
+    if (s.inUse && (s.hardLocked || s.failCount > 0 || s.nextAllowedAttemptMs)) {
+      s.hardLocked = false; s.failCount = 0; s.nextAllowedAttemptMs = 0;
+      any = true;
+    }
   }
-  authHardLocked       = false;
-  authFailCount        = 0;
-  nextAllowedAttemptMs = 0;
   authUnlock();
-  LOG("[AUTH] Hard lock + fail counter cleared (%s)\n", reason);
+  if (any) LOG("[AUTH] Hard lock + fail counters cleared for all clients (%s)\n", reason);
 }
 
 // Pull the session token out of a Cookie header string. Returns empty
@@ -2363,7 +2464,7 @@ static bool sessionTouchOrFailToken_nolock(const String& token) {
       authSessions[i].token[0] = '\0';
       continue;
     }
-    if (token.equals(authSessions[i].token)) {
+    if (authConstTimeTokenEqual(token.c_str(), authSessions[i].token)) {
       authSessions[i].lastUsedMs = now;
       return true;
     }
@@ -2480,7 +2581,8 @@ static void sessionsLoadFromNvs() {
 static void sessionForgetToken_nolock(const String& token) {
   if (token.length() != 32) return;
   for (int i = 0; i < MAX_SESSIONS; i++) {
-    if (authSessions[i].token[0] != '\0' && token.equals(authSessions[i].token)) {
+    if (authSessions[i].token[0] != '\0' &&
+        authConstTimeTokenEqual(token.c_str(), authSessions[i].token)) {
       bool wasPersistent = authSessions[i].persistent;
       authSessions[i].token[0]   = '\0';
       authSessions[i].persistent = false;
@@ -2551,7 +2653,7 @@ static bool authValidNoChallenge() {
 // acquisition. The caller is just a thin response-dispatcher — see
 // handleLoginPost / httpsHandleLoginPost.
 static LoginOutcome tryLogin(const String& username, const String& password,
-                             bool remember) {
+                             bool remember, uint32_t clientIp) {
   LoginOutcome out{};
   out.result = LOGIN_BAD_CREDS;
 
@@ -2562,10 +2664,11 @@ static LoginOutcome tryLogin(const String& username, const String& password,
     return out;
   }
 
-  hardLockMaybeAutoExpire_nolock();
+  AuthIpSlot* s = authIpSlot_nolock(clientIp);   // per-IP lockout state (#9)
+  hardLockMaybeAutoExpire_nolock(s);
 
-  if (authHardLocked) {
-    unsigned long lockedForMs = millis() - hardLockSinceMs;
+  if (s->hardLocked) {
+    unsigned long lockedForMs = millis() - s->hardLockSinceMs;
     unsigned long remMs       = (HARD_LOCK_AUTO_CLEAR_MS > lockedForMs)
                                   ? (HARD_LOCK_AUTO_CLEAR_MS - lockedForMs) : 0;
     out.result         = LOGIN_HARD_LOCKED;
@@ -2575,45 +2678,52 @@ static LoginOutcome tryLogin(const String& username, const String& password,
   }
 
   unsigned long now = millis();
-  if (authFailCount >= AUTH_GRACE && now < nextAllowedAttemptMs) {
+  // Rollover-safe deadline check (finding #11): signed difference instead of
+  // `now < deadline`, so a millis() wrap during the back-off window can't make
+  // the limiter mis-evaluate.
+  if (s->failCount >= AUTH_GRACE && (long)(s->nextAllowedAttemptMs - now) > 0) {
     out.result         = LOGIN_RATE_LIMITED;
-    out.retryAfterSec  = (nextAllowedAttemptMs - now + 999UL) / 1000UL;
+    out.retryAfterSec  = (s->nextAllowedAttemptMs - now + 999UL) / 1000UL;
     authUnlock();
     return out;
   }
 
-  // Credential check. These are short Arduino String compares (≪ 1 µs);
-  // safe to hold the mutex across them.
-  bool ok = username.equals(SECRET_OTA_USER) && password.equals(SECRET_OTA_PASS);
+  // Credential check — constant-time (finding #10). Bitwise & (not &&) so both
+  // comparisons always run and neither short-circuits on a length/char mismatch.
+  bool userOk = authConstTimeStrEqual(username.c_str(), SECRET_OTA_USER);
+  bool passOk = authConstTimeStrEqual(password.c_str(), SECRET_OTA_PASS);
+  bool ok = userOk & passOk;
 
   if (!ok) {
-    if (authFailCount < 255) authFailCount++;
-    if (authFailCount >= AUTH_HARD_LOCK_THRESHOLD && !authHardLocked) {
-      authHardLocked  = true;
-      hardLockSinceMs = millis();
+    if (s->failCount < 255) s->failCount++;
+    if (s->failCount >= AUTH_HARD_LOCK_THRESHOLD && !s->hardLocked) {
+      s->hardLocked      = true;
+      s->hardLockSinceMs = millis();
+      uint8_t fc = s->failCount;
       authUnlock();
-      LOG("[AUTH] HARD LOCK tripped after %d failures — manual unlock required "
-          "(hold BOOT 3-5s, reboot, or wait %lu min)\n",
-          (int)authFailCount, HARD_LOCK_AUTO_CLEAR_MS / 60000UL);
+      LOG("[AUTH] HARD LOCK tripped after %d failures (one client IP) — manual "
+          "unlock required (hold BOOT 3-5s, reboot, or wait %lu min)\n",
+          (int)fc, HARD_LOCK_AUTO_CLEAR_MS / 60000UL);
     } else {
-      unsigned long delaySec = authDelaySec(authFailCount);
+      unsigned long delaySec = authDelaySec(s->failCount);
       delaySec += (unsigned long)(esp_random() % 3);  // 0–2 s jitter
-      nextAllowedAttemptMs = millis() + delaySec * 1000UL;
-      uint8_t fc = authFailCount;
+      s->nextAllowedAttemptMs = millis() + delaySec * 1000UL;
+      uint8_t fc = s->failCount;
       authUnlock();
-      LOG("[AUTH] Failed login #%d — next attempt allowed in %lu s\n",
+      LOG("[AUTH] Failed login #%d (one client IP) — next attempt allowed in %lu s\n",
           (int)fc, delaySec);
     }
     out.result = LOGIN_BAD_CREDS;
     return out;
   }
 
-  // Success — clear fail state and mint session token, still under lock so
-  // a concurrent failed-login attempt can't increment the counter against
-  // this just-succeeded user.
-  uint8_t prevFails = authFailCount;
-  authFailCount        = 0;
-  nextAllowedAttemptMs = 0;
+  // Success — clear this client's fail state and mint session token, still
+  // under lock so a concurrent failed-login attempt can't increment the
+  // counter against this just-succeeded user.
+  uint8_t prevFails = s->failCount;
+  s->failCount            = 0;
+  s->nextAllowedAttemptMs = 0;
+  s->hardLocked           = false;
   sessionMint_nolock(out.token, remember);
   // Always re-sync NVS after a mint: writes the persistent set if `remember`,
   // and also catches the case where minting evicted a persistent slot.
@@ -2642,6 +2752,32 @@ static bool requireAuthCtx(HttpCtx& ctx, bool isApi) {
   return false;
 }
 
+// Client IP helpers for the per-IP login lockout (finding #9).
+//   webClientIp() — Arduino WebServer (HTTP) path.
+//   idfClientIp() — ESP-IDF httpd_ssl (HTTPS) path; reads the socket peer.
+// Both return a uint32_t used purely as a table key (its byte order is
+// irrelevant as long as it's consistent). 0 means "couldn't determine" and is
+// treated as a single shared bucket — that only tightens the limit, never
+// loosens it.
+static uint32_t webClientIp() {
+  return (uint32_t)server.client().remoteIP();
+}
+static uint32_t idfClientIp(httpd_req_t* req) {
+  if (!req) return 0;
+  int fd = httpd_req_to_sockfd(req);
+  if (fd < 0) return 0;
+  struct sockaddr_in6 sa;
+  socklen_t sl = sizeof(sa);
+  if (lwip_getpeername(fd, (struct sockaddr*)&sa, &sl) != 0) return 0;
+  if (sa.sin6_family == AF_INET) {
+    return ((struct sockaddr_in*)&sa)->sin_addr.s_addr;
+  }
+  // IPv4-mapped IPv6 (::ffff:a.b.c.d) — the IPv4 address is the low 4 bytes.
+  const uint8_t* b = (const uint8_t*)&sa.sin6_addr;
+  return ((uint32_t)b[12])       | ((uint32_t)b[13] << 8) |
+         ((uint32_t)b[14] << 16) | ((uint32_t)b[15] << 24);
+}
+
 // GET /login — serve the HTML login form.
 // Redirects to / if a valid session is already present.
 // Shows a locked page if the hard lock is active.
@@ -2654,7 +2790,7 @@ void handleLoginGet() {
   }
 
   unsigned long lockRemSec = 0;
-  if (peekLockStatus(lockRemSec)) {
+  if (peekLockStatus(webClientIp(), lockRemSec)) {
     char retryHdr[16];
     snprintf(retryHdr, sizeof(retryHdr), "%lu", lockRemSec);
     server.sendHeader("Retry-After", retryHdr);
@@ -2681,7 +2817,8 @@ void handleLoginPost() {
 
   // The "remember" checkbox only appears in the POST body when ticked.
   bool remember  = server.hasArg("remember");
-  LoginOutcome o = tryLogin(server.arg("username"), server.arg("password"), remember);
+  LoginOutcome o = tryLogin(server.arg("username"), server.arg("password"),
+                            remember, webClientIp());
   char retryHdr[16];
   char cookieHdr[140];
 
@@ -2804,7 +2941,7 @@ static void httpsHandleLoginGet(HttpCtx& ctx) {
     return;
   }
   unsigned long lockRemSec = 0;
-  if (peekLockStatus(lockRemSec)) {
+  if (peekLockStatus(idfClientIp(ctx.idfReq), lockRemSec)) {
     char retryHdr[16];
     snprintf(retryHdr, sizeof(retryHdr), "%lu", lockRemSec);
     ctx.addRespHdr("Retry-After", String(retryHdr));
@@ -2829,7 +2966,8 @@ static void httpsHandleLoginPost(HttpCtx& ctx) {
   }
 
   bool remember  = ctx.hasArg("remember");
-  LoginOutcome o = tryLogin(ctx.arg("username"), ctx.arg("password"), remember);
+  LoginOutcome o = tryLogin(ctx.arg("username"), ctx.arg("password"),
+                            remember, idfClientIp(ctx.idfReq));
   char retryHdr[16];
   char cookieHdr[160];
 
@@ -2912,11 +3050,17 @@ static String applyApiSettingsBody(const String& body);  // returns JSON ack
 
 static void httpsHandleApiSettingsPost(HttpCtx& ctx) {
   if (!requireAuthCtx(ctx, true)) return;
+  if (ctx.bodyTooLarge) {
+    ctx.send(413, "application/json", "{\"ok\":false,\"error\":\"Payload too large\"}");
+    return;
+  }
   if (ctx.body.length() == 0) {
     ctx.send(400, "application/json", "{\"ok\":false,\"error\":\"No body\"}");
     return;
   }
+  bool locked = settingsLock();   // serialise vs the HTTP WebServer task (#8)
   String result = applyApiSettingsBody(ctx.body);
+  if (locked) settingsUnlock();
   // Determine HTTP status from result JSON
   int code = (result.indexOf("\"ok\":true") >= 0) ? 200 : 400;
   if (result.indexOf("\"error\":\"Payload too large\"") >= 0) code = 413;
@@ -2933,6 +3077,10 @@ static String applyApiControlBody(const String& body);
 
 static void httpsHandleApiControl(HttpCtx& ctx) {
   if (!requireAuthCtx(ctx, true)) return;
+  if (ctx.bodyTooLarge) {
+    ctx.send(413, "application/json", "{\"ok\":false,\"error\":\"Payload too large\"}");
+    return;
+  }
   if (ctx.body.length() == 0) {
     ctx.send(400, "application/json", "{\"ok\":false,\"error\":\"No body\"}");
     return;
@@ -2949,6 +3097,12 @@ static void handleApiTlsPost(HttpCtx& ctx) {
   if (ctx.isWS) { if (!requireAuth(true)) return; }
   else          { if (!requireAuthCtx(ctx, true)) return; }
 
+  // Oversized IDF body (finding #19) — the body was never read, so check the
+  // flag, not body.length(), before falling through to "Invalid JSON".
+  if (ctx.bodyTooLarge) {
+    ctx.send(413, "application/json", "{\"ok\":false,\"error\":\"Payload too large\"}");
+    return;
+  }
   String body = ctx.isWS ? server.arg("plain") : ctx.body;
   if (body.length() > 8192) {
     if (ctx.isWS) server.send(413, "application/json", "{\"ok\":false,\"error\":\"Payload too large\"}");
@@ -3152,21 +3306,34 @@ static void handleHTTPSRedirect() {
   // Strip port number from host if present
   int col = host.lastIndexOf(':');
   if (col > 0) host = host.substring(0, col);
-  String url = "https://" + host + server.uri();
-  if (server.args() > 0) {
-    // Reconstruct query string
-    url += "?";
-    for (int i = 0; i < server.args(); i++) {
-      if (i) url += "&";
-      url += server.argName(i) + "=" + server.arg(i);
-    }
+  // Sanitise the Host header before reflecting it into the Location URL
+  // (finding #12 — open-redirect / header-injection hardening). Keep only
+  // characters legal in a hostname or IPv4/IPv6 literal; anything else
+  // (including CR/LF, '/', '@', whitespace) means a crafted Host, so we fall
+  // back to the device's own STA IP rather than honour it.
+  bool hostOk = host.length() > 0 && host.length() <= 253;
+  for (unsigned int i = 0; hostOk && i < host.length(); i++) {
+    char c = host.charAt(i);
+    bool legal = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                 (c >= '0' && c <= '9') || c == '.' || c == '-' || c == ':';
+    if (!legal) hostOk = false;
   }
+  if (!hostOk) host = WiFi.localIP().toString();
+  // server.uri() is the path the WebServer already parsed (no scheme/host), so
+  // it can't smuggle a different origin. The query string is intentionally not
+  // reflected — it isn't needed to land on the HTTPS dashboard and reflecting
+  // raw arg values would be another injection vector.
+  String url = "https://" + host + server.uri();
   server.sendHeader("Location", url);
   server.send(301, "text/plain", "");
 }
 
 // Build the /api/settings JSON string. Called by both HTTP and HTTPS handlers.
 static String buildApiSettingsJson() {
+  // Read the shared config globals under settingsLock so we can't snapshot a
+  // half-written mqttHost/apStatic*/mqttCaCert while the other server task is
+  // mutating it (#8).
+  bool locked = settingsLock();
   String ssid = preferences.getString("ssid", "");
   String aps  = preferences.getString("ap_ssid", String(apSSID));
   String mh   = String(mqttHost);
@@ -3222,6 +3389,7 @@ static String buildApiSettingsJson() {
     httpsEnabled ? "true" : "false",
     tlsCertSet   ? "true" : "false"
   );
+  if (locked) settingsUnlock();
   return String(buf);
 }
 
@@ -3377,7 +3545,7 @@ static String applyApiSettingsBody(const String& body) {
       mqttBrokerPass[sizeof(mqttBrokerPass) - 1] = '\0';
     }
     LOG("[SETTINGS] MQTT settings saved: %s:%d\n", mqttHost, mqttPort);
-    mqttClient.disconnect();
+    mqttReconnectRequested = true;  // mqttTask owns mqttClient — don't touch it here (#7)
   }
 
   // MQTT TLS toggle + CA cert.
@@ -3408,7 +3576,7 @@ static String applyApiSettingsBody(const String& body) {
     preferences.putBool("mqtt_tls", tls);
     LOG("[SETTINGS] MQTT TLS: %s\n", tls ? "ON" : "off");
   }
-  if (mqttSettingsTouched) mqttClient.disconnect();
+  if (mqttSettingsTouched) mqttReconnectRequested = true;  // consumed by mqttTask (#7)
 
   // Charger count.
   if (doc.containsKey("charger_count")) {
@@ -3485,7 +3653,9 @@ void handleApiSettingsPost() {
     server.send(400, "application/json", "{\"ok\":false,\"error\":\"No body\"}");
     return;
   }
+  bool locked = settingsLock();   // serialise vs the HTTPS server task (#8)
   String result = applyApiSettingsBody(server.arg("plain"));
+  if (locked) settingsUnlock();
   int code = 200;
   if (result.indexOf("\"ok\":false") >= 0)
     code = (result.indexOf("Payload too large") >= 0) ? 413 : 400;
@@ -3576,9 +3746,12 @@ static String buildApiStatusJson() {
   float sessWh = 0.0f, sessAh = 0.0f;
   sessionSnapshot(sessWh, sessAh);
 
-  // Fixed fields — use a stack buffer for the bulk of the response
-  char buf[1024];
-  snprintf(buf, sizeof(buf),
+  // Fixed fields — use a stack buffer for the bulk of the response. Sized with
+  // headroom over the worst-case formatted length (finding #14); the return
+  // value is checked below so a future field addition can't silently truncate
+  // the JSON into something unparseable.
+  char buf[1536];
+  int jsonLen = snprintf(buf, sizeof(buf),
     "{"
       "\"fresh\":%s,"
       "\"ap_mode\":%s,"
@@ -3660,6 +3833,15 @@ static String buildApiStatusJson() {
     g_thermalThrottle ? "true" : "false",
     (int)g_cycleCount
   );
+
+  // Guard against truncation: snprintf returns the length it WOULD have written.
+  // If that meets/exceeds the buffer the fixed block was clipped — emit a small
+  // valid JSON error instead of a malformed body the dashboard can't parse.
+  if (jsonLen < 0 || jsonLen >= (int)sizeof(buf)) {
+    LOG("[API] status JSON truncated (%d >= %u) — sending error stub\n",
+        jsonLen, (unsigned)sizeof(buf));
+    return String("{\"fresh\":false,\"error\":\"status buffer overflow\"}");
+  }
 
   // Build the charger array dynamically — one entry per present charger
   String response = String(buf);
@@ -3810,7 +3992,23 @@ static void otaResetHmacState() {
   otaImageBytes   = 0;
 }
 
+// True if the compiled-in OTA secret is still the all-zero placeholder shipped
+// in the repo copy of ota_secret.h (finding #13). A real build host overwrites
+// it with 32 random bytes. If it's left as zeros, signed-OTA is meaningless —
+// anyone could sign an image with the public all-zero key — so we refuse OTA
+// entirely rather than "verify" against a known key.
+static bool otaSecretIsPlaceholder() {
+  uint8_t acc = 0;
+  for (size_t i = 0; i < sizeof(OTA_HMAC_SECRET); i++) acc |= OTA_HMAC_SECRET[i];
+  return acc == 0;
+}
+
 static bool otaHmacBegin() {
+  if (otaSecretIsPlaceholder()) {
+    LOG("[OTA] REFUSED: OTA_HMAC_SECRET is the all-zero placeholder. Generate a "
+        "real key in ota_secret.h + sign_ota.py before using OTA.\n");
+    return false;
+  }
   mbedtls_md_init(&otaHmacCtx);
   const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
   if (!info) return false;
@@ -3831,30 +4029,52 @@ static bool otaConstTimeEqual(const uint8_t* a, const uint8_t* b, size_t n) {
   return diff == 0;
 }
 
-// Process one chunk of upload bytes:
-//   1. Append `buf` to the sliding window (but the window only holds the
-//      last OTA_HMAC_LEN bytes — anything pushed out goes through the HMAC
-//      and gets flashed via Update.write()).
-//   2. The bytes that get pushed out of the window are committed image bytes;
-//      everything still in the window is "could be HMAC trailer, hold for now".
+// Process one chunk of upload bytes. We keep the last OTA_HMAC_LEN bytes of the
+// stream in otaHmacWin (the candidate HMAC trailer); everything before that is
+// committed image — fed through the HMAC and flashed via Update.write().
 //
-// At end-of-upload the window holds exactly the candidate HMAC trailer.
+// Finding #18: emit in CONTIGUOUS BLOCKS rather than one byte at a time (the
+// old version called mbedtls_md_hmac_update()/Update.write() per byte). The
+// exact same byte ranges are hashed and written, so HMAC and flash content
+// always agree — a bug here can only ever cause an HMAC mismatch (→ rejected,
+// no flash commit), never a corrupt or partial image.
 static bool otaProcessChunk(const uint8_t* buf, size_t n) {
-  for (size_t i = 0; i < n; i++) {
-    if (otaHmacWinFill < OTA_HMAC_LEN) {
-      otaHmacWin[otaHmacWinFill++] = buf[i];
-      continue;
-    }
-    // Window full — push oldest byte out, slide everything left, append new.
-    uint8_t emit = otaHmacWin[0];
-    memmove(otaHmacWin, otaHmacWin + 1, OTA_HMAC_LEN - 1);
-    otaHmacWin[OTA_HMAC_LEN - 1] = buf[i];
-
-    // The emitted byte is part of the image — feed HMAC + flash.
-    if (mbedtls_md_hmac_update(&otaHmacCtx, &emit, 1) != 0) return false;
-    if (Update.write(&emit, 1) != 1) return false;
-    otaImageBytes++;
+  // Conceptual stream = otaHmacWin[0..winFill) followed by buf[0..n).
+  // We must end with the LAST OTA_HMAC_LEN bytes back in otaHmacWin.
+  size_t total = otaHmacWinFill + n;
+  if (total <= OTA_HMAC_LEN) {
+    // Not enough yet to commit anything — just grow the window.
+    memcpy(otaHmacWin + otaHmacWinFill, buf, n);
+    otaHmacWinFill += n;
+    return true;
   }
+
+  size_t emit = total - OTA_HMAC_LEN;  // bytes to hash+flash this call
+
+  // Block 1: bytes that come from the existing window (its oldest `fromWin`).
+  size_t fromWin = (emit < otaHmacWinFill) ? emit : otaHmacWinFill;
+  if (fromWin > 0) {
+    if (mbedtls_md_hmac_update(&otaHmacCtx, otaHmacWin, fromWin) != 0) return false;
+    if (Update.write(otaHmacWin, fromWin) != fromWin) return false;
+    otaImageBytes += fromWin;
+  }
+  // Block 2: remaining emitted bytes come from the head of buf.
+  size_t fromBuf = emit - fromWin;
+  if (fromBuf > 0) {
+    if (mbedtls_md_hmac_update(&otaHmacCtx, buf, fromBuf) != 0) return false;
+    if (Update.write((uint8_t*)buf, fromBuf) != (int)fromBuf) return false;
+    otaImageBytes += fromBuf;
+  }
+
+  // Rebuild the window with the trailing OTA_HMAC_LEN bytes, in order:
+  //   leftover window bytes [fromWin..winFill)  ++  leftover buf bytes [fromBuf..n)
+  uint8_t newWin[OTA_HMAC_LEN];
+  size_t pos = 0;
+  for (size_t i = fromWin; i < otaHmacWinFill; i++) newWin[pos++] = otaHmacWin[i];
+  for (size_t i = fromBuf; i < n; i++)              newWin[pos++] = buf[i];
+  // pos == OTA_HMAC_LEN by construction (total - emit == OTA_HMAC_LEN).
+  memcpy(otaHmacWin, newWin, pos);
+  otaHmacWinFill = pos;
   return true;
 }
 
@@ -4020,17 +4240,14 @@ void checkBootButton() {
       delay(300);
       ESP.restart();
     } else if (heldMs >= 3000UL) {
-      // 3–5 s window: clear the auth hard-lock if one is active. This is the
-      // documented manual-unlock path for users locked out of the dashboard
-      // after too many failed login attempts. Note: only takes effect on
-      // release, so a press that grows past 5 s into AP-reset territory
-      // wins instead. Sessions persist; only the lock + fail counter clear.
-      // Benign lock-free peek: if the values are mid-transition we'll either
-      // call hardLockManualClear() needlessly (it re-checks under the lock
-      // and returns early) or log "nothing to clear" one cycle late. Both
-      // are harmless — the real mutation is in hardLockManualClear which
-      // takes authMutex internally.
-      if (authHardLocked || authFailCount > 0) {
+      // 3–5 s window: clear the auth hard-lock for ALL client IPs if any is
+      // active. This is the documented manual-unlock path for users locked out
+      // of the dashboard after too many failed login attempts. Note: only takes
+      // effect on release, so a press that grows past 5 s into AP-reset
+      // territory wins instead. Sessions persist; only the lock + fail counters
+      // clear. authAnyLockOrFails()/hardLockManualClear() both take authMutex
+      // internally, so this is race-safe against a concurrent login attempt.
+      if (authAnyLockOrFails()) {
         hardLockManualClear("BOOT button held 3-5s");
       } else {
         LOG("[BTN] BOOT pressed %lums (no auth lock to clear)\n", heldMs);
@@ -4299,11 +4516,23 @@ void setup() {
 
   logBegin(115200);
   LOG("\n[BOOT] Supercharger firmware %lld\n", (long long)VERSION);
+  if (otaSecretIsPlaceholder()) {
+    LOG("[BOOT] WARNING: OTA_HMAC_SECRET is the all-zero placeholder — signed "
+        "OTA is DISABLED until you generate a real key (ota_secret.h + "
+        "sign_ota.py). USB flashing still works.\n");
+  }
 
-  // authMutex protects authSessions[], authFailCount, authHardLocked,
-  // hardLockSinceMs, nextAllowedAttemptMs. Must exist BEFORE any HTTP or
-  // HTTPS handler can run — both call into the session helpers, which
-  // assume the mutex is available.
+  // authMutex protects authSessions[] and the per-IP authIpSlots[] lockout
+  // table. Must exist BEFORE any HTTP or HTTPS handler can run — both call into
+  // the session/lockout helpers, which assume the mutex is available.
+  // settingsMutex serialises config mutation across the HTTP and HTTPS server
+  // tasks (findings #7/#8). Create it before any handler can run.
+  settingsMutex = xSemaphoreCreateMutex();
+  if (settingsMutex == nullptr) {
+    LOG("[BOOT] Failed to create settingsMutex — halting\n");
+    while (true) { delay(1000); }
+  }
+
   authMutex = xSemaphoreCreateMutex();
   if (authMutex == nullptr) {
     LOG("[BOOT] Failed to create authMutex — halting\n");
@@ -4941,6 +5170,30 @@ void sendHeartbeat() {
     xSemaphoreGive(chargerMutex);
   }
 
+  // Dead-man check (finding #6): rampTask owns the command values and is the
+  // only thing that supervises voltage/temperature/phase. If it stops
+  // advancing g_rampHeartbeat (mutex wedge, stack-overflow park, crash) the
+  // last command would otherwise be re-sent at 1 Hz forever, charging the pack
+  // unsupervised. If the counter hasn't moved for RAMP_DEADMAN_MS, force STOP.
+  static uint32_t      lastRampHb   = 0;
+  static unsigned long lastRampHbMs = 0;
+  static bool          rampHbSeen   = false;
+  const unsigned long  RAMP_DEADMAN_MS = 5000UL;  // 5 missed 1 Hz ramp ticks
+  uint32_t hbNow  = g_rampHeartbeat;
+  unsigned long tn = millis();
+  if (!rampHbSeen || hbNow != lastRampHb) {
+    lastRampHb = hbNow; lastRampHbMs = tn; rampHbSeen = true;
+  }
+  if (start && (tn - lastRampHbMs) > RAMP_DEADMAN_MS) {
+    vCmd = 0; aCmd = 0; start = false;
+    static unsigned long lastDeadmanLog = 0;
+    if (tn - lastDeadmanLog >= 5000UL) {
+      lastDeadmanLog = tn;
+      LOG("[MCP] rampTask not advancing (%lus) — forcing charger STOP (dead-man)\n",
+          (tn - lastRampHbMs) / 1000UL);
+    }
+  }
+
   byte data[8] = {
     (byte)(vCmd >> 8),
     (byte)(vCmd & 0xFF),
@@ -5049,12 +5302,36 @@ void chargerBusTask(void* /*pvParameters*/) {
   }
 
   unsigned long lastHeartbeatMs = 0;
+  unsigned long lastDecayMs     = 0;
   // Rate-limit raw frame logging in listen-only mode
   static unsigned long lastRawLogMs = 0;
   static uint32_t      frameCount   = 0;
 
   for (;;) {
     unsigned long now = millis();
+
+    // --- Decay stale chargers (finding #16) ---
+    // present[]/chargerCount only ever grew; a charger that stopped sending
+    // status frames stayed "present" forever, so cmdStart gating (and the
+    // dashboard count) could act on a charger that has actually gone away.
+    // Once per second, clear present for any unit not seen within the timeout
+    // window and recompute chargerCount from what's genuinely live.
+    if (now - lastDecayMs >= 1000) {
+      lastDecayMs = now;
+      if (xSemaphoreTake(chargerMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        uint8_t count = 0;
+        for (int i = 0; i < MAX_CHARGERS; i++) {
+          ChargerUnit& c = chargerBus.chargers[i];
+          if (c.present && (now - c.lastSeenMs) > CHARGER_TIMEOUT_MS) {
+            c.present = false;
+            LOG("[MCP] Charger %d timed out — marking absent\n", i);
+          }
+          if (c.present) count++;
+        }
+        if (chargerBus.chargerCount != count) chargerBus.chargerCount = count;
+        xSemaphoreGive(chargerMutex);
+      }
+    }
 
 #if !MCP_LISTEN_ONLY
     // --- Heartbeat (normal mode only) ---
@@ -5164,6 +5441,22 @@ static uint16_t countCycleRecords() {
 // Thread-safety: only ever called from rampTask; g_cycle is task-local.
 static void appendCycleRecord(const CycleRecord& r) {
   if (!g_fatReady) return;
+  // Bound growth + surface the full-disk case instead of failing silently
+  // (finding #17). Each record is well under 200 bytes; refuse to append once
+  // free space drops below a safety margin so the partition can't fill up and
+  // start dropping writes invisibly. The user can download + clear via the
+  // /api/cycles endpoints to reclaim space.
+  const size_t FAT_MIN_FREE = 32768;  // keep 32 KB headroom
+  if (FFat.freeBytes() < FAT_MIN_FREE) {
+    static unsigned long lastFullLog = 0;
+    unsigned long nowMs = millis();
+    if (lastFullLog == 0 || nowMs - lastFullLog >= 60000UL) {
+      lastFullLog = nowMs;
+      LOG("[FAT] cycles.csv not appended — only %lu KB free (clear it via the "
+          "dashboard to reclaim space)\n", (unsigned long)(FFat.freeBytes() / 1024UL));
+    }
+    return;
+  }
   File f = FFat.open("/cycles.csv", FILE_APPEND);
   if (!f) { LOG("[FAT] Cannot open /cycles.csv for append\n"); return; }
   // Write CSV header if this is a brand-new file (size 0 before the write)
@@ -5266,6 +5559,11 @@ void rampTask(void* /*pvParameters*/) {
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(1000)); // 1 s ramp tick
 
+    // Dead-man heartbeat — bumped every iteration (before any `continue`) so
+    // chargerBusTask can tell this task is still advancing. If we ever wedge,
+    // the counter freezes and the charger heartbeat falls back to STOP.
+    g_rampHeartbeat++;
+
     // ── Control snapshot ──────────────────────────────────────────────────────
     uint16_t target     = 0;
     uint16_t current    = 0;
@@ -5348,8 +5646,11 @@ void rampTask(void* /*pvParameters*/) {
 
     // Raw (unclamped) pack voltage — all cutback decisions use this.
     // sagAdjDv is the BMS sag-compensation offset (additive, not a replacement).
+    // The PowerTank is wired in PARALLEL with the monolith on stock Zeros, so
+    // both packs sit at the same rail voltage — the monolith reading already
+    // IS the pack voltage and the PowerTank voltage must NOT be added (doing so
+    // would double the reading and instantly trip skip-to-DONE / max cutback).
     long rawPackDv = monolithDv + (sagAdjDv > 0 ? (long)sagAdjDv : 0L);
-    if (ptPresent && ptDv > 0) rawPackDv += ptDv;
 
     uint16_t voltCeiling = min(targetVolt, MAX_CHARGE_VOLTAGE_DV);
     const long hyst = 10; // 1.0 V in dV
@@ -6501,6 +6802,30 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
 // Connect/reconnect to broker — called from mqttTask when not connected
 static bool mqttConnect() {
+  // Snapshot broker config into task-local stable storage under settingsLock
+  // (findings #7/#8). setServer() stores the host POINTER and setCACert()
+  // stores the cert POINTER for the whole TLS session, so they must reference
+  // memory only this task owns — never the shared globals another task could
+  // reassign mid-handshake. The old code passed mqttCaCert.c_str() directly:
+  // if the settings handler reassigned that String during connect(), the
+  // pointer dangled (use-after-free). These statics live for the task's life.
+  static char     s_host[sizeof(mqttHost)]       = "";
+  static char     s_user[sizeof(mqttUser)]       = "";
+  static char     s_pass[sizeof(mqttBrokerPass)] = "";
+  static String   s_caCert;
+  static uint16_t s_port = 1883;
+  static bool     s_tls  = false;
+  {
+    bool locked = settingsLock();
+    strncpy(s_host, mqttHost, sizeof(s_host)); s_host[sizeof(s_host) - 1] = '\0';
+    strncpy(s_user, mqttUser, sizeof(s_user)); s_user[sizeof(s_user) - 1] = '\0';
+    strncpy(s_pass, mqttBrokerPass, sizeof(s_pass)); s_pass[sizeof(s_pass) - 1] = '\0';
+    s_caCert = mqttCaCert;   // deep copy into task-local String
+    s_port   = mqttPort;
+    s_tls    = mqttTls;
+    if (locked) settingsUnlock();
+  }
+
   char baseTopic[80], willTopic[90];
   snprintf(baseTopic, sizeof(baseTopic), "supercharger/%s", mqttHostname);
   snprintf(willTopic, sizeof(willTopic), "%s/state",        baseTopic);
@@ -6515,8 +6840,8 @@ static bool mqttConnect() {
   // a pinned CA, MQTT-TLS provides confidentiality but no authentication of
   // the broker, which is worse than plaintext (gives a false sense of
   // security and lets MITM attackers transparently relay credentials).
-  if (mqttTls) {
-    if (mqttCaCert.length() == 0) {
+  if (s_tls) {
+    if (s_caCert.length() == 0) {
       static unsigned long lastWarnMs = 0;
       if (millis() - lastWarnMs > 30000UL) {
         lastWarnMs = millis();
@@ -6525,18 +6850,18 @@ static bool mqttConnect() {
       }
       return false;
     }
-    mqttTlsClient.setCACert(mqttCaCert.c_str());
+    mqttTlsClient.setCACert(s_caCert.c_str());
     mqttClient.setClient(mqttTlsClient);
   } else {
     mqttClient.setClient(mqttWifiClient);
   }
   // Keep the broker host/port in sync with the (possibly-swapped) transport.
-  mqttClient.setServer(mqttHost, mqttPort);
+  mqttClient.setServer(s_host, s_port);
 
   bool ok = mqttClient.connect(
     mqttHostname,
-    mqttUser,
-    mqttBrokerPass,
+    s_user,
+    s_pass,
     willTopic,      // LWT topic
     1,              // LWT QoS
     true,           // LWT retained
@@ -6550,10 +6875,10 @@ static bool mqttConnect() {
     // Reset snapshot so all values publish immediately after reconnect
     mqttLast = MqttSnapshot();
     LOG("[MQTT] Connected to %s:%d (%s) as %s\n",
-        mqttHost, mqttPort, mqttTls ? "TLS" : "plain", mqttHostname);
+        s_host, s_port, s_tls ? "TLS" : "plain", mqttHostname);
   } else {
     LOG("[MQTT] Connect failed (%s), rc=%d\n",
-        mqttTls ? "TLS" : "plain", mqttClient.state());
+        s_tls ? "TLS" : "plain", mqttClient.state());
   }
   return ok;
 }
@@ -6744,9 +7069,10 @@ static bool mqttPublishChanges() {
 void mqttTask(void* /*pvParameters*/) {
   LOG("[MQTT] mqttTask running on core %d\n", xPortGetCoreID());
 
-  mqttClient.setServer(mqttHost, mqttPort);
   mqttClient.setCallback(mqttCallback);
   mqttClient.setBufferSize(512); // discovery payloads need > default 256 bytes
+  // Note: setServer() is now done inside mqttConnect() from a locked snapshot
+  // of the broker config — this task is the ONLY one that touches mqttClient.
 
   unsigned long lastConnectAttempt = 0;
   unsigned long lastKeepalive      = 0;
@@ -6761,13 +7087,24 @@ void mqttTask(void* /*pvParameters*/) {
       continue;
     }
 
+    // Consume a reconnect request from the settings handlers (finding #7).
+    // mqttClient is owned exclusively by this task, so the disconnect happens
+    // here rather than cross-task. Forcing a disconnect makes the block below
+    // reconnect with the freshly-saved (locked-snapshot) broker config.
+    if (mqttReconnectRequested) {
+      mqttReconnectRequested = false;
+      if (mqttClient.connected()) {
+        LOG("[MQTT] Reconnecting to apply new settings\n");
+        mqttClient.disconnect();
+      }
+      lastConnectAttempt = 0;  // allow an immediate reconnect attempt
+    }
+
     if (!mqttClient.connected()) {
       unsigned long now = millis();
-      if (now - lastConnectAttempt >= RECONNECT_INTERVAL) {
+      if (lastConnectAttempt == 0 || now - lastConnectAttempt >= RECONNECT_INTERVAL) {
         lastConnectAttempt = now;
-        // Re-apply server settings in case they were changed via /api/settings
-        mqttClient.setServer(mqttHost, mqttPort);
-        mqttConnect();
+        mqttConnect();   // re-reads broker config under settingsLock
       }
       vTaskDelay(pdMS_TO_TICKS(1000));
       continue;
