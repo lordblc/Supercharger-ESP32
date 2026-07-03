@@ -48,7 +48,7 @@
 //   esp_https_server } built into Espressif ESP32 Arduino core - used for HTTPS port-443 serving
 // ==========================================================================
 
-#define VERSION 202606261200
+#define VERSION 202607031330
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -682,6 +682,8 @@ static String   mqttCaCert         = "";
 //   chunked/streaming or multipart-upload story before they can move over.
 //   When httpsEnabled, these endpoints are unavailable; disable HTTPS to
 //   reach them.
+//   (/api/cycles GET+DELETE moved to 443 in the 2026-07 audit — chunked
+//   file streaming turned out to be enough for it.)
 // ---------------------------------------------------------------------------
 
 // HTTPS server state — only active when httpsEnabled=true.
@@ -2178,6 +2180,13 @@ void sseFlush() {
 //    without the password), so honouring active sessions during a lock can't
 //    aid an attacker.
 //
+// 4. **Device-wide backstop** (audit 2026-07): the per-IP slots are
+//    LRU-evicted, so an attacker rotating source addresses could keep getting
+//    fresh counters. A global sliding window counts failures across ALL
+//    clients; AUTH_GLOBAL_FAIL_MAX failures within AUTH_GLOBAL_WINDOW_MS
+//    trips a lock on new logins from everyone for HARD_LOCK_AUTO_CLEAR_MS.
+//    Cleared by the same BOOT-button hold / reboot as the per-IP lock.
+//
 // Login form vs Digest: the form sends credentials in plaintext over HTTP
 // (same as every consumer router / embedded device login page on a LAN).
 // The advantage is that password managers (Bitwarden, etc.) can autofill
@@ -2205,6 +2214,21 @@ static const unsigned long HARD_LOCK_AUTO_CLEAR_MS = 15UL * 60UL * 1000UL;
 // that take/return it.
 static const int  MAX_AUTH_IPS = 8;
 static AuthIpSlot authIpSlots[MAX_AUTH_IPS];
+
+// Device-wide failure backstop (audit 2026-07). The per-IP slots above are
+// LRU-evicted, and a freshly (re)allocated slot starts with failCount=0 — so
+// an attacker rotating through >MAX_AUTH_IPS source addresses could reset
+// their counters indefinitely and never trip the per-IP hard lock. This
+// global sliding window counts ALL failed logins regardless of source: too
+// many failures across the whole device within the window trips a global
+// lock on NEW logins (existing sessions unaffected, same rationale as the
+// per-IP lock). Cleared by the BOOT-button hold, reboot, or auto-expiry.
+// All three variables are guarded by authMutex.
+static const uint8_t       AUTH_GLOBAL_FAIL_MAX  = 15;      // failures within window
+static const unsigned long AUTH_GLOBAL_WINDOW_MS = 60000UL; // 60 s sliding window
+static uint8_t       authGlobalFails       = 0;
+static unsigned long authGlobalWindowStart = 0;
+static unsigned long authGlobalLockUntil   = 0;  // 0 = no global lock active
 
 // Constant-time string compare (finding #10) — no early-out on first mismatch,
 // so an attacker can't learn how many leading characters were correct from the
@@ -2289,6 +2313,71 @@ static inline void settingsUnlock() {
 // mqttTask, which is the ONLY task allowed to touch mqttClient (finding #7).
 // Replaces the old cross-task mqttClient.disconnect() calls from the web tasks.
 static volatile bool mqttReconnectRequested = false;
+
+// ---------------------------------------------------------------------------
+// Capped request-body collection for port-80 POST routes (audit 2026-07).
+//
+// The Arduino WebServer's default body handling malloc()s the ENTIRE request
+// body (Content-Length sized) into RAM before the route handler — and thus
+// its auth check — ever runs, so an unauthenticated client could POST a huge
+// body and force large allocations. Every body-consuming POST/DELETE route is
+// therefore registered with rawBodyCollect() as its "upload" function: on
+// ESP32 core 3.x that flips the route into RAW streaming mode, where the body
+// arrives in fixed ~1.4 KB chunks and we accumulate at most RAW_BODY_CAP
+// bytes. Anything larger is drained off the socket through the fixed chunk
+// buffer and discarded; the completion handler answers 413. Unmatched URIs
+// are covered by WebBodyGuardHandler (registered last in setup()).
+//
+// Side effect of RAW mode: the WebServer no longer parses the body into
+// server.arg() — completion handlers read g_rawBody directly (JSON routes)
+// or parse it with parseKVPairs() from https_ctx.h (form routes: /login,
+// /save). Query-string args are also NOT parsed in RAW mode; none of these
+// POST routes use them.
+//
+// Single-threaded by construction: the WebServer serves one client at a time
+// from loop(), so one static buffer suffices. RAW_START resets it per request.
+//
+// Residual gap (can't be closed at sketch level): multipart/form-data bodies
+// bypass RAW mode entirely — the core's _parseForm() accumulates non-file
+// field VALUES into an unbounded String (Parsing.cpp). File parts are safe
+// (streamed and discarded without a canUpload handler). Closing it would
+// mean patching the bundled WebServer library; accepted for a LAN device
+// whose worst case is a heap-pressure reboot into charging-off defaults.
+// ---------------------------------------------------------------------------
+static const size_t RAW_BODY_CAP = 8192;
+static String g_rawBody;
+static bool   g_rawTooLarge = false;
+
+static void rawBodyCollect() {
+  HTTPRaw& r = server.raw();
+  switch (r.status) {
+    case RAW_START: {
+      int cl = server.clientContentLength();
+      g_rawBody     = String();
+      g_rawTooLarge = (cl > (int)RAW_BODY_CAP);
+      if (!g_rawTooLarge && cl > 0) g_rawBody.reserve(cl + 1);
+      break;
+    }
+    case RAW_WRITE:
+      if (!g_rawTooLarge) {
+        if (g_rawBody.length() + r.currentSize > RAW_BODY_CAP) {
+          // Body exceeded the cap despite the Content-Length check (lying
+          // header). Flip to discard mode; chunks keep draining harmlessly.
+          g_rawTooLarge = true;
+          g_rawBody = String();
+        } else {
+          g_rawBody.concat((const char*)r.buf, r.currentSize);
+        }
+      }
+      break;
+    case RAW_END:
+      break;
+    case RAW_ABORTED:
+      g_rawBody     = String();
+      g_rawTooLarge = false;
+      break;
+  }
+}
 
 // Standardised response strings for the locked / rate-limited paths so both
 // HTTP and HTTPS handlers say the same thing.
@@ -2380,9 +2469,46 @@ static void hardLockMaybeAutoExpire_nolock(AuthIpSlot* s) {
   }
 }
 
+// Device-wide backstop: is the global login lock active? Internal — caller
+// must hold authMutex. Lazily clears an expired lock (mirrors the per-IP
+// auto-expire pattern). remSecOut = seconds until auto-clear when locked.
+static bool globalLockActive_nolock(unsigned long now, unsigned long& remSecOut) {
+  remSecOut = 0;
+  if (authGlobalLockUntil == 0) return false;
+  long rem = (long)(authGlobalLockUntil - now);   // rollover-safe signed diff
+  if (rem <= 0) {
+    authGlobalLockUntil = 0;
+    authGlobalFails     = 0;
+    LOG("[AUTH] Global login lock auto-cleared after cooldown\n");
+    return false;
+  }
+  remSecOut = ((unsigned long)rem + 999UL) / 1000UL;
+  return true;
+}
+
+// Count one failed login into the device-wide sliding window. Internal —
+// caller must hold authMutex. Returns true if this failure tripped the
+// global lock (caller logs after releasing the mutex).
+static bool globalFailCount_nolock(unsigned long now) {
+  if (authGlobalFails == 0 ||
+      (now - authGlobalWindowStart) > AUTH_GLOBAL_WINDOW_MS) {
+    authGlobalWindowStart = now;
+    authGlobalFails       = 1;
+    return false;
+  }
+  if (authGlobalFails < 255) authGlobalFails++;
+  if (authGlobalFails >= AUTH_GLOBAL_FAIL_MAX && authGlobalLockUntil == 0) {
+    authGlobalLockUntil = now + HARD_LOCK_AUTO_CLEAR_MS;
+    if (authGlobalLockUntil == 0) authGlobalLockUntil = 1;  // 0 = "off" sentinel
+    return true;
+  }
+  return false;
+}
+
 // Atomic read of "is this client's hard lock active?" + remaining seconds.
 // Used by the /login GET handlers so the auto-expire + read pair can't race
 // against a concurrent failed-login attempt that just tripped the lock.
+// Also reports the device-wide global lock (whichever lasts longer).
 static bool peekLockStatus(uint32_t ip, unsigned long& remSecOut) {
   remSecOut = 0;
   if (!authLock()) return false;
@@ -2395,6 +2521,11 @@ static bool peekLockStatus(uint32_t ip, unsigned long& remSecOut) {
                                   ? (HARD_LOCK_AUTO_CLEAR_MS - lockedForMs) : 0;
     remSecOut = (remMs + 999UL) / 1000UL;
   }
+  unsigned long gRem = 0;
+  if (globalLockActive_nolock(millis(), gRem)) {
+    locked = true;
+    if (gRem > remSecOut) remSecOut = gRem;
+  }
   authUnlock();
   return locked;
 }
@@ -2404,11 +2535,11 @@ static bool peekLockStatus(uint32_t ip, unsigned long& remSecOut) {
 // has anything to do.
 static bool authAnyLockOrFails() {
   if (!authLock()) return false;
-  bool any = false;
-  for (int i = 0; i < MAX_AUTH_IPS; i++) {
+  bool any = (authGlobalFails > 0 || authGlobalLockUntil != 0);
+  for (int i = 0; !any && i < MAX_AUTH_IPS; i++) {
     if (authIpSlots[i].inUse &&
         (authIpSlots[i].hardLocked || authIpSlots[i].failCount > 0)) {
-      any = true; break;
+      any = true;
     }
   }
   authUnlock();
@@ -2426,6 +2557,13 @@ static void hardLockManualClear(const char* reason) {
       s.hardLocked = false; s.failCount = 0; s.nextAllowedAttemptMs = 0;
       any = true;
     }
+  }
+  // Device-wide backstop clears with the same deliberate physical action.
+  if (authGlobalFails > 0 || authGlobalLockUntil != 0) {
+    authGlobalFails       = 0;
+    authGlobalWindowStart = 0;
+    authGlobalLockUntil   = 0;
+    any = true;
   }
   authUnlock();
   if (any) LOG("[AUTH] Hard lock + fail counters cleared for all clients (%s)\n", reason);
@@ -2671,6 +2809,18 @@ static LoginOutcome tryLogin(const String& username, const String& password,
   AuthIpSlot* s = authIpSlot_nolock(clientIp);   // per-IP lockout state (#9)
   hardLockMaybeAutoExpire_nolock(s);
 
+  // Device-wide backstop (audit 2026-07): blocks NEW logins from every client
+  // when too many failures accumulated across all IPs — closes the "rotate
+  // source IPs to evict per-IP slots" gap. Existing sessions stay valid, and
+  // the BOOT-button 3-5 s hold clears it just like the per-IP hard lock.
+  unsigned long gRem = 0;
+  if (globalLockActive_nolock(millis(), gRem)) {
+    out.result        = LOGIN_HARD_LOCKED;
+    out.retryAfterSec = gRem;
+    authUnlock();
+    return out;
+  }
+
   if (s->hardLocked) {
     unsigned long lockedForMs = millis() - s->hardLockSinceMs;
     unsigned long remMs       = (HARD_LOCK_AUTO_CLEAR_MS > lockedForMs)
@@ -2700,6 +2850,9 @@ static LoginOutcome tryLogin(const String& username, const String& password,
 
   if (!ok) {
     if (s->failCount < 255) s->failCount++;
+    // Count into the device-wide window as well (audit 2026-07); log the
+    // trip after the mutex is released, matching the per-IP pattern.
+    bool gTripped = globalFailCount_nolock(millis());
     if (s->failCount >= AUTH_HARD_LOCK_THRESHOLD && !s->hardLocked) {
       s->hardLocked      = true;
       s->hardLockSinceMs = millis();
@@ -2717,6 +2870,12 @@ static LoginOutcome tryLogin(const String& username, const String& password,
       LOG("[AUTH] Failed login #%d (one client IP) — next attempt allowed in %lu s\n",
           (int)fc, delaySec);
     }
+    if (gTripped) {
+      LOG("[AUTH] GLOBAL LOCK tripped: %d failed logins across all clients "
+          "within %lu s — new logins blocked for %lu min (hold BOOT 3-5s to clear)\n",
+          (int)AUTH_GLOBAL_FAIL_MAX, AUTH_GLOBAL_WINDOW_MS / 1000UL,
+          HARD_LOCK_AUTO_CLEAR_MS / 60000UL);
+    }
     out.result = LOGIN_BAD_CREDS;
     return out;
   }
@@ -2728,6 +2887,10 @@ static LoginOutcome tryLogin(const String& username, const String& password,
   s->failCount            = 0;
   s->nextAllowedAttemptMs = 0;
   s->hardLocked           = false;
+  // A successful login also resets the device-wide window — an attacker can't
+  // reach this branch, so it only ever forgives the owner's own typos.
+  authGlobalFails       = 0;
+  authGlobalWindowStart = 0;
   sessionMint_nolock(out.token, remember);
   // Always re-sync NVS after a mint: writes the persistent set if `remember`,
   // and also catches the case where minting evicted a persistent slot.
@@ -2819,9 +2982,16 @@ void handleLoginPost() {
     return;
   }
 
+  // RAW body mode (rawBodyCollect): the WebServer no longer parses the
+  // urlencoded form into server.arg() — parse the capped g_rawBody here with
+  // the same helpers the HTTPS path uses. An oversized body yields empty
+  // credentials, which fail closed through tryLogin.
+  HttpCtx form;
+  parseKVPairs(g_rawBody, form);
+
   // The "remember" checkbox only appears in the POST body when ticked.
-  bool remember  = server.hasArg("remember");
-  LoginOutcome o = tryLogin(server.arg("username"), server.arg("password"),
+  bool remember  = form.hasArg("remember");
+  LoginOutcome o = tryLogin(form.arg("username"), form.arg("password"),
                             remember, webClientIp());
   char retryHdr[16];
   char cookieHdr[140];
@@ -3094,6 +3264,36 @@ static void httpsHandleApiControl(HttpCtx& ctx) {
   ctx.send(code, "application/json", result);
 }
 
+// GET /api/cycles (HTTPS) — stream the cycle CSV as a download (audit 2026-07:
+// previously HTTP-only, so enabling HTTPS silently lost the dashboard's
+// "Cycles" download link). Streamed in chunks — the file can be large.
+static void httpsHandleApiCyclesGet(HttpCtx& ctx) {
+  if (!requireAuthCtx(ctx, true)) return;
+  if (!g_fatReady) { ctx.send(503, "text/plain", "FAT not mounted"); return; }
+  File f = FFat.open("/cycles.csv", FILE_READ);
+  if (!f) { ctx.send(404, "text/plain", "No data yet"); return; }
+  ctx.addRespHdr("Content-Disposition", "attachment; filename=\"cycles.csv\"");
+  ctx.flushRespHdrs(200, "text/csv");
+  char buf[512];
+  while (f.available()) {
+    size_t n = f.read((uint8_t*)buf, sizeof(buf));
+    if (n == 0) break;
+    if (httpd_resp_send_chunk(ctx.idfReq, buf, (ssize_t)n) != ESP_OK) break;
+  }
+  f.close();
+  httpd_resp_send_chunk(ctx.idfReq, nullptr, 0);  // terminate chunked transfer
+}
+
+// DELETE /api/cycles (HTTPS) — same semantics as the HTTP handler.
+static void httpsHandleApiCyclesDelete(HttpCtx& ctx) {
+  if (!requireAuthCtx(ctx, true)) return;
+  if (!g_fatReady) { ctx.send(503, "text/plain", "FAT not mounted"); return; }
+  FFat.remove("/cycles.csv");
+  g_cycleCount = 0;
+  ctx.send(200, "text/plain", "Cleared");
+  LOG("[FAT] cycles.csv deleted by user (TLS path)\n");
+}
+
 // POST /api/tls (HTTPS and HTTP) — cert/key upload.
 // Body JSON: {"cert":"<PEM>","key":"<PEM>"} (both required) or {"enabled":bool}.
 static void handleApiTlsPost(HttpCtx& ctx) {
@@ -3103,16 +3303,14 @@ static void handleApiTlsPost(HttpCtx& ctx) {
 
   // Oversized IDF body (finding #19) — the body was never read, so check the
   // flag, not body.length(), before falling through to "Invalid JSON".
-  if (ctx.bodyTooLarge) {
-    ctx.send(413, "application/json", "{\"ok\":false,\"error\":\"Payload too large\"}");
-    return;
-  }
-  String body = ctx.isWS ? server.arg("plain") : ctx.body;
-  if (body.length() > 8192) {
+  // The WS path uses the capped RAW collector (audit 2026-07): g_rawTooLarge
+  // is its equivalent of ctx.bodyTooLarge.
+  if (ctx.isWS ? g_rawTooLarge : ctx.bodyTooLarge) {
     if (ctx.isWS) server.send(413, "application/json", "{\"ok\":false,\"error\":\"Payload too large\"}");
     else ctx.send(413, "application/json", "{\"ok\":false,\"error\":\"Payload too large\"}");
     return;
   }
+  String body = ctx.isWS ? g_rawBody : ctx.body;
   DynamicJsonDocument doc(body.length() + 512);
   if (deserializeJson(doc, body)) {
     if (ctx.isWS) server.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid JSON\"}");
@@ -3150,16 +3348,24 @@ static void handleApiTlsPost(HttpCtx& ctx) {
       reject("{\"ok\":false,\"error\":\"Invalid key PEM (need BEGIN ... PRIVATE KEY marker, 64-4096 bytes)\"}");
       return;
     }
+    // Mutations under settingsLock (audit 2026-07) — this handler is reachable
+    // from BOTH the WebServer task and the IDF httpd task, same as
+    // /api/settings, so it must serialise the same way (#8). Validation above
+    // stays outside the lock; only the NVS writes + flag flip are inside.
+    bool locked = settingsLock();
     preferences.putString("tls_cert", cert);
     preferences.putString("tls_key",  key);
+    if (locked) settingsUnlock();
     changed = true;
     LOG("[TLS] Cert+key stored in NVS (%u / %u bytes)\n",
         (unsigned)certLen, (unsigned)keyLen);
   }
   if (doc.containsKey("enabled")) {
     bool en = doc["enabled"] | false;
+    bool locked = settingsLock();
     httpsEnabled = en;
     preferences.putBool("https_en", en);
+    if (locked) settingsUnlock();
     changed = true;
     LOG("[TLS] HTTPS %s\n", en ? "enabled" : "disabled");
   }
@@ -3238,6 +3444,16 @@ static esp_err_t idf_api_tls_post(httpd_req_t* req) {
   handleApiTlsPost(ctx);
   return ESP_OK;
 }
+static esp_err_t idf_api_cycles_get(httpd_req_t* req) {
+  HttpCtx ctx; initFromIDFReq(req, ctx);
+  httpsHandleApiCyclesGet(ctx);
+  return ESP_OK;
+}
+static esp_err_t idf_api_cycles_delete(httpd_req_t* req) {
+  HttpCtx ctx; initFromIDFReq(req, ctx);
+  httpsHandleApiCyclesDelete(ctx);
+  return ESP_OK;
+}
 
 // ---------------------------------------------------------------------------
 // startHTTPSServer / stopHTTPSServer
@@ -3261,7 +3477,7 @@ static bool startHTTPSServer(const String& cert, const String& key) {
   cfg.prvtkey_len            = s_key.length() + 1;
   cfg.port_secure            = 443;
   cfg.httpd.stack_size       = 10240;
-  cfg.httpd.max_uri_handlers = 12;
+  cfg.httpd.max_uri_handlers = 14;   // 12 routes registered below + headroom
 
   esp_err_t err = httpd_ssl_start(&g_httpsServer, &cfg);
   if (err != ESP_OK) {
@@ -3290,6 +3506,8 @@ static bool startHTTPSServer(const String& cert, const String& key) {
   reg("/api/settings",  HTTP_POST, idf_api_settings_post);
   reg("/api/control",   HTTP_POST, idf_api_control_post);
   reg("/api/tls",       HTTP_POST, idf_api_tls_post);
+  reg("/api/cycles",    HTTP_GET,    idf_api_cycles_get);
+  reg("/api/cycles",    HTTP_DELETE, idf_api_cycles_delete);
 
   LOG("[TLS] HTTPS server started on port 443 (cert %u bytes)\n",
       (unsigned)s_cert.length());
@@ -3653,12 +3871,16 @@ static String applyApiSettingsBody(const String& body) {
 // now reject oversized input with a 400 instead of being silently clipped.
 void handleApiSettingsPost() {
   if (!requireAuth(true)) return;   // API route
-  if (!server.hasArg("plain")) {
+  if (g_rawTooLarge) {
+    server.send(413, "application/json", "{\"ok\":false,\"error\":\"Payload too large\"}");
+    return;
+  }
+  if (g_rawBody.length() == 0) {
     server.send(400, "application/json", "{\"ok\":false,\"error\":\"No body\"}");
     return;
   }
   bool locked = settingsLock();   // serialise vs the HTTPS server task (#8)
-  String result = applyApiSettingsBody(server.arg("plain"));
+  String result = applyApiSettingsBody(g_rawBody);
   if (locked) settingsUnlock();
   int code = 200;
   if (result.indexOf("\"ok\":false") >= 0)
@@ -3678,9 +3900,12 @@ void handleApiSettingsPost() {
 // credentials and force a reboot, hijacking the controller.
 void handleSave() {
   if (!requireAuth(false)) return;  // legacy HTML form-POST, returns HTML
-  if (server.hasArg("ssid")) {
-    String newSSID = server.arg("ssid");
-    String newPass = server.arg("pass");
+  // RAW body mode (rawBodyCollect): parse the urlencoded body ourselves.
+  HttpCtx form;
+  parseKVPairs(g_rawBody, form);
+  if (form.hasArg("ssid")) {
+    String newSSID = form.arg("ssid");
+    String newPass = form.arg("pass");
     if (!newSSID.isEmpty()) {
       preferences.putString("ssid", newSSID);
       preferences.putString("pass", newPass);
@@ -3718,6 +3943,16 @@ static String buildApiStatusJson() {
   if (xSemaphoreTake(sysStatsMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
     statsSnap = sysStats;
     xSemaphoreGive(sysStatsMutex);
+  }
+
+  // Control state under its mutex too (audit 2026-07) — previously read from
+  // ctrl.* directly. Aligned ≤16-bit reads are atomic on Xtensa so it was
+  // benign, but snapshotting keeps the JSON internally consistent and matches
+  // how every other shared struct is handled here.
+  ChargingControl ctrlSnap;
+  if (xSemaphoreTake(controlMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+    ctrlSnap = ctrl;
+    xSemaphoreGive(controlMutex);
   }
 
   // State of charge: prefer the BMS's own value (BMS_PACK_STATUS 0x188 byte 0)
@@ -3819,8 +4054,8 @@ static String buildApiStatusJson() {
     liveSnap.powerTankMaxCRate  / 10.0f,
     sessWh,
     sessAh,
-    (int)ctrl.rampStepW,
-    (int)ctrl.targetVoltDv,
+    (int)ctrlSnap.rampStepW,
+    (int)ctrlSnap.targetVoltDv,
     millis() / 1000UL,
     (int)WiFi.RSSI(),
     (long long)VERSION,
@@ -3830,10 +4065,10 @@ static String buildApiStatusJson() {
     chargerSnap.heartbeatOk ? "true" : "false",
     g_rampPhase == 1 ? "absorption" : g_rampPhase == 2 ? "float" : "bulk",
     (int)g_etaMinutes,
-    (int)ctrl.chargerCount,
-    ctrl.enabled ? "true" : "false",
-    (int)ctrl.targetPowerW,
-    (int)ctrl.currentPowerW,
+    (int)ctrlSnap.chargerCount,
+    ctrlSnap.enabled ? "true" : "false",
+    (int)ctrlSnap.targetPowerW,
+    (int)ctrlSnap.currentPowerW,
     g_thermalThrottle ? "true" : "false",
     (int)g_cycleCount
   );
@@ -3941,11 +4176,15 @@ static String applyApiControlBody(const String& body) {
 
 void handleApiControl() {
   if (!requireAuth(true)) return;   // API route
-  if (!server.hasArg("plain")) {
+  if (g_rawTooLarge) {
+    server.send(413, "application/json", "{\"ok\":false,\"error\":\"Payload too large\"}");
+    return;
+  }
+  if (g_rawBody.length() == 0) {
     server.send(400, "text/plain", "No body");
     return;
   }
-  String result = applyApiControlBody(server.arg("plain"));
+  String result = applyApiControlBody(g_rawBody);
   int code = (result.indexOf("\"ok\":true") >= 0) ? 200 : 400;
   server.send(code, "application/json", result);
 }
@@ -4428,9 +4667,12 @@ void monitorWifiStatus() {
       LOG("[WIFI] Connected (%s). IP: %s\n",
                     wifiSource == WIFI_SRC_SECRETS ? "secrets" : "prefs",
                     WiFi.localIP().toString().c_str());
-      // Capture hostname for MQTT client ID and topic prefix
+      // Capture hostname for MQTT client ID and topic prefix. Write-if-changed
+      // (audit 2026-07): mqttTask reads this char array without a lock, so
+      // don't rewrite identical bytes on every reconnect — in practice the
+      // hostname never changes after the first association.
       const char* hn = WiFi.getHostname();
-      if (hn && strlen(hn) > 0)
+      if (hn && strlen(hn) > 0 && strcmp(hn, mqttHostname) != 0)
         snprintf(mqttHostname, sizeof(mqttHostname), "%s", hn);
       wifiFastAttempt = false;
       saveWifiFastConnect();  // remember BSSID+channel for next cold boot's fast-connect
@@ -4495,7 +4737,7 @@ void monitorWifiStatus() {
       LOG("[WIFI] STA reconnected. IP: %s (AP stays up; grace window started)\n",
           WiFi.localIP().toString().c_str());
       const char* hn = WiFi.getHostname();
-      if (hn && strlen(hn) > 0)
+      if (hn && strlen(hn) > 0 && strcmp(hn, mqttHostname) != 0)
         snprintf(mqttHostname, sizeof(mqttHostname), "%s", hn);
       // Re-bind mDNS — STA-side service registration needs the new IP.
       startMdns();
@@ -4567,6 +4809,68 @@ void handleApiCyclesDelete() {
   server.send(200, "text/plain", "Cleared");
   LOG("[FAT] cycles.csv deleted by user\n");
 }
+
+// ---------------------------------------------------------------------------
+// Request-handler shims (audit 2026-07)
+//
+// WebBodyGuardHandler — catch-all registered LAST in setup() so it only sees
+// requests no explicit route matched. It (a) reproduces the previous
+// not-found behaviour (404, or the port-80→443 redirect when httpsEnabled),
+// and (b) declares canRaw so the WebServer streams-and-discards the body of
+// any unmatched POST/PUT/PATCH/DELETE through its fixed ~1.4 KB chunk buffer
+// instead of malloc()ing the whole Content-Length into RAM before any auth
+// check could run.
+//
+// OtaUpdateHandler — replaces the plain server.on("/update", POST, fn, ufn)
+// registration. On ESP32 core 3.x a route with an upload function is ALSO
+// raw-capable, so a non-multipart POST to /update used to invoke
+// handleOTAUpload() through the raw path, where server.upload() dereferences
+// a null unique_ptr → LoadProhibited crash. This handler sends multipart
+// bodies to the real upload handler and quietly drains anything else,
+// flagging the attempt so the completion handler answers 403.
+// ---------------------------------------------------------------------------
+
+class WebBodyGuardHandler : public RequestHandler {
+public:
+  bool canHandle(HTTPMethod, const String&) override { return true; }
+  bool canHandle(WebServer&, HTTPMethod, const String&) override { return true; }
+  bool canRaw(const String&) override { return true; }
+  bool canRaw(WebServer&, const String&) override { return true; }
+  bool handle(WebServer& srv, HTTPMethod, const String&) override {
+    if (httpsEnabled) handleHTTPSRedirect();
+    else srv.send(404, "text/plain", "Not found");
+    return true;
+  }
+  void raw(WebServer&, const String&, HTTPRaw&) override { /* discard body */ }
+};
+
+class OtaUpdateHandler : public RequestHandler {
+public:
+  bool canHandle(HTTPMethod m, const String& uri) override {
+    return m == HTTP_POST && uri == "/update";
+  }
+  bool canHandle(WebServer&, HTTPMethod m, const String& uri) override {
+    return m == HTTP_POST && uri == "/update";
+  }
+  bool canUpload(const String& uri) override { return uri == "/update"; }
+  bool canUpload(WebServer&, const String& uri) override { return uri == "/update"; }
+  bool canRaw(const String&) override { return true; }
+  bool canRaw(WebServer&, const String&) override { return true; }
+  bool handle(WebServer&, HTTPMethod, const String&) override {
+    handleOTAPost();
+    return true;
+  }
+  void upload(WebServer&, const String&, HTTPUpload&) override { handleOTAUpload(); }
+  void raw(WebServer&, const String&, HTTPRaw& r) override {
+    // Non-multipart POST to /update is never a valid OTA upload. The body
+    // drains through the fixed chunk buffer; flag it so handleOTAPost 403s
+    // instead of misreading stale Update state as success.
+    if (r.status == RAW_START) {
+      otaUploadFailed = true;
+      LOG("[OTA] Non-multipart POST to /update — rejected\n");
+    }
+  }
+};
 
 // ---------------------------------------------------------------------------
 // Setup & Loop
@@ -4740,29 +5044,41 @@ void setup() {
   // When HTTPS is active: port 80 only serves redirect; all real routes live
   // on port 443 (served by the httpd_ssl FreeRTOS task).
   // When HTTPS is inactive: register all routes on port 80 as normal.
+  // Every body-consuming route gets rawBodyCollect as its "upload" function —
+  // that flips it into capped RAW streaming (audit 2026-07, see rawBodyCollect)
+  // so oversized bodies can't be malloc()ed into RAM before the auth check.
+  // Handlers read g_rawBody instead of server.arg("plain").
   if (httpsEnabled) {
+    // Belt-and-braces only: WebBodyGuardHandler (added below) matches first
+    // and issues the redirect itself; onNotFound would only fire if the
+    // catch-all were ever removed.
     server.onNotFound(handleHTTPSRedirect);
     // Also allow /api/tls on HTTP so the user can disable HTTPS if they mess up
-    server.on("/api/tls", HTTP_POST, handleApiTlsPostWS);
+    server.on("/api/tls", HTTP_POST, handleApiTlsPostWS, rawBodyCollect);
   } else {
     server.on("/",                HTTP_GET,  handleRoot);
     server.on("/login",           HTTP_GET,  handleLoginGet);   // serve the login form
-    server.on("/login",           HTTP_POST, handleLoginPost);  // validate credentials
-    server.on("/logout",          HTTP_POST, handleLogout);     // POST so prefetchers can't trigger it
-    server.on("/save",            HTTP_POST, handleSave);
+    server.on("/login",           HTTP_POST, handleLoginPost, rawBodyCollect);
+    server.on("/logout",          HTTP_POST, handleLogout,    rawBodyCollect); // POST so prefetchers can't trigger it
+    server.on("/save",            HTTP_POST, handleSave,      rawBodyCollect);
     server.on("/settings",        HTTP_GET,  handleSettingsPage);
     server.on("/api/settings",    HTTP_GET,  handleApiSettingsGet);
-    server.on("/api/settings",    HTTP_POST, handleApiSettingsPost);
+    server.on("/api/settings",    HTTP_POST, handleApiSettingsPost, rawBodyCollect);
     server.on("/api/status",      HTTP_GET,  handleApiStatus);
-    server.on("/api/control",     HTTP_POST, handleApiControl);
+    server.on("/api/control",     HTTP_POST, handleApiControl, rawBodyCollect);
     server.on("/api/log/stream",  HTTP_GET,  handleLogStream);
     server.on("/log",             HTTP_GET,  handleLogPage);
     server.on("/update",          HTTP_GET,  handleOTAGet);
-    server.on("/update",          HTTP_POST, handleOTAPost, handleOTAUpload);
-    server.on("/api/tls",         HTTP_POST, handleApiTlsPostWS);
+    // Custom handler: multipart → handleOTAUpload, anything else drained +
+    // rejected (fixes the raw-path server.upload() null-deref, audit 2026-07).
+    server.addHandler(new OtaUpdateHandler());
+    server.on("/api/tls",         HTTP_POST, handleApiTlsPostWS, rawBodyCollect);
     server.on("/api/cycles",      HTTP_GET,    handleApiCyclesGet);
-    server.on("/api/cycles",      HTTP_DELETE, handleApiCyclesDelete);
+    server.on("/api/cycles",      HTTP_DELETE, handleApiCyclesDelete, rawBodyCollect);
   }
+  // Catch-all — MUST be registered last (handlers match in registration
+  // order): 404s / redirects unmatched URIs and stream-discards their bodies.
+  server.addHandler(new WebBodyGuardHandler());
 
   // Tell WebServer to keep these request headers — by default it discards
   // anything not on this list, so server.header()/hasHeader() return empty.
@@ -5410,7 +5726,14 @@ void chargerBusTask(void* /*pvParameters*/) {
 #endif
 
     // --- Drain incoming frames ---
-    while (mcpCan.checkReceive() == CAN_MSGAVAIL) {
+    // Bounded per pass (audit 2026-07): a babbling/flooded bus used to keep
+    // checkReceive() permanently true, spinning this priority-6 loop forever —
+    // heartbeats stopped and bikeBusTask (prio 5, same core) starved. 32
+    // frames per 5 ms pass (~6400 f/s) is still ~3× the theoretical maximum
+    // frame rate of a 250 kbps bus, so no legitimate traffic is ever deferred.
+    int drained = 0;
+    while (drained < 32 && mcpCan.checkReceive() == CAN_MSGAVAIL) {
+      drained++;
       byte     len = 0;
       byte     buf[8];
       uint32_t id  = 0;
@@ -5495,9 +5818,16 @@ static uint16_t countCycleRecords() {
   if (!g_fatReady) return 0;
   File f = FFat.open("/cycles.csv", FILE_READ);
   if (!f) return 0;
+  // Block reads (audit 2026-07) — the old one-byte-per-read() loop took
+  // seconds at boot once the CSV grew to hundreds of KB.
   uint16_t newlines = 0;
+  uint8_t  cbuf[256];
   while (f.available()) {
-    if (f.read() == '\n') newlines++;
+    size_t n = f.read(cbuf, sizeof(cbuf));
+    if (n == 0) break;
+    for (size_t i = 0; i < n; i++) {
+      if (cbuf[i] == '\n') newlines++;
+    }
   }
   f.close();
   // Header line accounts for one '\n'; remainder are data rows.
@@ -5627,11 +5957,6 @@ void rampTask(void* /*pvParameters*/) {
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(1000)); // 1 s ramp tick
 
-    // Dead-man heartbeat — bumped every iteration (before any `continue`) so
-    // chargerBusTask can tell this task is still advancing. If we ever wedge,
-    // the counter freezes and the charger heartbeat falls back to STOP.
-    g_rampHeartbeat++;
-
     // ── Control snapshot ──────────────────────────────────────────────────────
     uint16_t target     = 0;
     uint16_t current    = 0;
@@ -5640,16 +5965,32 @@ void rampTask(void* /*pvParameters*/) {
     uint16_t rampStep   = DEFAULT_RAMP_STEP_W;
     uint16_t targetVolt = MAX_CHARGE_VOLTAGE_DV;
 
-    if (xSemaphoreTake(controlMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-      target     = ctrl.targetPowerW;
-      current    = ctrl.currentPowerW;
-      enabled    = ctrl.enabled;
-      nChargers  = ctrl.chargerCount;
-      rampStep   = ctrl.rampStepW;
-      targetVolt = ctrl.targetVoltDv;
-      if (nChargers < 1) nChargers = 1;
-      xSemaphoreGive(controlMutex);
+    if (xSemaphoreTake(controlMutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+      // (audit 2026-07) A timeout here used to leave enabled=false, so the
+      // disabled branch below ran: phase forced back to CC, cvTargetDv and the
+      // taper/plateau watches cleared — one transient contention mid-CV
+      // silently restarted the whole cycle (and corrupted the CycleRecord in
+      // progress). Instead skip the tick WITHOUT touching any state — and
+      // WITHOUT bumping g_rampHeartbeat, so if the mutex stays wedged the
+      // dead-man in sendHeartbeat() forces charger STOP within 5 s.
+      LOG("[RAMP] controlMutex timeout — tick skipped\n");
+      continue;
     }
+    target     = ctrl.targetPowerW;
+    current    = ctrl.currentPowerW;
+    enabled    = ctrl.enabled;
+    nChargers  = ctrl.chargerCount;
+    rampStep   = ctrl.rampStepW;
+    targetVolt = ctrl.targetVoltDv;
+    if (nChargers < 1) nChargers = 1;
+    xSemaphoreGive(controlMutex);
+
+    // Dead-man heartbeat — bumped once per SUPERVISED tick (after the control
+    // snapshot succeeded, before any other `continue`) so chargerBusTask can
+    // tell this task is still advancing and still acting on fresh control
+    // state. If we ever wedge — including on a stuck controlMutex — the
+    // counter freezes and the charger heartbeat falls back to STOP.
+    g_rampHeartbeat++;
 
     // Detect rising edge of `enabled` (off → on). Used to decide whether
     // the user just kicked off a fresh charge session, so we can skip

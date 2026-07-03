@@ -130,7 +130,7 @@ This is the one to remember. Four hold patterns are recognised:
 | --- | --- | --- |
 | **< 1 s** | Nothing | Ignored — prevents accidental triggers from packaging knocks. |
 | **1 – 3 s** | Nothing (logged) | Logged to serial/SSE but no action taken. |
-| **3 – 5 s** | Clear auth lock | If the dashboard login is hard-locked (5 failed password attempts), this clears the lock and the fail counter so the login page becomes responsive again. Has no effect if the lock is not currently active. |
+| **3 – 5 s** | Clear auth lock | If the dashboard login is locked (5 failed password attempts from one device, or the device-wide 15-failures-per-minute backstop), this clears all locks and fail counters so the login page becomes responsive again. Has no effect if no lock is currently active. |
 | **5 – 10 s** | Clear WiFi & restart into AP mode | Wipes saved WiFi SSID/password only. AP credentials, MQTT settings, charger count, ramp rate, target voltage, and boot defaults all stay intact. Use this when you need to switch the controller to a new network. |
 | **10 s+** | Factory reset | Wipes the entire NVS configuration namespace — WiFi credentials, AP credentials, MQTT settings, charger count, ramp rate, target voltage, and boot defaults. The controller reboots immediately when the 10 s threshold is hit (you don't need to release), so you'll feel the reset rather than wonder if it took. Use this when re-homing the controller to another bike or troubleshooting a stuck configuration. |
 
@@ -164,7 +164,7 @@ While a dashboard tab is open and polling, the session stays alive regardless of
 
 ### Login rate limiting and lock-out
 
-Failed login attempts are tracked globally:
+Failed login attempts are tracked **per client device** (by IP address), so one misbehaving gadget on your network can't lock everyone else out:
 
 | Attempt | Delay before next try |
 | --- | --- |
@@ -175,10 +175,14 @@ Failed login attempts are tracked globally:
 | 6 | 30 s |
 | 7+ | 60 s (cap) |
 
-After **5 failures** the login page returns **423 Locked** and refuses all further attempts regardless of waiting. Three ways to clear the lock:
+After **5 failures from one device** the login page returns **423 Locked** and refuses all further attempts from that device regardless of waiting.
 
-1. **BOOT button hold 3 – 5 s** — instant, no reboot required (see button section above).
-2. **15 minute auto-clear** — the lock clears itself after 15 minutes with no manual intervention.
+On top of the per-device tracking there is a **device-wide backstop**: if **15 login failures from any combination of devices** land within one minute (the signature of someone hopping between addresses to dodge the per-device lock), the controller locks out **all** new logins for 15 minutes.
+
+Three ways to clear either lock:
+
+1. **BOOT button hold 3 – 5 s** — instant, no reboot required (see button section above). Clears the per-device locks, the fail counters, and the device-wide lock in one go.
+2. **15 minute auto-clear** — both lock types clear themselves after 15 minutes with no manual intervention.
 3. **Reboot** — power cycle or press RST.
 
 Existing open sessions are not affected by a lock — if you are already logged in, the dashboard keeps working while the lock is active. Only new login attempts are blocked.
@@ -402,7 +406,7 @@ The controller can serve the dashboard over HTTPS (port 443) with a TLS certific
 
 - First browser visit to `https://<ip>/` will show a security warning for a self-signed cert. Accept it once (add a permanent exception). After that the browser connects silently.
 - To disable HTTPS: untick **Enable HTTPS** in Settings (or POST `{"enabled": false}` to `/api/tls`) and reboot. The controller falls back to plain HTTP on port 80.
-- `/update` (OTA) and the live log stream (`/api/log/stream`) remain HTTP-only even when HTTPS is active.
+- `/update` (OTA), the live log stream (`/api/log/stream`), and the log viewer page (`/log`) remain HTTP-only even when HTTPS is active — disable HTTPS temporarily if you need them. The cycle-data download (**⬇ Cycles** on the dashboard) works over HTTPS.
 - The HTTPS server runs in its own FreeRTOS task. No extra polling is needed; the plain HTTP port 80 also stays up to serve the redirect.
 - Cert and key are stored in NVS under keys `tls_cert`, `tls_key`, and `https_en`. A factory reset (10 s BOOT hold) clears them along with all other settings.
 
