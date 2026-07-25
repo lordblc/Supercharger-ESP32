@@ -38,7 +38,7 @@
 //                           c_plus (switch), charging_enabled (switch)
 //
 // Required libraries (Arduino Library Manager):
-//   mcp_can          by coryjfowler
+//   mcp_can          by coryjfowler (important. Do not use alternatives, it will fail the code.)
 //   PubSubClient     by Nick O'Leary
 //   ArduinoJson      by Benoit Blanchon  (v6)
 //   BLEDevice        } built into Espressif ESP32 Arduino core - no install needed
@@ -48,7 +48,7 @@
 //   esp_https_server } built into Espressif ESP32 Arduino core - used for HTTPS port-443 serving
 // ==========================================================================
 
-#define VERSION 202607031330
+#define VERSION 202607251501
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -80,6 +80,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include <lwip/sockets.h>    // select() writability probe + SO_SNDTIMEO — SSE log stream
 #include <PubSubClient.h>
 #include <ArduinoJson.h>     // v6 — used by /api/settings, /api/control body parsing
 #include <WiFiClientSecure.h>// MQTT-over-TLS path (mqttTls=true)
@@ -327,8 +328,21 @@ static const uint32_t CHARGER_CMD_ID         = 0x1806E5F4UL;
 static const uint32_t CHARGER_STATUS_ID_BASE = 0x18FF50E0UL; // mask low nibble
 static const uint32_t CHARGER_STATUS_ID_MASK = 0x1FFFFFF0UL; // top 28 bits
 
-// Maximum distinct chargers we track (nibbles 0–15)
+// Maximum distinct chargers we track (nibbles 0–15).
+// MUST stay 16: chargers[] is indexed by the raw CAN instance nibble, and the
+// Elcon factory IDs use nibbles 5 / 7 / 8 / 9 (see the ID comment above). A
+// smaller array would make processChargerFrame()'s `nibble >= MAX_CHARGERS`
+// guard reject every real charger.
 #define MAX_CHARGERS 16
+
+// Largest charger count the rest of the system supports. The preset power
+// table has 4 rows and ctrl.chargerCount (the per-charger current divisor) is
+// validated to 1..4, so a chargerCount above 4 would divide the commanded
+// current by fewer units than are physically drawing it — each charger would
+// then deliver the full per-unit share and the pack would see more than
+// commanded. Detection is clamped here rather than in the nibble guard so
+// extra units are noticed and logged instead of silently ignored.
+static const uint8_t MAX_ACTIVE_CHARGERS = 4;
 
 struct ChargerUnit {
   bool     present   = false;
@@ -368,8 +382,123 @@ static volatile bool    g_thermalThrottle = false;
 // 16-bit so the dashboard can display "—" when negative; capped at 24 h.
 static volatile int16_t g_etaMinutes = -1;
 
+// Why charging is currently inhibited outright, if it is. Distinct from
+// g_thermalThrottle, which means "still charging, just at reduced power".
+// An inhibit means zero current: the pack is outside the cell's safe charging
+// envelope (Farasis datasheet: 0-45 °C, and see PACK_V_CHARGE_FLOOR_DV).
+// Latched by rampTask with hysteresis so a cell sitting on a limit cannot
+// chatter the chargers on and off once per second. 8-bit read/write is atomic
+// on the ESP32, so no mutex needed.
+enum ChargeInhibit : uint8_t {
+  INHIBIT_NONE      = 0,
+  INHIBIT_TOO_COLD  = 1,   // coldest cell below CHARGE_TEMP_MIN_C
+  INHIBIT_TOO_HOT   = 2,   // hottest cell above CHARGE_TEMP_MAX_C
+  INHIBIT_PACK_LOW  = 3,   // pack below PACK_V_CHARGE_FLOOR_DV
+};
+static volatile uint8_t g_chargeInhibit = INHIBIT_NONE;
+
+// Human-readable form for logs and the status API.
+static const char* chargeInhibitName(uint8_t r) {
+  switch (r) {
+    case INHIBIT_TOO_COLD: return "pack too cold";
+    case INHIBIT_TOO_HOT:  return "pack too hot";
+    case INHIBIT_PACK_LOW: return "pack voltage too low";
+    default:               return "none";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Protection-state reporting for the dashboard banner.
+//
+// Each flag below is owned by the code path that detects the condition. They
+// are deliberately NOT combined at the point of detection — the priority
+// ordering lives in exactly one place (activeProtection()) so the firmware,
+// the dashboard and any future MQTT sensor can never disagree about which
+// condition is "the" current one. The dashboard shows a single banner for the
+// highest-severity active state; duplicating this ordering in JavaScript would
+// be a second source of truth waiting to drift.
+// 8/32-bit read/write is atomic on the ESP32, so none of these need a mutex.
+// ---------------------------------------------------------------------------
+
+// Bike BMS telemetry older than BMS_STALE_TIMEOUT_MS while charging is enabled.
+// Charging is stopped and waiting for fresh frames. Owned by rampTask.
+static volatile bool g_bmsStale = false;
+
+// More chargers answered on the CAN bus than MAX_ACTIVE_CHARGERS. The count was
+// clamped, so the per-charger current divisor no longer matches reality and
+// every unit would over-deliver. Owned by the charger-bus recount paths.
+static volatile bool g_chargerCountClamped = false;
+
+// The absolute 1.0 C ceiling (CELL_MAX_CHARGE_C × pack Ah) is actively limiting
+// commanded current, i.e. something upstream asked for more than the cells are
+// rated to accept. Owned by rampTask's amp calculation.
+static volatile bool g_currentClamped = false;
+
+// millis() of the most recent CAN frame rejected as implausible (pack voltage
+// outside the 28S window). 0 = none since boot. A timestamp rather than a
+// sticky flag so the banner self-clears once the bus is healthy again.
+static volatile unsigned long g_lastBadFrameMs = 0;
+static const unsigned long BAD_FRAME_BANNER_MS = 10000UL;  // "recent" window
+
+// Ordered worst-first. The numeric values are not persisted anywhere, so this
+// list can be reordered freely; only the relative order matters.
+enum ProtState : uint8_t {
+  PROT_NONE = 0,
+  PROT_TOO_COLD,           // charging inhibited — below datasheet minimum
+  PROT_TOO_HOT,            // charging inhibited — above datasheet maximum
+  PROT_PACK_LOW,           // charging inhibited — risk of copper dissolution
+  PROT_BMS_STALE,          // charging stopped — no fresh bike telemetry
+  PROT_CHARGER_CLAMPED,    // wiring/config fault — too many chargers
+  PROT_THERMAL_THROTTLE,   // still charging, power reduced by hot cutback
+  PROT_CURRENT_CLAMPED,    // still charging, power reduced by the 1 C ceiling
+  PROT_FRAMES_REJECTED,    // informational — bad CAN frames being dropped
+};
+
+// Stable machine-readable keys. The dashboard maps these to copy, so changing a
+// string here means changing the matching key in HTML_DASHBOARD's JS.
+static const char* protStateKey(uint8_t s) {
+  switch (s) {
+    case PROT_TOO_COLD:          return "too_cold";
+    case PROT_TOO_HOT:           return "too_hot";
+    case PROT_PACK_LOW:          return "pack_low";
+    case PROT_BMS_STALE:         return "bms_stale";
+    case PROT_CHARGER_CLAMPED:   return "charger_clamped";
+    case PROT_THERMAL_THROTTLE:  return "thermal_throttle";
+    case PROT_CURRENT_CLAMPED:   return "current_clamped";
+    case PROT_FRAMES_REJECTED:   return "frames_rejected";
+    default:                     return "none";
+  }
+}
+
+// The single highest-severity active protection state. An outright inhibit
+// outranks everything: if the pack is too cold to charge, saying "power reduced"
+// as well would be actively misleading.
+static uint8_t activeProtection() {
+  switch (g_chargeInhibit) {
+    case INHIBIT_TOO_COLD: return PROT_TOO_COLD;
+    case INHIBIT_TOO_HOT:  return PROT_TOO_HOT;
+    case INHIBIT_PACK_LOW: return PROT_PACK_LOW;
+    default: break;
+  }
+  if (g_bmsStale)            return PROT_BMS_STALE;
+  if (g_chargerCountClamped) return PROT_CHARGER_CLAMPED;
+  if (g_thermalThrottle)     return PROT_THERMAL_THROTTLE;
+  if (g_currentClamped)      return PROT_CURRENT_CLAMPED;
+  if (g_lastBadFrameMs != 0 &&
+      (millis() - g_lastBadFrameMs) < BAD_FRAME_BANNER_MS)
+    return PROT_FRAMES_REJECTED;
+  return PROT_NONE;
+}
+
 // Charger is considered gone if no status frame received within this window
 static const unsigned long CHARGER_TIMEOUT_MS = 10000;
+
+// Consecutive failed heartbeat transmits before we re-initialise the MCP2515
+// (M2). At HEARTBEAT_INTERVAL_MS this is the recovery latency, so keep it well
+// above CHARGER_TIMEOUT_MS / HEARTBEAT_INTERVAL_MS — a reset is itself
+// disruptive and we only want it for a genuinely wedged controller, not for
+// "no charger plugged in yet", which also fails to ACK.
+static const uint16_t MCP_TX_FAIL_RESET_THRESHOLD = 30;
 
 // Heartbeat interval — must stay well under the charger's 5 s cutoff
 static const unsigned long HEARTBEAT_INTERVAL_MS = 1000;
@@ -399,6 +528,76 @@ static const int MAX_CHARGER_ROWS = 4;
 // const not constexpr. Value is fixed after startup and never changes.
 static const uint16_t MAX_CHARGE_VOLTAGE_DV =
   VOLTAGE_CUTBACK[ (sizeof(VOLTAGE_CUTBACK)/sizeof(VOLTAGE_CUTBACK[0])) - 1 ].threshold;
+
+// ---------------------------------------------------------------------------
+// Cell-derived limits — Farasis IMP06160230P25A, 25 Ah NMC pouch, 28S monolith
+// (datasheet Farasis Energy V5, Aug 2011):
+//
+//   Nominal voltage        3.65 V      → 28S nominal 102.2 V
+//   Constant voltage       4.15-4.20 V → 28S CV      116.2-117.6 V
+//   Discharge V (min)      2.00 V      → 28S floor    56.0 V
+//   Max charge current     25 A on a 25 Ah cell = 1.0 C
+//   Charging temp          0 to 45 °C
+//
+// Three DIFFERENT thresholds live below. Keeping them separate matters:
+//
+//   1. PLAUSIBILITY  — "could a working BMS have sent this?" Purpose is to
+//      reject corrupt CAN frames. Deliberately WIDE, so a genuinely flat pack
+//      still reads correctly and can be reported as flat rather than
+//      disappearing into a "BMS data stale" failsafe.
+//   2. CHARGE FLOOR  — "is it safe to push current into this pack?" This is a
+//      protection limit, and it is much higher than the plausibility floor.
+//   3. CHARGE TARGET — MAX_CHARGE_VOLTAGE_DV above, what we aim for.
+//
+// Collapsing 1 and 2 into one constant is the tempting mistake: it makes an
+// over-discharged pack look like a comms fault.
+static const uint8_t  PACK_SERIES_COUNT = 28;    // 28S — matches cellVoltsMv[28]
+
+// (1) Plausibility window. 1.5 V/cell is below anything a healthy cell reaches
+// but still a decodable reading, so a deeply discharged pack is *visible*.
+// 4.20 V/cell is the datasheet CV maximum — nothing above it is physical.
+static const uint16_t CELL_V_PLAUSIBLE_MIN_MV = 1500;
+static const uint16_t CELL_V_PLAUSIBLE_MAX_MV = 4200;
+
+// (2) Charge-inhibit floor. Below ~2.5 V/cell the copper anode current
+// collector begins to dissolve; on recharge the dissolved copper can plate out
+// as an internal short. This is a distinct failure mode from the lithium
+// plating that COLD_CUTBACK guards against, and it is not recoverable by
+// charging normally — industry guidance is that a cell taken below 2.5 V should
+// only ever see a ≤0.05 C recovery charge under supervision, not a 1 C CC ramp.
+// The Farasis sheet lists 2.0 V as "Discharge V (min)", which is the absolute
+// floor, not a safe recharge point; the Zero BMS should itself cut out around
+// 3.0 V/cell, so reaching this gate at all means something is already wrong.
+// We therefore refuse to charge rather than attempt recovery.
+static const uint16_t CELL_V_CHARGE_FLOOR_MV = 2500;
+
+// Derived, so the series count and the per-cell limits can never drift apart.
+//   mV × cells / 100 = dV
+static const uint16_t PACK_V_MIN_DV =
+  (uint16_t)((uint32_t)CELL_V_PLAUSIBLE_MIN_MV * PACK_SERIES_COUNT / 100);  //  420 dV
+static const uint16_t PACK_V_MAX_DV =
+  (uint16_t)((uint32_t)CELL_V_PLAUSIBLE_MAX_MV * PACK_SERIES_COUNT / 100);  // 1176 dV
+static const uint16_t PACK_V_CHARGE_FLOOR_DV =
+  (uint16_t)((uint32_t)CELL_V_CHARGE_FLOOR_MV  * PACK_SERIES_COUNT / 100);  //  700 dV
+
+// Cell max charge current is 25 A on a 25 Ah cell, i.e. exactly 1.0 C. Because
+// the C-rate is per-cell and packAH scales with the parallel count, 1.0 C of
+// the BMS-reported pack Ah is the correct total-current ceiling regardless of
+// how many cells sit in parallel — no need to hard-code the P count.
+static const float CELL_MAX_CHARGE_C = 1.0f;
+
+// ---------------------------------------------------------------------------
+// Charging temperature window — Farasis datasheet "Charging Temp. 0°C to 45°C".
+// (Operating range is -20..60 °C, but that is DISCHARGE; charging is narrower.)
+//
+// Enforced as a hard inhibit in rampTask, with hysteresis so a cell hovering on
+// the boundary doesn't chatter the chargers on and off once per second. The
+// COLD/HOT cutback tables shape the C-rate *inside* this window; they are not
+// the boundary itself, and they are kept overlapping it as a second,
+// independent layer in case the gate is ever bypassed by a future refactor.
+static const short CHARGE_TEMP_MIN_C        = 0;   // datasheet minimum
+static const short CHARGE_TEMP_MAX_C        = 45;  // datasheet maximum
+static const short CHARGE_TEMP_HYSTERESIS_C = 2;   // re-arm 2 °C inside the limit
 
 // Ramp rate: default 100 W per ramp tick (1 s), slider step 100 W
 static const uint16_t DEFAULT_RAMP_STEP_W = 100;
@@ -702,7 +901,8 @@ static uint16_t g_cycleCount = 0;      // number of records in /cycles.csv (cach
 // ---------------------------------------------------------------------------
 
 const char HTML_LOGIN[] PROGMEM =
-  "<!DOCTYPE html><html><head><title>Supercharger - Login</title>"
+  "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+  "<title>Supercharger - Login</title>"
   "<meta name='viewport' content='width=device-width,initial-scale=1'>"
   "<style>"
   "body{font-family:sans-serif;background:#0a0a1a;color:#ccc;"
@@ -1267,10 +1467,15 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
     <a href="/settings" style="color:#e94560;margin-left:8px">Configure WiFi &#8594;</a>
   </div>
 
-  <div id="thermalBanner" style="display:none;background:#3a1f0a;border:1px solid #ff8c00;
-       border-radius:8px;padding:12px 16px;margin-top:12px;text-align:center">
-    <span style="color:#ff8c00;font-weight:bold">&#127777; Thermal throttling</span>
-    <span style="color:#aaa"> — pack temperature high, charge power reduced. Charging continues at a safe rate.</span>
+  <!-- Protection banner. ONE element for every protection state rather than one
+       div per condition: the firmware already decided which state is most
+       severe (activeProtection()), so the UI only ever has one thing to say.
+       Colour, icon and copy are all set from d.protection in updateStatus().
+       Replaces the former separate thermalBanner / inhibitBanner. -->
+  <div id="protBanner" style="display:none;border-radius:8px;padding:12px 16px;
+       margin-top:12px;text-align:center;border:1px solid #888;background:#222">
+    <span id="protTitle" style="font-weight:bold"></span>
+    <span id="protMsg" style="color:#aaa"></span>
   </div>
 
   <div class="section">Monolith Pack</div>
@@ -1627,8 +1832,53 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
           // AP mode banner
           document.getElementById('apBanner').style.display = d.ap_mode ? 'block' : 'none';
 
-          // Thermal throttling banner (hot-cutback active in CC phase)
-          document.getElementById('thermalBanner').style.display = d.thermal_throttle ? 'block' : 'none';
+          // ── Protection banner ────────────────────────────────────────────
+          // d.protection is the single highest-severity active state, already
+          // prioritised by activeProtection() in the firmware. Keys here MUST
+          // match protStateKey(). Three severities:
+          //   stop  (red)   — no current is flowing
+          //   warn  (amber) — still charging, but limited
+          //   info  (blue)  — advisory only, charging unaffected
+          var PROT = {
+            too_cold: { sev:'stop', icon:'❄', title:'Charging paused — pack too cold',
+              msg:' Pack is below 0 °C. Charging a cold lithium cell plates metallic lithium on the anode, which permanently reduces capacity and can eventually short the cell. Charging will resume on its own once the pack warms above 2 °C — riding it, or moving the bike somewhere warmer, is the quickest way.' },
+            too_hot: { sev:'stop', icon:'🔥', title:'Charging paused — pack too hot',
+              msg:' Pack is above 45 °C, the cell manufacturer’s charging limit. Charging will resume on its own once it cools below 43 °C. If this happens without hard riding beforehand, check for blocked airflow around the pack.' },
+            pack_low: { sev:'stop', icon:'⚠', title:'Charging blocked — pack voltage too low',
+              msg:' Pack is below 70 V (2.5 V per cell). Below this level the copper inside the cells starts to dissolve, and charging normally can create an internal short. This should not happen in normal use — the bike’s BMS cuts out well above it. Have the pack checked by a technician before charging; do not force it.' },
+            bms_stale: { sev:'stop', icon:'🔌', title:'Charging stopped — no data from bike',
+              msg:' The controller has lost contact with the bike’s battery management system, so it cannot see pack voltage or temperature and will not charge blind. Check that the charge connector is fully seated and the bike is powered on. Charging resumes automatically within a second of data returning.' },
+            charger_clamped: { sev:'stop', icon:'⚠', title:'Wiring problem — too many chargers',
+              msg:' More than four chargers are answering on the CAN bus. The controller divides the requested current between the chargers it knows about, so an extra unit would make every charger deliver more than intended. Disconnect the extra charger, or set distinct CAN instance IDs, before charging.' },
+            thermal_throttle: { sev:'warn', icon:'🌡', title:'Reduced power — pack warm',
+              msg:' Pack temperature is high, so charge power has been cut back. This is normal on a hot day or after a fast ride. Charging continues safely at a lower rate and will speed up as the pack cools — nothing to do.' },
+            current_clamped: { sev:'warn', icon:'🛡', title:'Reduced power — at cell current limit',
+              msg:' The requested power needs more current than the cells are rated to accept (1 C), so it has been capped. Charging continues safely at the maximum the pack allows. Lower the power setting if you’d rather not sit at the limit.' },
+            frames_rejected: { sev:'info', icon:'ℹ', title:'Ignoring bad data from bike',
+              msg:' Some CAN messages from the battery are arriving corrupted and are being discarded rather than acted on. Charging is unaffected while valid messages keep coming. If this persists, check the CAN wiring and connector for damage or a loose shield.' }
+          };
+          var SEV = {
+            stop: { bg:'#3a0a0a', border:'#e94560', fg:'#e94560' },
+            warn: { bg:'#3a1f0a', border:'#ff8c00', fg:'#ff8c00' },
+            info: { bg:'#0a2a3a', border:'#4aa3c7', fg:'#4aa3c7' }
+          };
+          var pb = document.getElementById('protBanner');
+          var p  = PROT[d.protection];
+          if (p) {
+            var s = SEV[p.sev];
+            pb.style.background  = s.bg;
+            pb.style.borderColor = s.border;
+            var t = document.getElementById('protTitle');
+            t.style.color   = s.fg;
+            t.textContent   = p.icon + ' ' + p.title;
+            // textContent, not innerHTML — these strings are firmware
+            // constants today, but keeping the sink safe means a future
+            // dynamic detail can't turn into script injection.
+            document.getElementById('protMsg').textContent = p.msg;
+            pb.style.display = 'block';
+          } else {
+            pb.style.display = 'none';
+          }
 
           // Pack current display:
           //  - When charging is enabled, current is flowing INTO the pack on
@@ -1854,6 +2104,7 @@ const char HTML_OTA[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
+  <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>OTA Update</title>
   <style>
@@ -1923,7 +2174,14 @@ const char HTML_OTA[] PROGMEM = R"rawliteral(
           bar.style.width='100%';
           var secs=6;
           function tick(){
-            stat.innerText='Success! Rebooting… returning to dashboard in '+secs+' s';
+            // Plain ASCII "..." here, deliberately. This string used to carry a
+            // literal U+2026 ellipsis while the page declared no charset, so
+            // browsers fell back to their locale default (usually windows-1252)
+            // and rendered its three UTF-8 bytes as mojibake -- the "Rebooting"
+            // message looked corrupted. The meta charset added above fixes the
+            // root cause; ASCII here means this particular string cannot break
+            // again regardless of how the encoding is resolved.
+            stat.innerText='Success! Rebooting... returning to dashboard in '+secs+' s';
             if(secs<=0){ window.location.href='/'; return; }
             secs--;
             setTimeout(tick,1000);
@@ -1950,6 +2208,7 @@ const char HTML_LOG[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
+  <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Serial Log</title>
   <style>
@@ -2012,18 +2271,27 @@ const char HTML_LOG[] PROGMEM = R"rawliteral(
       if (autoScroll) logEl.scrollTop = logEl.scrollHeight;
     }
 
+    var lastEvt = 0;
+
     function connect() {
       if (es) es.close();
       es = new EventSource('/api/log/stream');
+      lastEvt = Date.now();
 
       es.onopen = function() {
         statusEl.textContent = 'Connected';
+        lastEvt = Date.now();
       };
 
       es.onmessage = function(e) {
         // Each SSE message is one line of log output
+        lastEvt = Date.now();
         appendLine(e.data + '\n');
       };
+
+      // Server emits "event: ping" every ~20 s while the log is quiet.
+      // Not shown in the log — it only feeds the staleness watchdog below.
+      es.addEventListener('ping', function() { lastEvt = Date.now(); });
 
       es.onerror = function() {
         statusEl.textContent = 'Reconnecting...';
@@ -2031,6 +2299,17 @@ const char HTML_LOG[] PROGMEM = R"rawliteral(
         setTimeout(connect, 3000);
       };
     }
+
+    // Staleness watchdog: a half-open TCP stream (WiFi drop, device reboot,
+    // firewall idle-kill on a routed path) leaves EventSource silently "open"
+    // forever — onerror never fires. With server pings every 20 s, more than
+    // 45 s of total silence means the stream is dead: force a reconnect.
+    setInterval(function() {
+      if (es && lastEvt && Date.now() - lastEvt > 45000) {
+        statusEl.textContent = 'Stale - reconnecting...';
+        connect();
+      }
+    }, 5000);
 
     function togglePause() {
       paused = !paused;
@@ -2058,6 +2337,8 @@ const char HTML_LOG[] PROGMEM = R"rawliteral(
 static WiFiClient sseClient;
 static uint32_t   sseReadPos  = 0;
 static bool       sseActive   = false;
+// Last time anything was written to the SSE client — drives the idle ping.
+static unsigned long sseLastWriteMs = 0;
 
 // ---------------------------------------------------------------------------
 // Route handlers
@@ -2066,7 +2347,7 @@ static bool       sseActive   = false;
 // GET /log — serves the log viewer page (protected)
 void handleLogPage() {
   if (!requireAuth(false)) return;  // HTML route — 302 to /login on no session
-  server.send_P(200, "text/html", HTML_LOG);
+  server.send_P(200, "text/html; charset=utf-8", HTML_LOG);
 }
 
 // GET /api/log/stream — opens an SSE connection (protected).
@@ -2081,6 +2362,13 @@ void handleLogStream() {
   }
 
   sseClient  = server.client();
+  // Bound how long a single write may block if the viewer's TCP window fills
+  // mid-write. Together with the select() probe in sseFlush() this preserves
+  // the finding #15 guarantee: a stalled log viewer can't wedge loop().
+  {
+    struct timeval sndTo = { 0, 200000 };  // 200 ms
+    sseClient.setSocketOption(SOL_SOCKET, SO_SNDTIMEO, &sndTo, sizeof(sndTo));
+  }
   // Start the SSE response — keep-alive, no content-length
   sseClient.print(
     "HTTP/1.1 200 OK\r\n"
@@ -2093,6 +2381,23 @@ void handleLogStream() {
   // then track position for incremental updates
   sseReadPos = (logHead > LOG_BUF_SIZE) ? (logHead - LOG_BUF_SIZE) : 0;
   sseActive  = true;
+  sseLastWriteMs = millis();
+}
+
+// Zero-timeout select(): true when the SSE socket's send buffer can accept
+// data right now. This replaces the earlier availableForWrite() >= 1460 guard:
+// core 3.x's NetworkClient does NOT implement availableForWrite(), so the
+// Print base-class default returned 0 and the guard skipped EVERY round —
+// the stream carried headers and then nothing, forever (the "log page shows
+// nothing" bug). select() writability is the real lwIP-level check.
+static bool sseSocketWritable() {
+  int fd = sseClient.fd();
+  if (fd < 0) return false;
+  fd_set wfds;
+  FD_ZERO(&wfds);
+  FD_SET(fd, &wfds);
+  struct timeval tv = { 0, 0 };   // poll — never blocks loop()
+  return select(fd + 1, nullptr, &wfds, nullptr, &tv) > 0;
 }
 
 // Called from loop() — pushes any new log lines to the SSE client.
@@ -2104,14 +2409,26 @@ void sseFlush() {
     sseActive = false;
     return;
   }
-  // Don't write unless the socket has room for a full round's output. A stalled
+  // Don't write unless the socket can take data without blocking. A stalled
   // log viewer must never block the whole WebServer on a slow TCP write
   // (finding #15). If the send buffer is backed up we skip this round and retry
   // next loop(); worst case the viewer misses a few log lines, never the
-  // dashboard. One MSS (1460 B) comfortably covers the ≤256-byte read even with
-  // the per-line "data: …\n\n" overhead.
-  if (sseClient.availableForWrite() < 1460) return;
-  if (sseReadPos >= logHead) return; // nothing new
+  // dashboard. The 200 ms SO_SNDTIMEO set at accept bounds the residual risk
+  // of a window filling mid-write.
+  if (!sseSocketWritable()) return;
+  if (sseReadPos >= logHead) {
+    // Nothing new. Ping every 20 s of silence — three jobs in one:
+    //  - keeps stateful firewalls from silently dropping the idle flow
+    //    (cross-VLAN viewers lose quiet streams to FW idle timeouts),
+    //  - forces lwIP to detect a black-holed peer (the write eventually
+    //    errors → connected() goes false → the single SSE slot is freed),
+    //  - feeds the log page's staleness watchdog ("event: ping" listener).
+    if (millis() - sseLastWriteMs >= 20000UL) {
+      sseClient.print("event: ping\ndata: 1\n\n");
+      sseLastWriteMs = millis();
+    }
+    return;
+  }
 
   // Read up to 256 bytes at a time to keep loop() responsive
   char tmp[257];
@@ -2140,6 +2457,7 @@ void sseFlush() {
       lineBuf[lineLen++] = c;
     }
   }
+  sseLastWriteMs = millis();  // real lines went out — idle ping timer resets
 }
 
 // ---------------------------------------------------------------------------
@@ -2236,7 +2554,15 @@ static unsigned long authGlobalLockUntil   = 0;  // 0 = no global lock active
 // not the attacker-supplied input's, so timing doesn't vary with their guess.
 static bool authConstTimeStrEqual(const char* a, const char* b) {
   size_t la = strlen(a), lb = strlen(b);
-  uint8_t diff = (uint8_t)((la - lb) | (lb - la));  // nonzero if lengths differ
+  // M3: this was `(uint8_t)((la - lb) | (lb - la))`. Both operands are size_t,
+  // so the cast keeps only the low byte — and when la - lb is any nonzero
+  // multiple of 256 BOTH low bytes are zero, leaving diff == 0. Since the loop
+  // below only covers lb bytes, the correct secret followed by exactly 256
+  // extra characters compared equal. Not a bypass (the secret is still
+  // required) but the length guard did nothing in that case. Reduce the
+  // comparison to a single branchless 0/1 instead: it is independent of the
+  // secret's content, so no timing signal is introduced.
+  uint8_t diff = (la == lb) ? 0 : 1;
   for (size_t i = 0; i < lb; i++) {
     uint8_t ca = (i < la) ? (uint8_t)a[i] : 0;
     diff |= (uint8_t)(ca ^ (uint8_t)b[i]);
@@ -2572,18 +2898,28 @@ static void hardLockManualClear(const char* reason) {
 // Pull the session token out of a Cookie header string. Returns empty
 // string if the string doesn't contain an scs= entry.
 static String sessionParseCookieTokenStr(const String& cookie) {
-  int idx = cookie.indexOf("scs=");
-  if (idx < 0) return String();
-  // Guard against false-matching "xscs=foo"
-  if (idx > 0 && cookie.charAt(idx - 1) != ' ' && cookie.charAt(idx - 1) != ';') {
-    return String();
+  // L4: previously this took the FIRST "scs=" occurrence and, if it wasn't at a
+  // cookie boundary, gave up entirely. Any unrelated cookie whose *value*
+  // happened to contain the substring "scs=" (e.g. `theme=scs=dark; scs=<tok>`)
+  // therefore locked the user out. Keep scanning past non-boundary matches
+  // instead of returning empty on the first one.
+  int from = 0;
+  while (true) {
+    int idx = cookie.indexOf("scs=", from);
+    if (idx < 0) return String();
+    // Accept only at start-of-header or immediately after a "; " separator,
+    // so "xscs=foo" and "theme=scs=dark" don't false-match.
+    bool atBoundary = (idx == 0) ||
+                      (cookie.charAt(idx - 1) == ' ') ||
+                      (cookie.charAt(idx - 1) == ';');
+    if (!atBoundary) { from = idx + 4; continue; }
+    int valStart = idx + 4;
+    int valEnd   = cookie.indexOf(';', valStart);
+    if (valEnd < 0) valEnd = cookie.length();
+    String token = cookie.substring(valStart, valEnd);
+    token.trim();
+    return token;
   }
-  int valStart = idx + 4;
-  int valEnd   = cookie.indexOf(';', valStart);
-  if (valEnd < 0) valEnd = cookie.length();
-  String token = cookie.substring(valStart, valEnd);
-  token.trim();
-  return token;
 }
 
 // Pull the session token out of the WebServer request's Cookie header.
@@ -2970,7 +3306,7 @@ void handleLoginGet() {
     : "";
   char buf[2048];   // HTML_LOGIN is ~1300 bytes formatted; was 1100 — truncated mid-form
   snprintf(buf, sizeof(buf), HTML_LOGIN, errFrag);
-  server.send(200, "text/html", buf);
+  server.send(200, "text/html; charset=utf-8", buf);
 }
 
 // POST /login — thin response dispatcher around tryLogin(). All auth-state
@@ -2988,6 +3324,15 @@ void handleLoginPost() {
   // credentials, which fail closed through tryLogin.
   HttpCtx form;
   parseKVPairs(g_rawBody, form);
+
+  // L1: more fields than args[] holds means we cannot trust that "username" /
+  // "password" / "remember" are the ones the user actually sent — reject rather
+  // than authenticate against a partially-parsed form.
+  if (form.argsOverflow) {
+    LOG("[AUTH] Login form had more than %d fields — rejected\n", HTTPS_MAX_ARGS);
+    server.send(400, "text/plain", "Malformed login form\n");
+    return;
+  }
 
   // The "remember" checkbox only appears in the POST body when ticked.
   bool remember  = form.hasArg("remember");
@@ -3052,7 +3397,7 @@ void handleLogout() {
   char clearHdr[140];
   sessionBuildClearCookie(clearHdr, sizeof(clearHdr), /*secure=*/false);
   server.sendHeader("Set-Cookie", clearHdr);
-  server.send(200, "text/html",
+  server.send(200, "text/html; charset=utf-8",
     "<!DOCTYPE html><html><head><title>Logged out</title>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
     "<style>"
@@ -3074,13 +3419,13 @@ void handleLogout() {
 
 void handleRoot() {
   if (!requireAuth(false)) return;  // HTML route — 302 to /login on no session
-  server.send_P(200, "text/html", HTML_DASHBOARD);
+  server.send_P(200, "text/html; charset=utf-8", HTML_DASHBOARD);
 }
 
 // GET /settings — settings page (protected)
 void handleSettingsPage() {
   if (!requireAuth(false)) return;  // HTML route
-  server.send_P(200, "text/html", HTML_SETTINGS);
+  server.send_P(200, "text/html; charset=utf-8", HTML_SETTINGS);
 }
 
 // ---------------------------------------------------------------------------
@@ -3098,13 +3443,13 @@ static bool settingsNeedRestart = false;
 // GET / (HTTPS)
 static void httpsHandleRoot(HttpCtx& ctx) {
   if (!requireAuthCtx(ctx, false)) return;
-  ctx.sendProgmem(200, "text/html", HTML_DASHBOARD);
+  ctx.sendProgmem(200, "text/html; charset=utf-8", HTML_DASHBOARD);
 }
 
 // GET /settings (HTTPS)
 static void httpsHandleSettingsPage(HttpCtx& ctx) {
   if (!requireAuthCtx(ctx, false)) return;
-  ctx.sendProgmem(200, "text/html", HTML_SETTINGS);
+  ctx.sendProgmem(200, "text/html; charset=utf-8", HTML_SETTINGS);
 }
 
 // GET /login (HTTPS)
@@ -3126,7 +3471,7 @@ static void httpsHandleLoginGet(HttpCtx& ctx) {
     ? "<p class='err'>&#10006; Invalid username or password.</p>" : "";
   char buf[2048];   // HTML_LOGIN is ~1300 bytes formatted; was 1100 — truncated mid-form
   snprintf(buf, sizeof(buf), HTML_LOGIN, errFrag);
-  ctx.send(200, "text/html", String(buf));
+  ctx.send(200, "text/html; charset=utf-8", String(buf));
 }
 
 // POST /login (HTTPS) — uses the same tryLogin() helper as the HTTP path.
@@ -3136,6 +3481,14 @@ static void httpsHandleLoginPost(HttpCtx& ctx) {
   if (sessionTouchOrFailStr(ctx.header("Cookie"))) {
     ctx.addRespHdr("Location", "/");
     ctx.send(302, "text/plain", "");
+    return;
+  }
+
+  // L1 — see handleLoginPost.
+  if (ctx.argsOverflow) {
+    LOG("[AUTH] Login form had more than %d fields — rejected (TLS path)\n",
+        HTTPS_MAX_ARGS);
+    ctx.send(400, "text/plain", "Malformed login form\n");
     return;
   }
 
@@ -3180,7 +3533,7 @@ static void httpsHandleLogout(HttpCtx& ctx) {
   char clearHdr[160];
   sessionBuildClearCookie(clearHdr, sizeof(clearHdr), /*secure=*/true);
   ctx.addRespHdr("Set-Cookie", String(clearHdr));
-  ctx.send(200, "text/html",
+  ctx.send(200, "text/html; charset=utf-8",
     "<!DOCTYPE html><html><head><title>Logged out</title>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
     "<style>"
@@ -3260,7 +3613,9 @@ static void httpsHandleApiControl(HttpCtx& ctx) {
     return;
   }
   String result = applyApiControlBody(ctx.body);
-  int code = (result.indexOf("\"ok\":true") >= 0) ? 200 : 400;
+  // M1: 503 for "controller busy, nothing applied" — see handleApiControl.
+  int code = (result.indexOf("\"ok\":true") >= 0) ? 200
+           : (result.indexOf("Controller busy") >= 0) ? 503 : 400;
   ctx.send(code, "application/json", result);
 }
 
@@ -3547,7 +3902,13 @@ static void handleHTTPSRedirect() {
   // raw arg values would be another injection vector.
   String url = "https://" + host + server.uri();
   server.sendHeader("Location", url);
-  server.send(301, "text/plain", "");
+  // M5: 302, not 301. Browsers cache a 301 indefinitely and ignore the origin
+  // afterwards, so if HTTPS is later turned off (bad cert, expired cert,
+  // factory reset) every previously-visited browser keeps forcing https:// and
+  // the dashboard becomes unreachable until the user clears their cache — on a
+  // device whose only recovery path is the physical BOOT button. A 302 gets the
+  // same redirect behaviour with none of the stickiness.
+  server.send(302, "text/plain", "");
 }
 
 // Build the /api/settings JSON string. Called by both HTTP and HTTPS handlers.
@@ -3903,13 +4264,21 @@ void handleSave() {
   // RAW body mode (rawBodyCollect): parse the urlencoded body ourselves.
   HttpCtx form;
   parseKVPairs(g_rawBody, form);
+  // L1: reject rather than persist WiFi credentials parsed from a form we only
+  // partially captured — a silently dropped "pass" field would save an SSID
+  // with an empty password and then reboot into it.
+  if (form.argsOverflow) {
+    LOG("[SETTINGS] /save form had more than %d fields — rejected\n", HTTPS_MAX_ARGS);
+    server.send(400, "text/plain", "Malformed form\n");
+    return;
+  }
   if (form.hasArg("ssid")) {
     String newSSID = form.arg("ssid");
     String newPass = form.arg("pass");
     if (!newSSID.isEmpty()) {
       preferences.putString("ssid", newSSID);
       preferences.putString("pass", newPass);
-      server.send(200, "text/html",
+      server.send(200, "text/html; charset=utf-8",
         "<div style='font-family:Arial;text-align:center;padding:40px;"
         "background:#1a1a2e;color:#eee'>"
         "<h2 style='color:#e94560'>Saved!</h2><p>Restarting...</p></div>");
@@ -3989,7 +4358,10 @@ static String buildApiStatusJson() {
   // headroom over the worst-case formatted length (finding #14); the return
   // value is checked below so a future field addition can't silently truncate
   // the JSON into something unparseable.
-  char buf[1536];
+  // 1536 -> 1600 when charge_inhibit was added (worst case ~40 bytes:
+  // "charge_inhibit":"pack voltage too low",). The guard below still backs this
+  // up, but keep the headroom real rather than relying on the error stub.
+  char buf[1600];
   int jsonLen = snprintf(buf, sizeof(buf),
     "{"
       "\"fresh\":%s,"
@@ -4030,6 +4402,15 @@ static String buildApiStatusJson() {
       "\"target_power_w\":%d,"
       "\"current_power_w\":%d,"
       "\"thermal_throttle\":%s,"
+      // Outright charge inhibit (outside the cell's safe envelope). Distinct
+      // from thermal_throttle, which means "charging, but at reduced power".
+      // Emitted as a fixed string from chargeInhibitName() — no user-controlled
+      // data, so no escaping needed.
+      "\"charge_inhibit\":\"%s\","
+      // Highest-severity active protection state, for the dashboard banner.
+      // Priority lives in activeProtection() so the firmware and the UI can't
+      // disagree. Fixed key from protStateKey() — no user data, no escaping.
+      "\"protection\":\"%s\","
       "\"cycle_count\":%d,"
       "\"chargers\":[",
     liveSnap.dataFresh         ? "true" : "false",
@@ -4070,6 +4451,8 @@ static String buildApiStatusJson() {
     (int)ctrlSnap.targetPowerW,
     (int)ctrlSnap.currentPowerW,
     g_thermalThrottle ? "true" : "false",
+    chargeInhibitName(g_chargeInhibit),
+    protStateKey(activeProtection()),
     (int)g_cycleCount
   );
 
@@ -4142,26 +4525,35 @@ static String applyApiControlBody(const String& body) {
   int  tvd     = doc["target_volt_dv"] | -1;
   bool resetSession = doc["reset_session"] | false;
 
-  if (xSemaphoreTake(controlMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-    if (tw >= 0) ctrl.targetPowerW = (uint16_t)constrain(tw, 0, 13200);
-    if (hasEn) {
-      ctrl.enabled = en;
-      if (!en) ctrl.currentPowerW = 0;
-    }
-    if (cc >= 1 && cc <= 4) {
-      ctrl.chargerCount = (uint8_t)cc;
-      preferences.putUChar("charger_count", (uint8_t)cc);
-    }
-    if (rr >= 10 && rr <= 500) {
-      ctrl.rampStepW = (uint16_t)rr;
-      preferences.putUShort("ramp_step_w", (uint16_t)rr);
-    }
-    if (tvd >= TARGET_VOLT_PRESETS[0].dv && tvd <= (int)MAX_CHARGE_VOLTAGE_DV) {
-      ctrl.targetVoltDv = (uint16_t)tvd;
-      preferences.putUShort("target_volt_dv", (uint16_t)tvd);
-    }
-    xSemaphoreGive(controlMutex);
+  // M1: a controlMutex timeout used to fall straight through to
+  // {"ok":true} — the caller was told the command landed when nothing had been
+  // written. That silently swallowed {"enabled":false}, i.e. a stop-charging
+  // request. Report the failure so the client (or Home Assistant) can retry.
+  if (xSemaphoreTake(controlMutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+    LOG("[CTRL] controlMutex timeout — command NOT applied "
+        "(target=%d enabled=%s chargers=%d ramp=%d tgtV=%d)\n",
+        tw, hasEn ? (en ? "true" : "false") : "(unchanged)", cc, rr, tvd);
+    return "{\"ok\":false,\"error\":\"Controller busy, command not applied — retry\"}";
   }
+  if (tw >= 0) ctrl.targetPowerW = (uint16_t)constrain(tw, 0, 13200);
+  if (hasEn) {
+    ctrl.enabled = en;
+    if (!en) ctrl.currentPowerW = 0;
+  }
+  if (cc >= 1 && cc <= (int)MAX_ACTIVE_CHARGERS) {
+    ctrl.chargerCount = (uint8_t)cc;
+    preferences.putUChar("charger_count", (uint8_t)cc);
+  }
+  if (rr >= 10 && rr <= 500) {
+    ctrl.rampStepW = (uint16_t)rr;
+    preferences.putUShort("ramp_step_w", (uint16_t)rr);
+  }
+  if (tvd >= TARGET_VOLT_PRESETS[0].dv && tvd <= (int)MAX_CHARGE_VOLTAGE_DV) {
+    ctrl.targetVoltDv = (uint16_t)tvd;
+    preferences.putUShort("target_volt_dv", (uint16_t)tvd);
+  }
+  xSemaphoreGive(controlMutex);
+
   if (resetSession) {
     sessionReset();
     LOG("[CTRL] Session reset\n");
@@ -4185,7 +4577,11 @@ void handleApiControl() {
     return;
   }
   String result = applyApiControlBody(g_rawBody);
-  int code = (result.indexOf("\"ok\":true") >= 0) ? 200 : 400;
+  // M1: distinguish "your request was malformed" (400) from "the controller was
+  // busy and applied nothing" (503) — the latter is retryable and the dashboard
+  // must not treat it as success.
+  int code = (result.indexOf("\"ok\":true") >= 0) ? 200
+           : (result.indexOf("Controller busy") >= 0) ? 503 : 400;
   server.send(code, "application/json", result);
 }
 
@@ -4324,7 +4720,7 @@ static bool otaProcessChunk(const uint8_t* buf, size_t n) {
 // GET /update — OTA page (session-cookie protected)
 void handleOTAGet() {
   if (!requireAuth(false)) return;  // HTML route
-  server.send_P(200, "text/html", HTML_OTA);
+  server.send_P(200, "text/html; charset=utf-8", HTML_OTA);
 }
 
 // POST /update completion handler
@@ -4587,6 +4983,47 @@ bool beginStaConnect(const char* ssid, const char* pass) {
   return false;
 }
 
+// Human-readable names for the WiFi disconnect reason codes we actually see
+// in the field. Anything else is logged numerically.
+static const char* wifiDisconnectReasonName(uint8_t reason) {
+  switch (reason) {
+    case 2:   return "AUTH_EXPIRE";
+    case 3:   return "AUTH_LEAVE";
+    case 4:   return "ASSOC_EXPIRE";           // AP dropped us for inactivity
+    case 8:   return "ASSOC_LEAVE";
+    case 15:  return "4WAY_HANDSHAKE_TIMEOUT"; // usually wrong password
+    case 200: return "BEACON_TIMEOUT";         // we stopped hearing the AP
+    case 201: return "NO_AP_FOUND";
+    case 202: return "AUTH_FAIL";
+    case 203: return "ASSOC_FAIL";
+    case 204: return "HANDSHAKE_TIMEOUT";
+    default:  return "?";
+  }
+}
+
+// STA disconnect event — logs WHY the link dropped (the state machine only
+// notices THAT it dropped). Runs in the WiFi event task; LOG() is ring-buffer
+// + mutex so cross-task use is fine. Rate-limited to 1 line per 5 s with a
+// suppressed-count so an overnight outage can't flood the web log.
+void onWifiStaDisconnected(WiFiEvent_t event, WiFiEventInfo_t info) {
+  static unsigned long lastLogMs = 0;
+  static uint32_t      suppressed = 0;
+  uint8_t reason = info.wifi_sta_disconnected.reason;
+  unsigned long now = millis();
+  if (now - lastLogMs < 5000UL) { suppressed++; return; }
+  if (suppressed > 0) {
+    LOG("[WIFI] STA disconnected: reason %u (%s) — +%lu more in last 5 s\n",
+        reason, wifiDisconnectReasonName(reason), (unsigned long)suppressed);
+  } else {
+    // (No RSSI here — by the time this event fires the link is down and
+    // WiFi.RSSI() reads 0. Watch the dashboard's RSSI card while connected.)
+    LOG("[WIFI] STA disconnected: reason %u (%s)\n",
+        reason, wifiDisconnectReasonName(reason));
+  }
+  lastLogMs = now;
+  suppressed = 0;
+}
+
 void startAPMode() {
   WiFi.disconnect(true);
   // Hostname must be set BEFORE softAP() so it goes into the AP DHCP server's
@@ -4614,6 +5051,7 @@ void trySecretsConnect() {
   LOG("[WIFI] No saved credentials. Trying secrets SSID \"%s\"...\n", ssid);
   WiFi.disconnect(true);
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);  // modem sleep OFF — see comment at the setup() call
   WiFi.setHostname(MDNS_HOSTNAME);
   WiFi.begin(ssid, pass);
   wifiSource         = WIFI_SRC_SECRETS;
@@ -4644,6 +5082,7 @@ void enterApRetrying() {
   // is force-moved to the STA's channel (clients on the AP may briefly drop).
   WiFi.disconnect(true);
   WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleep(false);  // modem sleep OFF — see comment at the setup() call
   WiFi.softAPsetHostname(MDNS_HOSTNAME);
   applyApStaticIp();  // softAPConfig() — must precede softAP()
   WiFi.softAP(apSSID, apPass);
@@ -5003,6 +5442,12 @@ void setup() {
     LOG("[BOOT] MQTT: %s:%d user=%s\n", mqttHost, mqttPort, mqttUser);
   }
 
+  // Log the driver's reason code whenever the STA link drops — the state
+  // machine only sees THAT it dropped, this tells us WHY (beacon timeout,
+  // AP kicked us, auth failure...). Register before any begin() so the very
+  // first failed attempt is captured too.
+  WiFi.onEvent(onWifiStaDisconnected, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+
   if (savedSSID.length() > 0) {
     // Priority 1: saved preferences
     LOG("[WIFI] Connecting to saved SSID \"%s\"...\n", savedSSID.c_str());
@@ -5011,6 +5456,13 @@ void setup() {
     // pfSense, UniFi, etc.) will then expose the controller as
     // supercharger.<your-domain> — independent of mDNS / .local resolution.
     WiFi.mode(WIFI_STA);
+    // Modem power save OFF. The ESP32 default (WIFI_PS_MIN_MODEM) naps the
+    // radio between DTIM beacons: pings jump to 100-2000 ms, mDNS gets flaky,
+    // and APs that expect prompt ACKs deauth us for inactivity — the observed
+    // "connects then drops shortly after" failure. This device is powered from
+    // the charger/bike, so the ~60 mA saving is irrelevant. The flag persists
+    // across mode changes but is re-asserted at every bring-up path anyway.
+    WiFi.setSleep(false);
     WiFi.setHostname(MDNS_HOSTNAME);
     wifiFastAttempt    = beginStaConnect(savedSSID.c_str(), savedPass.c_str());
     wifiSource         = WIFI_SRC_PREFS;
@@ -5292,11 +5744,34 @@ void processBikeFrame(const twai_message_t &msg) {
     //   bytes 1-2   : cell voltage, uint16 LE, mV  (e.g. E2 0F → 4066 mV)
     //   bytes 3-6   : pack voltage, uint32 LE, mV  → dV stored in monolithVoltageDv
     //   byte 7      : 0x00 padding
-    live.monolithVoltageDv = zeroDecoder.voltage(len, buf) / 100;
-    live.bms0LastMs = now;   // liveness timestamp for rampTask staleness guard
-    if (!live.dataFresh) {
-      live.dataFresh   = true;
-      live.bms0FirstMs = now;
+    // Plausibility-gate the pack voltage before storing it (H1). The cell
+    // decode 10 lines below has always had a sanity window; the *pack* voltage
+    // did not, and it is the divisor in the I = P/V calculation that produces
+    // the charger current command. A corrupt frame decoding to e.g. 1 dV made
+    // rampTask compute a five-figure amp command (and, past 6553.5 A, wrap the
+    // uint16_t). PACK_V_MIN_DV/PACK_V_MAX_DV come from the Farasis cell
+    // datasheet × 28S — see their definition near MAX_CHARGE_VOLTAGE_DV.
+    //
+    // A rejected frame deliberately does NOT refresh bms0LastMs, so persistent
+    // garbage trips the existing BMS_STALE_TIMEOUT_MS failsafe in rampTask and
+    // the chargers are commanded to STOP. Fail-safe by omission.
+    long vDv = zeroDecoder.voltage(len, buf) / 100;
+    if (vDv < (long)PACK_V_MIN_DV || vDv > (long)PACK_V_MAX_DV) {
+      g_lastBadFrameMs = now;   // raises the dashboard banner for a short window
+      static unsigned long lastBadMonoVLog = 0;
+      if (now - lastBadMonoVLog >= 5000) {
+        lastBadMonoVLog = now;
+        LOG("[CAN] Implausible monolith pack voltage %ld dV (valid %u-%u) — "
+            "frame rejected\n", vDv,
+            (unsigned)PACK_V_MIN_DV, (unsigned)PACK_V_MAX_DV);
+      }
+    } else {
+      live.monolithVoltageDv = vDv;
+      live.bms0LastMs = now;   // liveness timestamp for rampTask staleness guard
+      if (!live.dataFresh) {
+        live.dataFresh   = true;
+        live.bms0FirstMs = now;
+      }
     }
     // Decode rotating cell voltage and update per-cell array + balance
     if (len >= 3 && buf[0] < 28) {
@@ -5370,12 +5845,28 @@ void processBikeFrame(const twai_message_t &msg) {
 
   // --- PowerTank (BMS1) ---
   else if (zeroDecoder.hasPowerTankVoltage(id)) {
-    // BMS1_CELL_VOLTAGE (0x389): same layout as BMS0
-    live.powerTankVoltageDv = zeroDecoder.voltage(len, buf) / 100;
-    if (!live.powerTankPresent) {
-      live.powerTankPresent = true;
-      live.powerTankDecided = true;
-      live.bms1FirstMs      = now;
+    // BMS1_CELL_VOLTAGE (0x389): same layout as BMS0 — same plausibility gate
+    // (H1). The PowerTank sits in parallel with the monolith on stock Zeros, so
+    // it shares the 28S window. A rejected frame also leaves powerTankPresent
+    // alone: a pack that only ever sends garbage is never declared present, so
+    // rampTask won't fold its temperatures into the cutback decisions.
+    long ptVDv = zeroDecoder.voltage(len, buf) / 100;
+    if (ptVDv < (long)PACK_V_MIN_DV || ptVDv > (long)PACK_V_MAX_DV) {
+      g_lastBadFrameMs = now;   // raises the dashboard banner for a short window
+      static unsigned long lastBadPtVLog = 0;
+      if (now - lastBadPtVLog >= 5000) {
+        lastBadPtVLog = now;
+        LOG("[CAN] Implausible PowerTank pack voltage %ld dV (valid %u-%u) — "
+            "frame rejected\n", ptVDv,
+            (unsigned)PACK_V_MIN_DV, (unsigned)PACK_V_MAX_DV);
+      }
+    } else {
+      live.powerTankVoltageDv = ptVDv;
+      if (!live.powerTankPresent) {
+        live.powerTankPresent = true;
+        live.powerTankDecided = true;
+        live.bms1FirstMs      = now;
+      }
     }
   }
   else if (zeroDecoder.hasPowerTankAmps(id)) {
@@ -5592,6 +6083,8 @@ void sendHeartbeat() {
   // Rate-limited error logging — print at most once every 5 s so the
   // serial monitor stays readable when no charger is connected.
   static unsigned long lastErrLogMs = 0;
+  // M2: consecutive TX failures, used as the bus-off proxy below.
+  static uint16_t consecTxErr = 0;
   if (rc != CAN_OK) {
     unsigned long now = millis();
     if (now - lastErrLogMs >= 5000) {
@@ -5601,23 +6094,49 @@ void sendHeartbeat() {
       lastErrLogMs = now;
     }
 
-    // If the MCP2515 has gone bus-off (>256 consecutive errors), reset it.
-    if (mcpCan.checkError() == CAN_CTRLERROR) {
+    // ── Controller reset on sustained TX failure (M2) ───────────────────────
+    // This used to be `if (mcpCan.checkError() == CAN_CTRLERROR)`, which is
+    // NOT a bus-off test. checkError() returns:
+    //     (eflg & MCP_EFLG_ERRORMASK) ? CAN_CTRLERROR : CAN_OK
+    // and MCP_EFLG_ERRORMASK is 0xF8 — RX1OVR | RX0OVR | TXBO | TXEP | RXEP.
+    // Bus-off (TXBO) is only bit 5. So a transient RX overflow or a brief
+    // error-passive excursion re-initialised the controller mid-charge,
+    // dropping the bus long enough for the chargers to hit
+    // CHARGER_TIMEOUT_MS. Upstream coryjfowler has the identical
+    // implementation, so this cannot be fixed by updating the library, and
+    // mcp2515_readRegister()/MCP_EFLG are private — EFLG cannot be read
+    // through the public API without patching the library (which would become
+    // an undocumented build dependency).
+    //
+    // Instead: count consecutive heartbeat TX failures. TXBO means >255
+    // consecutive TX errors, so sustained failure of an unconditional 1 Hz
+    // transmit is the observable equivalent, and unlike the EFLG test it
+    // cannot be tripped by a receive-side hiccup. A single successful send
+    // clears the counter.
+    if (consecTxErr < 65535) consecTxErr++;
 #if MCP_LISTEN_ONLY
-      // Bus-off shouldn't occur in listen-only mode — log but don't spam
+    // Bus-off shouldn't occur in listen-only mode — log but don't spam
+    if (consecTxErr >= MCP_TX_FAIL_RESET_THRESHOLD) {
       static unsigned long lastBusOffLog = 0;
       if (millis() - lastBusOffLog >= 10000) {
         lastBusOffLog = millis();
-        LOG("[MCP] Bus-off in listen-only mode — unexpected, check wiring\n");
+        LOG("[MCP] Sustained TX failure in listen-only mode — unexpected, "
+            "check wiring\n");
       }
+      consecTxErr = 0;
+    }
 #else
-      LOG("[MCP] Bus-off detected — resetting MCP2515\n");
+    if (consecTxErr >= MCP_TX_FAIL_RESET_THRESHOLD) {
+      LOG("[MCP] %u consecutive heartbeat TX failures — resetting MCP2515\n",
+          (unsigned)consecTxErr);
       mcpCan.begin(MCP_ANY, CAN_250KBPS, MCP_16MHZ);
       mcpCan.setMode(MCP_NORMAL);
-#endif
+      consecTxErr = 0;
     }
+#endif
   } else {
     lastErrLogMs = 0; // reset so next error after a working period logs immediately
+    consecTxErr  = 0; // a single good send means the controller is not bus-off
   }
 
   if (xSemaphoreTake(chargerMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
@@ -5659,6 +6178,17 @@ void processChargerFrame(uint32_t id, byte len, byte* buf) {
       uint8_t count = 0;
       for (int i = 0; i < MAX_CHARGERS; i++) {
         if (chargerBus.chargers[i].present) count++;
+      }
+      // Clamp to what the current divisor / preset table support (L6). More
+      // units on the bus than this means the per-charger division would
+      // under-divide and every charger would over-deliver, so refuse to
+      // report a count we can't safely command.
+      if (count > MAX_ACTIVE_CHARGERS) {
+        LOG("[MCP] WARNING: %d chargers detected but only %d supported — "
+            "count clamped. Per-charger current would be under-divided.\n",
+            count, (int)MAX_ACTIVE_CHARGERS);
+        count = MAX_ACTIVE_CHARGERS;
+        g_chargerCountClamped = true;   // raises the dashboard banner
       }
       chargerBus.chargerCount = count;
       LOG("[MCP] Charger %d seen — total: %d\n", nibble, count);
@@ -5712,6 +6242,11 @@ void chargerBusTask(void* /*pvParameters*/) {
           }
           if (c.present) count++;
         }
+        // L6 clamp. Recomputed here every second, so the banner clears itself
+        // once the extra unit stops answering (unplugged / powered down) rather
+        // than latching until reboot.
+        g_chargerCountClamped = (count > MAX_ACTIVE_CHARGERS);
+        if (count > MAX_ACTIVE_CHARGERS) count = MAX_ACTIVE_CHARGERS;
         if (chargerBus.chargerCount != count) chargerBus.chargerCount = count;
         xSemaphoreGive(chargerMutex);
       }
@@ -5992,17 +6527,46 @@ void rampTask(void* /*pvParameters*/) {
     // counter freezes and the charger heartbeat falls back to STOP.
     g_rampHeartbeat++;
 
-    // Detect rising edge of `enabled` (off → on). Used to decide whether
-    // the user just kicked off a fresh charge session, so we can skip
-    // straight to DONE if the pack is already at/above the target.
+    // Detect rising edge of `enabled` (off → on) — the start of a charge
+    // session, at which point BULK must compare pack voltage against the target
+    // before committing to charge.
+    //
+    // The edge is LATCHED into pendingStartEval rather than acted on directly.
+    // prevEnabled has to be updated here (it is the edge detector's own state),
+    // but the evaluation itself can only happen ~150 lines further down, after
+    // the live snapshot — and three `continue` paths sit in between (charging
+    // disabled, BMS telemetry stale, outside the safe charging envelope). Using
+    // `justEnabled` directly meant any of those consumed the edge and silently
+    // discarded the start check.
+    //
+    // That is exactly what happened on a boot with charge-on-boot enabled: tick
+    // 1 saw the edge, hit the staleness guard because no BMS frame had arrived
+    // yet, and continued. From tick 2 on the edge was gone, phase was still
+    // PHASE_CC, and once telemetry appeared a pack already above target went
+    // straight into the CC→CV voltage trigger and commanded the chargers on.
+    // Observed as: target 80 %, bike at 84 %, charging anyway, already showing
+    // Absorption a few seconds after power-up.
+    //
+    // The latch is only cleared once a tick actually reaches the evaluation
+    // point with a valid pack voltage — see "Charge-start evaluation" below.
+    static bool pendingStartEval = false;
     bool justEnabled = enabled && !prevEnabled;
     prevEnabled = enabled;
+    if (justEnabled) pendingStartEval = true;
 
     // Disabled: reset to CC, stop charger, clear all per-session state, skip tick
     if (!enabled) {
       phase              = PHASE_CC;
       g_rampPhase        = (uint8_t)PHASE_CC;  // keep dashboard/MQTT phase in sync
       g_thermalThrottle  = false;
+      g_chargeInhibit    = INHIBIT_NONE;  // not inhibited, just switched off
+      // Clear the charging-related protection flags too: with charging off,
+      // "charging stopped, waiting for bike CAN" would be a false statement.
+      g_bmsStale         = false;
+      g_currentClamped   = false;
+      // Switching off abandons any pending start evaluation — the next enable
+      // edge will raise a fresh one.
+      pendingStartEval   = false;
       ccTaperStartMs     = 0;
       voltPlateauStartMs = 0;
       plateauRefDv       = 0;
@@ -6094,8 +6658,20 @@ void rampTask(void* /*pvParameters*/) {
     // charger's own 5 s heartbeat cutoff and is fail-safe. millis() subtraction
     // is rollover-safe. Charging resumes automatically once fresh frames return.
     const unsigned long BMS_STALE_TIMEOUT_MS = 5000UL;
-    if ((now0 - bmsLastMs) > BMS_STALE_TIMEOUT_MS) {
+    // `bmsLastMs == 0` is tested explicitly. The comment above has always
+    // claimed "never received" counts as stale, but the subtraction alone does
+    // not deliver that: with bmsLastMs == 0 the expression reduces to
+    // `now0 > BMS_STALE_TIMEOUT_MS`, so for the first 5 seconds of uptime the
+    // guard passed with no BMS telemetry whatsoever. Harmless in practice —
+    // rawPackDv is 0 then and the downstream `packDv > 0` guards hold — but the
+    // code did not do what it documented.
+    g_bmsStale = (bmsLastMs == 0) || ((now0 - bmsLastMs) > BMS_STALE_TIMEOUT_MS);
+    if (g_bmsStale) {
       g_thermalThrottle  = false;
+      // Not an envelope inhibit — we simply have no telemetry to judge with, and
+      // the dedicated stale-data message below is the accurate one to surface.
+      g_chargeInhibit    = INHIBIT_NONE;
+      g_currentClamped   = false;
       g_etaMinutes       = -1;
       ccTaperStartMs     = 0;
       voltPlateauStartMs = 0;
@@ -6119,17 +6695,218 @@ void rampTask(void* /*pvParameters*/) {
       continue;
     }
 
-    // ── Skip charge if pack is already at or above target ────────────────────
-    // Triggered only on the rising edge of `enabled` so a fresh start with a
-    // pack already above the chosen preset (e.g. preset = 80 %, bike at 81 %)
-    // jumps straight to DONE instead of running CC→CV→DONE through the chargers.
-    // Once in DONE, the existing re-engage logic waits for the pack to sag
-    // below the appropriate floor before starting a new cycle.
-    if (justEnabled && rawPackDv > 0 &&
-        rawPackDv >= (long)voltCeiling) {
-      phase = PHASE_DONE;
-      LOG("[RAMP] Skip charge: pack at %ld dV ≥ ceil %d dV (already at target)\n",
-          rawPackDv, voltCeiling);
+    // ── Worst-case temperatures across both packs ────────────────────────────
+    // Moved above the safe-envelope gate below (it needs them) — this used to
+    // sit further down with the cutback calculations. When a PowerTank is
+    // present and live (reporting voltage — the same "PT is really here" gate
+    // the voltage sum uses), fold its hottest / coldest thermocouple in so the
+    // hot and cold limits track whichever pack is nearest its limit. Boot
+    // caveat (as for the monolith): a present pack momentarily reading 0 °C
+    // before its first temp frame is benign because the ramp is far slower than
+    // the ~3 s it takes real telemetry to arrive.
+    short hotTemp  = maxTemp;
+    short coldTemp = minTemp;
+    if (ptPresent && ptDv > 0) {
+      if (ptMaxTemp > hotTemp)  hotTemp  = ptMaxTemp;
+      if (ptMinTemp < coldTemp) coldTemp = ptMinTemp;
+    }
+
+    // ── Cell safe-charging-envelope gate ─────────────────────────────────────
+    // Farasis IMP06160230P25A: charging permitted only 0-45 °C, and never below
+    // ~2.5 V/cell (copper current-collector dissolution — see
+    // CELL_V_CHARGE_FLOOR_MV). None of this was previously enforced:
+    //
+    //   * COLD_CUTBACK's lowest entry was 0 °C -> 0.2 C, and find_cutback's
+    //     AT_OR_BELOW mode returns the first threshold >= measurement, so at
+    //     -20 °C it returned 0.2 C and charged happily. Sub-zero charging is
+    //     precisely the lithium-plating case the cold table exists to prevent.
+    //   * HOT_CUTBACK started at 50 °C, so 46-49 °C — already past the
+    //     datasheet maximum — got no limit at all.
+    //   * There was no pack-voltage floor of any kind.
+    //
+    // Unlike a cutback (reduce power, keep charging) this is an outright stop.
+    // Hysteresis: once inhibited we require the pack to come back
+    // CHARGE_TEMP_HYSTERESIS_C *inside* the limit before charging resumes, so a
+    // cell hovering at exactly 0 or 45 °C can't toggle the chargers every tick.
+    // Deliberately placed AFTER the staleness guard, so it only ever acts on
+    // fresh telemetry, and it re-evaluates every tick — recovery is automatic.
+    {
+      uint8_t inhibit = INHIBIT_NONE;
+      uint8_t prev    = g_chargeInhibit;
+
+      // Temperature limits, with the re-arm band applied only when already
+      // inhibited for that same reason.
+      short coldLimit = (prev == INHIBIT_TOO_COLD)
+                          ? (short)(CHARGE_TEMP_MIN_C + CHARGE_TEMP_HYSTERESIS_C)
+                          : CHARGE_TEMP_MIN_C;
+      short hotLimit  = (prev == INHIBIT_TOO_HOT)
+                          ? (short)(CHARGE_TEMP_MAX_C - CHARGE_TEMP_HYSTERESIS_C)
+                          : CHARGE_TEMP_MAX_C;
+
+      // coldTemp/hotTemp default to -127 when no temperature frame has arrived
+      // yet. Treating that as "too cold" would refuse to charge for the first
+      // few seconds after every power-on, so an uninitialised sentinel is
+      // ignored here; the ramp is far slower than the ~3 s until real telemetry
+      // arrives, and the cutback tables still apply in the meantime.
+      bool tempsValid = (coldTemp > -100) && (hotTemp > -100);
+
+      if (tempsValid && coldTemp < coldLimit)      inhibit = INHIBIT_TOO_COLD;
+      else if (tempsValid && hotTemp  > hotLimit)  inhibit = INHIBIT_TOO_HOT;
+      // Voltage floor needs no hysteresis: charging raises pack voltage, so it
+      // moves monotonically away from the limit once current starts flowing.
+      else if (rawPackDv > 0 && rawPackDv < (long)PACK_V_CHARGE_FLOOR_DV)
+        inhibit = INHIBIT_PACK_LOW;
+
+      g_chargeInhibit = inhibit;
+
+      if (inhibit != INHIBIT_NONE) {
+        g_thermalThrottle  = false;
+        g_currentClamped   = false;   // no current at all, so nothing to clamp
+        g_etaMinutes       = -1;
+        ccTaperStartMs     = 0;
+        voltPlateauStartMs = 0;
+        plateauRefDv       = 0;
+        if (xSemaphoreTake(controlMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          ctrl.currentPowerW = 0;
+          xSemaphoreGive(controlMutex);
+        }
+        if (xSemaphoreTake(chargerMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          chargerBus.cmdVoltDv = 0;
+          chargerBus.cmdAmpsDa = 0;
+          chargerBus.cmdStart  = false;
+          xSemaphoreGive(chargerMutex);
+        }
+        // Log the transition immediately, then rate-limit the repeat.
+        static unsigned long lastInhibitLogMs = 0;
+        if (prev != inhibit || (now0 - lastInhibitLogMs) >= 30000UL) {
+          lastInhibitLogMs = now0;
+          LOG("[RAMP] CHARGE INHIBITED (%s) — charger STOP. "
+              "cold %d°C / hot %d°C (permitted %d..%d°C), pack %ld dV "
+              "(floor %u dV)\n",
+              chargeInhibitName(inhibit), (int)coldTemp, (int)hotTemp,
+              (int)CHARGE_TEMP_MIN_C, (int)CHARGE_TEMP_MAX_C,
+              rawPackDv, (unsigned)PACK_V_CHARGE_FLOOR_DV);
+        }
+        continue;
+      } else if (prev != INHIBIT_NONE) {
+        LOG("[RAMP] Charge inhibit cleared (was: %s) — cold %d°C / hot %d°C, "
+            "pack %ld dV. Resuming.\n",
+            chargeInhibitName(prev), (int)coldTemp, (int)hotTemp, rawPackDv);
+      }
+    }
+
+    // ── Charge-start evaluation ──────────────────────────────────────────────
+    // BULK's first job at the start of a session: decide whether any charge is
+    // actually needed. If the pack is already at or above the target there is
+    // nothing to do — go straight to FLOAT without ever commanding the chargers.
+    //
+    // Gated on pendingStartEval (latched at the enable edge, see above) AND on
+    // having a real pack voltage. The `rawPackDv > 0` condition is what makes
+    // this correct: the latch is not consumed until there is something genuine
+    // to compare against, so a boot where telemetry has not arrived yet defers
+    // the decision to the next tick instead of skipping it.
+    //
+    // `enabled` is deliberately left alone. Going to FLOAT hands the pack to the
+    // existing DONE→CC re-engage logic, which tops up once the pack sags below
+    // the appropriate floor — the same behaviour as finishing a normal cycle.
+    // True only on the single tick that actually performed the start evaluation.
+    // Downstream hooks that used to key off `justEnabled` use this instead, so
+    // they fire on the tick the session really began rather than on an edge that
+    // may have been discarded by an early return.
+    bool startEvalRan = false;
+    if (pendingStartEval && rawPackDv > 0) {
+      pendingStartEval = false;
+      startEvalRan     = true;
+      int packSoc   = calcSocFromVoltage(rawPackDv);
+      int targetSoc = calcSocFromVoltage((long)voltCeiling);
+      if (rawPackDv >= (long)voltCeiling) {
+        phase      = PHASE_DONE;
+        cvTargetDv = 0;
+        LOG("[RAMP] Start: no charge needed — pack %ld dV (~%d%%) ≥ target %d dV "
+            "(~%d%%). FLOAT; will top up if the pack sags.\n",
+            rawPackDv, packSoc, voltCeiling, targetSoc);
+      } else {
+        LOG("[RAMP] Start: BULK — pack %ld dV (~%d%%) → target %d dV (~%d%%)\n",
+            rawPackDv, packSoc, voltCeiling, targetSoc);
+      }
+    }
+
+    // ── Above-target backstop ────────────────────────────────────────────────
+    // Covers every route into "pack is past the target" that is NOT an enable
+    // edge, none of which the start evaluation above can see:
+    //   * the user lowers the target mid-charge (84 % pack, target moved to 80 %)
+    //   * the pack was charged externally, or regen lifted it, while enabled
+    // Without this the CC→CV voltage trigger fires instead and CV commands the
+    // chargers ON at a voltage BELOW the pack's own for at least CV_MIN_MS
+    // (2 min) — the Elcons cannot sink, so it achieves nothing while reporting
+    // Absorption.
+    //
+    // `+ hyst` (1.0 V) is what separates this from a legitimate CC arrival: CC
+    // stops AT the ceiling, so a pack more than 1 V above it cannot have got
+    // there by charging. Preset spacing is 32-40 dV, so any target change clears
+    // the margin comfortably while an exact-ceiling arrival still enters CV.
+    //
+    // DONE→CC cannot immediately undo this: doneReengageDv is always ≤
+    // voltCeiling, so a pack above the ceiling is also above the re-engage floor.
+    if (phase != PHASE_DONE && rawPackDv > 0 &&
+        rawPackDv > (long)voltCeiling + hyst) {
+      LOG("[RAMP] Pack %ld dV is above target %d dV by more than %ld dV — "
+          "nothing to charge, %s→FLOAT\n",
+          rawPackDv, voltCeiling, hyst, (phase == PHASE_CV) ? "ABSORPTION" : "BULK");
+      phase      = PHASE_DONE;
+      cvTargetDv = 0;
+    }
+
+    // Target lowered while in ABSORPTION, but not far enough to trip the
+    // backstop above (e.g. 100 % → 90 % with the pack at 113.5 V). cvTargetDv
+    // was latched at the OLD higher ceiling and the CV branch commands it
+    // directly, so without this the chargers keep pushing toward the old target
+    // until CV_HOLD_MS — one hour — expires. Enforce the invariant
+    // cvTargetDv <= voltCeiling unconditionally; it is self-correcting and
+    // needs no change-detection state.
+    if (phase == PHASE_CV && cvTargetDv > voltCeiling) {
+      LOG("[RAMP] Target lowered during ABSORPTION — CV target %u → %d dV\n",
+          (unsigned)cvTargetDv, voltCeiling);
+      cvTargetDv = voltCeiling;
+    }
+
+    // ── Target-raised re-engage ──────────────────────────────────────────────
+    // The sag floor below is pinned at the 80 % preset for ANY target above
+    // 80 %, because its job is to stop the pack cycling near the top of charge.
+    // That makes it the wrong test when the *target* moves rather than the pack
+    // draining: sitting in FLOAT at 84 % and raising the target to 90 % left
+    // rawPackDv (1112) above doneReengageDv (1100), so nothing happened — the
+    // pack had to sag all the way back to 80 % before it would charge to 90 %.
+    // Raising to 100 % behaved the same way.
+    //
+    // Edge-detected on purpose. A plain "resume whenever pack < ceiling - hyst"
+    // would also fire on the normal post-cycle sag, re-engaging about 1 V below
+    // target every time and defeating the wide hysteresis entirely. Only a
+    // deliberate change of target counts.
+    //
+    // Placed here, after every `continue` path, so the edge cannot be consumed
+    // by a tick that returns early — the same trap that swallowed justEnabled.
+    static uint16_t prevVoltCeiling = 0;
+    bool ceilingRaised = (prevVoltCeiling != 0) && (voltCeiling > prevVoltCeiling);
+    prevVoltCeiling = voltCeiling;
+
+    // Covers FLOAT *and* ABSORPTION. The absorption case is the mirror of the
+    // lowered-target fix above: sitting in CV at a latched cvTargetDv of 1100
+    // (80 % reached) and raising the target to 90 % left the CV→CC sag detector
+    // comparing against the OLD 1100 target, so the pack never looked like it
+    // had sagged and it finished the cycle at 80 % regardless of the new
+    // setting. Dropping back to BULK is the correct response to "charge more".
+    if (ceilingRaised && (phase == PHASE_DONE || phase == PHASE_CV) &&
+        rawPackDv > 0 && rawPackDv < (long)voltCeiling - hyst) {
+      LOG("[RAMP] Target raised to %d dV (~%d%%) — pack %ld dV (~%d%%) is below "
+          "it, %s→BULK\n",
+          voltCeiling, calcSocFromVoltage((long)voltCeiling),
+          rawPackDv, calcSocFromVoltage(rawPackDv),
+          (phase == PHASE_CV) ? "ABSORPTION" : "FLOAT");
+      phase = PHASE_CC;
+      // Discard the CV target latched against the previous, lower ceiling so a
+      // future CC→CV transition recomputes it from the new one.
+      cvTargetDv = 0;
     }
 
     // ── Phase transitions ─────────────────────────────────────────────────────
@@ -6176,20 +6953,9 @@ void rampTask(void* /*pvParameters*/) {
     uint32_t voltPwrW = (voltCbK == UINT32_MAX) ? UINT32_MAX
                        : (uint32_t)(voltCbK / 1000.0f * packAH * voltV);
 
-    // Worst-case temps across both packs for the thermal cutbacks (finding #4).
-    // When a PowerTank is present and live (reporting voltage — the same "PT is
-    // really here" gate used for the voltage sum above), fold its hottest /
-    // coldest thermocouple in so the hot and cold limits track whichever pack
-    // is nearest its limit. Boot caveat (as for the monolith): a present pack
-    // momentarily reading 0 °C before its first temp frame is benign because
-    // the ramp is far slower than the ~3 s it takes real telemetry to arrive.
-    short hotTemp  = maxTemp;
-    short coldTemp = minTemp;
-    if (ptPresent && ptDv > 0) {
-      if (ptMaxTemp > hotTemp)  hotTemp  = ptMaxTemp;
-      if (ptMinTemp < coldTemp) coldTemp = ptMinTemp;
-    }
-
+    // hotTemp / coldTemp (worst case across both packs, finding #4) are now
+    // computed further up — the safe-charging-envelope gate needs them before
+    // this point. Values are unchanged.
     uint32_t hotCbK   = find_cutback((int)hotTemp,  CUTBACK_AT_OR_ABOVE, HOT_CUTBACK);
     uint32_t hotPwrW  = (hotCbK  == UINT32_MAX) ? UINT32_MAX
                        : (uint32_t)(hotCbK  / 1000.0f * packAH * voltV);
@@ -6310,8 +7076,20 @@ void rampTask(void* /*pvParameters*/) {
     if (ccTriggerVoltage || ccTriggerTaper || ccTriggerPlateau) {
       phase = PHASE_CV;
       cvMs  = millis();
-      // CV amps ceiling: at least as generous as last CC command so the charger
-      // doesn't lose current mid-transition; cap at C/5 per charger.
+      // CV amps limit, per charger. This is a LIMIT the Elcon regulates under,
+      // not a demand: in CV the charger holds voltage and the pack draws
+      // whatever it accepts, so a looser figure here does not force current in.
+      //
+      // NOTE (audit 2026-07): the max() below makes C/5 a FLOOR, not a cap — the
+      // earlier comment here said "cap at C/5 per charger", which the code has
+      // never done. Whichever of ccAmpsPerCh / cvMaxPerCh is LARGER wins, so
+      // entering CV from a tapering CC can raise the limit (e.g. CC tapering at
+      // 2 A/charger → CV limit 7.6 A/charger on a 114 Ah pack across 3 units).
+      // Deliberately left as-is: changing it to min() would tighten the CV
+      // current limit and could shift absorption duration and when the
+      // CV→DONE taper fires, which is tuned by bench observation. The absolute
+      // 1.0 C ceiling in the amp calculation below backstops it either way.
+      // Revisit together with CV tuning, not in isolation.
       long   clampedDv    = min(rawPackDv, (long)voltCeiling);
       float  packV        = clampedDv / 10.0f;
       float  ccAmpsPerCh  = (current > 0 && packV > 0 && nChargers > 0)
@@ -6355,11 +7133,17 @@ void rampTask(void* /*pvParameters*/) {
     }
 
     // ── Cycle data logger — phase-entry hooks ─────────────────────────────────
-    // CC entry: fire when transitioning into CC from any other phase, OR on
-    // the rising edge of 'enabled' while already in CC (covers disable/re-enable
+    // CC entry: fire when transitioning into CC from any other phase, OR on the
+    // tick the start evaluation ran while already in CC (covers disable/re-enable
     // without a phase change that would update lastPhase).
+    //
+    // Uses startEvalRan, not justEnabled: lastPhase is not updated on ticks that
+    // return early, so a disable/re-enable cycle that stayed in PHASE_CC relies
+    // entirely on the enable edge here — and justEnabled could be consumed by an
+    // early return before reaching this point, leaving the new cycle's record
+    // carrying the previous cycle's start voltage, SoC and temperature.
     if ((phase == PHASE_CC && lastPhase != PHASE_CC) ||
-        (justEnabled && phase == PHASE_CC)) {
+        (startEvalRan && phase == PHASE_CC)) {
       ccEntryMs = millis();
       g_cycle   = CycleRecord{};
       struct tm ti;
@@ -6387,7 +7171,29 @@ void rampTask(void* /*pvParameters*/) {
 
     // ── Ramp step ─────────────────────────────────────────────────────────────
     // effectiveTarget and cutbackActive already computed above (before taper check).
-    if (current < effectiveTarget) {
+    //
+    // L3: a cutback table entry of 0 C-rate is a *stop*, not a ramp target. The
+    // HOT_CUTBACK table's last entry (75 °C) is c_rate 0, which yields
+    // effectiveTarget == 0 — but the normal ramp walks `current` down at
+    // rampStep W/s, so at the 100 W/s default it took ~33 s to actually stop
+    // from 3300 W while the pack was already 30 °C past the cell's 45 °C
+    // charging limit. Zero immediately instead. The chargers see cmdStart=false
+    // on this same tick because cmdStart is gated on (current > 0).
+    //
+    // `target > 0` is deliberate: it distinguishes "a cutback table forced the
+    // ceiling to zero" (a protection event — stop now) from "the user dragged
+    // the power slider to 0" (an ordinary setpoint change, which should still
+    // ramp down smoothly). Without it, moving the slider to 0 would trigger an
+    // abrupt stop and a scary HARD CUTOFF log line.
+    bool hardCutoff = (phase == PHASE_CC) && (target > 0) &&
+                      (effectiveTarget == 0) && (current > 0);
+    if (hardCutoff) {
+      LOG("[RAMP] HARD CUTOFF: cutback table returned 0 C-rate "
+          "(hot %d°C / cold %d°C / pack %lddV) — commanding STOP immediately, "
+          "bypassing %dW/s ramp-down from %dW\n",
+          (int)hotTemp, (int)coldTemp, rawPackDv, rampStep, current);
+      current = 0;
+    } else if (current < effectiveTarget) {
       current = (uint16_t)min((uint32_t)(current + rampStep), (uint32_t)effectiveTarget);
     } else if (current > effectiveTarget) {
       uint16_t dn = cutbackActive ? min((uint16_t)(rampStep * 2), (uint16_t)500) : rampStep;
@@ -6409,11 +7215,39 @@ void rampTask(void* /*pvParameters*/) {
 
     uint16_t cmdAmpsDa  = 0;
     float    totalAmpsA = 0.0f;
+    // Recomputed every tick so the dashboard banner self-clears the moment the
+    // ceiling stops binding.
+    g_currentClamped = false;
     if (packDv > 0 && current > 0) {
-      float v        = packDv / 10.0f;
-      totalAmpsA     = current / v;
-      float perCh    = totalAmpsA / nChargers;
-      cmdAmpsDa      = (uint16_t)max(1.0f, perCh * 10.0f);
+      float v    = packDv / 10.0f;
+      totalAmpsA = current / v;
+
+      // ── Absolute current ceiling (H1) ────────────────────────────────────
+      // Independent of the cutback tables, which are a shaping curve rather
+      // than a hard limit (they permit up to 3.0 C; the cell is rated 1.0 C).
+      // The Farasis IMP06160230P25A allows 25 A max charge on a 25 Ah cell =
+      // 1.0 C, and because packAH scales with the parallel count, 1.0 C of the
+      // BMS-reported pack Ah is the right total ceiling whatever P happens to
+      // be. Applied to the TOTAL before dividing per charger.
+      float maxTotalA = CELL_MAX_CHARGE_C * packAH;
+      if (totalAmpsA > maxTotalA) {
+        g_currentClamped = true;
+        static unsigned long lastAmpClampLog = 0;
+        if (now0 - lastAmpClampLog >= 10000UL) {
+          lastAmpClampLog = now0;
+          LOG("[RAMP] Total current clamped %.1fA -> %.1fA (%.2fC ceiling on "
+              "%.0fAh pack)\n", totalAmpsA, maxTotalA, CELL_MAX_CHARGE_C, packAH);
+        }
+        totalAmpsA = maxTotalA;
+      }
+
+      // Per-charger share. The uint16_t cast is now unreachable-by-overflow:
+      // maxTotalA is bounded by pack Ah (~125 A worst case), so perCh * 10
+      // cannot approach 65535. The explicit clamp documents that invariant
+      // rather than relying on it.
+      float perChDa = (totalAmpsA / nChargers) * 10.0f;
+      if (perChDa > 6553.0f) perChDa = 6553.0f;   // uint16_t dA headroom
+      cmdAmpsDa = (uint16_t)max(1.0f, perChDa);
     }
 
     // Session energy (CC phase) — accumulate using measured charger output,
@@ -6926,6 +7760,74 @@ static void mqttDiscoverSensor(
   mqttClient.publish(topic, payload, true);
 }
 
+// Same as mqttDiscoverSensor but flags the entity as a diagnostic — HA groups
+// it under the device's "Diagnostic" section instead of "Sensors". Also
+// carries the firmware build in the device block ("sw" → sw_version): it
+// merges into HA's device registry, so the device page shows the running
+// firmware and updates automatically after every OTA.
+static void mqttDiscoverDiagSensor(
+    const char* name, const char* friendlyName,
+    const char* unit, const char* deviceClass,
+    const char* stateClass)
+{
+  static char topic[120];
+  static char payload[512];
+  static char stateTopic[80];
+  static char availTopic[80];
+  static char devId[40];
+  static char dcPart[60];
+  static char scPart[60];
+  static char unitPart[30];
+
+  snprintf(topic, sizeof(topic),
+    "homeassistant/sensor/supercharger_%s/%s/config",
+    mqttHostname, name);
+  snprintf(stateTopic, sizeof(stateTopic),
+    "supercharger/%s/sensor/%s", mqttHostname, name);
+  snprintf(availTopic, sizeof(availTopic),
+    "supercharger/%s/state", mqttHostname);
+  snprintf(devId, sizeof(devId),
+    "supercharger_%s", mqttHostname);
+
+  dcPart[0] = '\0';
+  if (deviceClass && strlen(deviceClass) > 0)
+    snprintf(dcPart, sizeof(dcPart), ",\"dev_cla\":\"%s\"", deviceClass);
+
+  scPart[0] = '\0';
+  if (stateClass && strlen(stateClass) > 0)
+    snprintf(scPart, sizeof(scPart), ",\"stat_cla\":\"%s\"", stateClass);
+
+  unitPart[0] = '\0';
+  if (unit && strlen(unit) > 0)
+    snprintf(unitPart, sizeof(unitPart), ",\"unit_of_meas\":\"%s\"", unit);
+
+  snprintf(payload, sizeof(payload),
+    "{"
+      "\"name\":\"%s\","
+      "\"uniq_id\":\"sc_%s_%s\","
+      "\"stat_t\":\"%s\","
+      "\"avty_t\":\"%s\","
+      "\"pl_avail\":\"online\","
+      "\"pl_not_avail\":\"offline\","
+      "\"ent_cat\":\"diagnostic\""
+      "%s%s%s,"
+      "\"dev\":{"
+        "\"ids\":[\"%s\"],"
+        "\"name\":\"Supercharger\","
+        "\"mdl\":\"ESP32-S3 Supercharger\","
+        "\"mf\":\"DIY\","
+        "\"sw\":\"%lld\""
+      "}"
+    "}",
+    friendlyName, mqttHostname, name,
+    stateTopic, availTopic,
+    dcPart, scPart, unitPart,
+    devId, (long long)VERSION
+  );
+
+  mqttClient.publish(topic, payload, true);
+}
+
 static void mqttDiscoverNumber(
     const char* name, const char* friendlyName,
     int minVal, int maxVal, int step, const char* unit)
@@ -7111,6 +8013,13 @@ static void mqttPublishDiscovery() {
   mqttDiscoverSensor("bms_board_temp",    "BMS Board Temp",          "\xB0""C", "temperature", "measurement");
   // Per-cell average voltage — bytes 6-7 of 0x488 (uint16 LE, mV). Tracks pack_v/28.
   mqttDiscoverSensor("cell_avg_mv",       "Cell Average Voltage",    "mV",  "voltage",    "measurement");
+  // Diagnostics — grouped under the HA device's "Diagnostic" section.
+  // Published on a fixed 30 s cadence (see mqttPublishChanges), retained.
+  // RSSI history is the tool for spotting link trouble; the uptime sawtooth
+  // exposes unexpected reboots; firmware pins both to a build.
+  mqttDiscoverDiagSensor("wifi_rssi", "WiFi RSSI",        "dBm", "signal_strength", "measurement");
+  mqttDiscoverDiagSensor("uptime",    "Uptime",           "s",   "duration",        "measurement");
+  mqttDiscoverDiagSensor("firmware",  "Firmware Version", "",    "",                "");
 
   LOG("[MQTT] Discovery published\n");
 }
@@ -7128,44 +8037,58 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   memcpy(val, payload, copyLen);
   val[copyLen] = '\0';
 
+  // M1: MQTT has no response channel, so a dropped command can only be
+  // surfaced in the log. Previously every branch logged the command as though
+  // it had been applied even when the mutex take failed — most dangerously for
+  // charging_enabled=false. Each branch now reports which of the two happened,
+  // and the NVS write is skipped when the RAM write didn't land so the two
+  // can't diverge.
   if (strcmp(cmd, "target_power_w") == 0) {
     int tw = atoi(val);
-    if (xSemaphoreTake(controlMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    bool ok = (xSemaphoreTake(controlMutex, pdMS_TO_TICKS(20)) == pdTRUE);
+    if (ok) {
       ctrl.targetPowerW = (uint16_t)constrain(tw, 0, 13200);
       xSemaphoreGive(controlMutex);
     }
-    LOG("[MQTT] cmd target_power_w = %d W\n", tw);
+    LOG("[MQTT] cmd target_power_w = %d W%s\n",
+        tw, ok ? "" : "  *** NOT APPLIED: controlMutex timeout ***");
 
   } else if (strcmp(cmd, "charging_enabled") == 0) {
     bool en = (strcmp(val, "true") == 0 || strcmp(val, "1") == 0 ||
                strcmp(val, "ON")   == 0 || strcmp(val, "on") == 0);
-    if (xSemaphoreTake(controlMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    bool ok = (xSemaphoreTake(controlMutex, pdMS_TO_TICKS(20)) == pdTRUE);
+    if (ok) {
       ctrl.enabled = en;
       if (!en) ctrl.currentPowerW = 0;
       xSemaphoreGive(controlMutex);
     }
-    LOG("[MQTT] cmd charging_enabled = %s\n", en ? "true" : "false");
+    LOG("[MQTT] cmd charging_enabled = %s%s\n", en ? "true" : "false",
+        ok ? "" : "  *** NOT APPLIED: controlMutex timeout ***");
 
   } else if (strcmp(cmd, "charger_count") == 0) {
     int cc = atoi(val);
-    if (cc >= 1 && cc <= 4) {
-      if (xSemaphoreTake(controlMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    if (cc >= 1 && cc <= (int)MAX_ACTIVE_CHARGERS) {
+      bool ok = (xSemaphoreTake(controlMutex, pdMS_TO_TICKS(20)) == pdTRUE);
+      if (ok) {
         ctrl.chargerCount = (uint8_t)cc;
         xSemaphoreGive(controlMutex);
+        preferences.putUChar("charger_count", (uint8_t)cc);
       }
-      preferences.putUChar("charger_count", (uint8_t)cc);
-      LOG("[MQTT] cmd charger_count = %d\n", cc);
+      LOG("[MQTT] cmd charger_count = %d%s\n",
+          cc, ok ? "" : "  *** NOT APPLIED: controlMutex timeout ***");
     }
 
   } else if (strcmp(cmd, "ramp_rate_wps") == 0) {
     int rr = atoi(val);
     if (rr >= 10 && rr <= 500) {
-      if (xSemaphoreTake(controlMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+      bool ok = (xSemaphoreTake(controlMutex, pdMS_TO_TICKS(20)) == pdTRUE);
+      if (ok) {
         ctrl.rampStepW = (uint16_t)rr;
         xSemaphoreGive(controlMutex);
+        preferences.putUShort("ramp_step_w", (uint16_t)rr);
       }
-      preferences.putUShort("ramp_step_w", (uint16_t)rr);
-      LOG("[MQTT] cmd ramp_rate_wps = %d W/s\n", rr);
+      LOG("[MQTT] cmd ramp_rate_wps = %d W/s%s\n",
+          rr, ok ? "" : "  *** NOT APPLIED: controlMutex timeout ***");
     }
 
   } else if (strcmp(cmd, "target_volt_v") == 0) {
@@ -7173,12 +8096,14 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     float tvV = atof(val);
     int   tvd = (int)(tvV * 10.0f + 0.5f); // round to nearest dV
     if (tvd >= TARGET_VOLT_PRESETS[0].dv && tvd <= (int)MAX_CHARGE_VOLTAGE_DV) {
-      if (xSemaphoreTake(controlMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+      bool ok = (xSemaphoreTake(controlMutex, pdMS_TO_TICKS(20)) == pdTRUE);
+      if (ok) {
         ctrl.targetVoltDv = (uint16_t)tvd;
         xSemaphoreGive(controlMutex);
+        preferences.putUShort("target_volt_dv", (uint16_t)tvd);
       }
-      preferences.putUShort("target_volt_dv", (uint16_t)tvd);
-      LOG("[MQTT] cmd target_volt_v = %.1f V (%d dV)\n", tvV, tvd);
+      LOG("[MQTT] cmd target_volt_v = %.1f V (%d dV)%s\n", tvV, tvd,
+          ok ? "" : "  *** NOT APPLIED: controlMutex timeout ***");
     }
 
   } else if (strncmp(cmd, "preset_", 7) == 0) {
@@ -7188,13 +8113,15 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     for (int i = 0; i < TARGET_VOLT_PRESET_COUNT; i++) {
       if (TARGET_VOLT_PRESETS[i].pct == pct) {
         uint16_t dv = TARGET_VOLT_PRESETS[i].dv;
-        if (xSemaphoreTake(controlMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        bool ok = (xSemaphoreTake(controlMutex, pdMS_TO_TICKS(20)) == pdTRUE);
+        if (ok) {
           ctrl.targetVoltDv = dv;
           xSemaphoreGive(controlMutex);
+          preferences.putUShort("target_volt_dv", dv);
         }
-        preferences.putUShort("target_volt_dv", dv);
-        LOG("[MQTT] cmd preset_%d → target_volt_v = %.1f V (%u dV)\n",
-            pct, dv / 10.0f, dv);
+        LOG("[MQTT] cmd preset_%d → target_volt_v = %.1f V (%u dV)%s\n",
+            pct, dv / 10.0f, dv,
+            ok ? "" : "  *** NOT APPLIED: controlMutex timeout ***");
         break;
       }
     }
@@ -7469,6 +8396,24 @@ static bool mqttPublishChanges() {
     published = true;
   }
 
+  // Diagnostic trio — WiFi RSSI, uptime, firmware. Fixed 30 s cadence instead
+  // of change-detection: RSSI jitters a few dB constantly and uptime changes
+  // every second, so PUB_IF_CHANGED (with the 10 s snapshot reset) would spam
+  // the broker. State topics are retained, so HA always has the latest values
+  // after its own restart. First pass publishes immediately on (re)connect.
+  {
+    static unsigned long lastDiagMs = 0;
+    if (lastDiagMs == 0 || millis() - lastDiagMs >= 30000UL) {
+      lastDiagMs = millis();
+      mqttPublishSensorI("wifi_rssi", (int)WiFi.RSSI());
+      mqttPublishSensorI("uptime",    (int)(millis() / 1000UL));
+      char fw[16];
+      snprintf(fw, sizeof(fw), "%lld", (long long)VERSION);
+      mqttPublishSensor("firmware", fw);
+      published = true;
+    }
+  }
+
   #undef PUB_IF_CHANGED_F
   #undef PUB_IF_CHANGED_I
 
@@ -7479,7 +8424,8 @@ void mqttTask(void* /*pvParameters*/) {
   LOG("[MQTT] mqttTask running on core %d\n", xPortGetCoreID());
 
   mqttClient.setCallback(mqttCallback);
-  mqttClient.setBufferSize(512); // discovery payloads need > default 256 bytes
+  mqttClient.setBufferSize(768); // discovery payloads need > default 256 bytes;
+                                 // diag entities add ent_cat + sw to the payload
   // Note: setServer() is now done inside mqttConnect() from a locked snapshot
   // of the broker config — this task is the ONLY one that touches mqttClient.
 

@@ -41,6 +41,14 @@ struct HttpCtx {
   // invalid JSON (finding #19).
   bool         bodyTooLarge;
 
+  // L1: set by parseKVPairs() when the request carried more key=value pairs
+  // than args[] can hold. The overflow used to be discarded in silence, so a
+  // form with a 9th field had that field quietly ignored — a settings write
+  // that appeared to succeed while dropping data, and a way to push a
+  // security-relevant field out of the array by padding ahead of it. Handlers
+  // that parse forms check this and reject with 400.
+  bool         argsOverflow;
+
   // Request body — populated by initFromIDFReq() for IDF POSTs.
   String       body;
 
@@ -56,7 +64,8 @@ struct HttpCtx {
   int     nRespHdrs;
   bool    respStarted;
 
-  HttpCtx() : isWS(false), isIDF(false), bodyTooLarge(false), idfReq(nullptr),
+  HttpCtx() : isWS(false), isIDF(false), bodyTooLarge(false),
+              argsOverflow(false), idfReq(nullptr),
               nArgs(0), nRespHdrs(0), respStarted(false) {}
 
   // ----- request accessors (IDF path) -----
@@ -146,7 +155,21 @@ struct HttpCtx {
 // ---------------------------------------------------------------------------
 // URL-decode a percent-encoded string (replaces %XX and '+' with space).
 // ---------------------------------------------------------------------------
+// L2: %XX is only honoured when both digits are genuinely hex, and %00 is
+// dropped rather than decoded. Previously strtol() turned invalid hex into 0
+// silently, and a literal %00 embedded a NUL in the Arduino String — String
+// keeps its length but every consumer that goes through c_str() (strlen,
+// strcmp, the constant-time credential compare) sees a truncated value, so the
+// String's view and the C view of the same field disagreed. Anything an
+// attacker can use to make two layers disagree about where a string ends is
+// worth closing even without a concrete exploit.
 inline String urlDecode(const String& in) {
+  auto hexVal = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+  };
   String out;
   out.reserve(in.length());
   for (unsigned int i = 0; i < in.length(); i++) {
@@ -154,9 +177,17 @@ inline String urlDecode(const String& in) {
     if (c == '+') {
       out += ' ';
     } else if (c == '%' && i + 2 < in.length()) {
-      char h[3] = { in.charAt(i + 1), in.charAt(i + 2), '\0' };
-      out += (char)strtol(h, nullptr, 16);
-      i += 2;
+      int hi = hexVal(in.charAt(i + 1));
+      int lo = hexVal(in.charAt(i + 2));
+      if (hi < 0 || lo < 0) {
+        // Malformed escape — emit the '%' literally and carry on, rather than
+        // silently substituting a NUL for it.
+        out += c;
+      } else {
+        int v = (hi << 4) | lo;
+        if (v != 0) out += (char)v;   // %00 dropped: never embed a NUL
+        i += 2;
+      }
     } else {
       out += c;
     }
@@ -178,6 +209,8 @@ inline void parseKVPairs(const String& src, HttpCtx& ctx) {
       ctx.args[ctx.nArgs].k = urlDecode(src.substring(start, eq));
       ctx.args[ctx.nArgs].v = urlDecode(src.substring(eq + 1, amp));
       ctx.nArgs++;
+    } else {
+      ctx.argsOverflow = true;   // L1 — caller decides whether to reject
     }
     start = amp + 1;
   }

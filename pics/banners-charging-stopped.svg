@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="352" viewBox="0 0 760 352" role="img" aria-label="The five red dashboard banners that mean charging has stopped">
+  <title>Dashboard banners: charging stopped</title>
+  <desc>Five red banners shown on the Supercharger dashboard when charging is halted: pack too cold, pack too hot, pack voltage too low, no data from bike, and too many chargers.</desc>
+
+  <rect x="0" y="0" width="760" height="352" fill="#1a1a2e"/>
+
+  <g font-family="Arial, Helvetica, sans-serif">
+
+    <g transform="translate(20,16)">
+      <rect x="0" y="0" width="720" height="56" rx="8" fill="#3a0a0a" stroke="#e94560" stroke-width="1"/>
+      <text x="16" y="23" font-size="14" font-weight="bold" fill="#e94560">&#10052; Charging paused &#8212; pack too cold</text>
+      <text x="16" y="42" font-size="12.5" fill="#aaaaaa">Pack is below 0 &#176;C. Resumes on its own above 2 &#176;C.</text>
+    </g>
+
+    <g transform="translate(20,82)">
+      <rect x="0" y="0" width="720" height="56" rx="8" fill="#3a0a0a" stroke="#e94560" stroke-width="1"/>
+      <text x="16" y="23" font-size="14" font-weight="bold" fill="#e94560">&#128293; Charging paused &#8212; pack too hot</text>
+      <text x="16" y="42" font-size="12.5" fill="#aaaaaa">Pack is above 45 &#176;C. Resumes on its own below 43 &#176;C.</text>
+    </g>
+
+    <g transform="translate(20,148)">
+      <rect x="0" y="0" width="720" height="56" rx="8" fill="#3a0a0a" stroke="#e94560" stroke-width="1"/>
+      <text x="16" y="23" font-size="14" font-weight="bold" fill="#e94560">&#9888; Charging blocked &#8212; pack voltage too low</text>
+      <text x="16" y="42" font-size="12.5" fill="#aaaaaa">Below 70 V. Have the pack checked before charging. Do not force it.</text>
+    </g>
+
+    <g transform="translate(20,214)">
+      <rect x="0" y="0" width="720" height="56" rx="8" fill="#3a0a0a" stroke="#e94560" stroke-width="1"/>
+      <text x="16" y="23" font-size="14" font-weight="bold" fill="#e94560">&#128268; Charging stopped &#8212; no data from bike</text>
+      <text x="16" y="42" font-size="12.5" fill="#aaaaaa">Check the charge connector is seated and the bike is powered on.</text>
+    </g>
+
+    <g transform="translate(20,280)">
+      <rect x="0" y="0" width="720" height="56" rx="8" fill="#3a0a0a" stroke="#e94560" stroke-width="1"/>
+      <text x="16" y="23" font-size="14" font-weight="bold" fill="#e94560">&#9888; Wiring problem &#8212; too many chargers</text>
+      <text x="16" y="42" font-size="12.5" fill="#aaaaaa">More than four chargers answering. Disconnect the extra unit.</text>
+    </g>
+
+  </g>
+</svg>

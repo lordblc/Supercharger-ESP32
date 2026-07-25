@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="220" viewBox="0 0 760 220" role="img" aria-label="The three dashboard banners that appear while charging continues">
+  <title>Dashboard banners: charging continues</title>
+  <desc>Two amber banners for reduced power (pack warm, at cell current limit) and one blue informational banner for ignoring bad data from the bike. In all three cases charging carries on.</desc>
+
+  <rect x="0" y="0" width="760" height="220" fill="#1a1a2e"/>
+
+  <g font-family="Arial, Helvetica, sans-serif">
+
+    <g transform="translate(20,16)">
+      <rect x="0" y="0" width="720" height="56" rx="8" fill="#3a1f0a" stroke="#ff8c00" stroke-width="1"/>
+      <text x="16" y="23" font-size="14" font-weight="bold" fill="#ff8c00">&#127777; Reduced power &#8212; pack warm</text>
+      <text x="16" y="42" font-size="12.5" fill="#aaaaaa">Normal on a hot day. Charging continues safely at a lower rate.</text>
+    </g>
+
+    <g transform="translate(20,82)">
+      <rect x="0" y="0" width="720" height="56" rx="8" fill="#3a1f0a" stroke="#ff8c00" stroke-width="1"/>
+      <text x="16" y="23" font-size="14" font-weight="bold" fill="#ff8c00">&#128737; Reduced power &#8212; at cell current limit</text>
+      <text x="16" y="42" font-size="12.5" fill="#aaaaaa">Requested power exceeds the cells' 1 C rating, so it has been capped.</text>
+    </g>
+
+    <g transform="translate(20,148)">
+      <rect x="0" y="0" width="720" height="56" rx="8" fill="#0a2a3a" stroke="#4aa3c7" stroke-width="1"/>
+      <text x="16" y="23" font-size="14" font-weight="bold" fill="#4aa3c7">&#8505; Ignoring bad data from bike</text>
+      <text x="16" y="42" font-size="12.5" fill="#aaaaaa">Corrupted CAN messages discarded. Charging unaffected. Clears after 10 s.</text>
+    </g>
+
+  </g>
+</svg>

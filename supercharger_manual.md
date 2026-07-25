@@ -228,10 +228,39 @@ The dashboard auto refreshes every 2 seconds.
 
 ### Status Banners
 
-A coloured banner across the top of the dashboard tells you when something needs your attention:
+A coloured banner across the top of the dashboard tells you when something needs your attention. The colour tells you how serious it is:
 
-- **Red — "No WiFi"**: the controller can't reach your home WiFi and is running its own AP. Reach the dashboard via `http://<ap-ip>` or `http://supercharger.local`. Reconnects automatically when home WiFi comes back.
-- **Orange — "Thermal throttling"**: the pack temperature has crossed the hot-cutback threshold and the controller is reducing charging power to keep the cells safe. Charging continues, just slower. The banner clears on its own when the pack cools below the threshold.
+| Colour | Meaning |
+| --- | --- |
+| **Red** | Charging has stopped, or cannot start. |
+| **Amber** | Charging continues, but at reduced power. |
+| **Blue** | Advisory only. Charging is unaffected. |
+
+Only one banner shows at a time — the most serious condition wins, so you never get two messages that contradict each other. Each one clears itself as soon as the condition passes; none of them need acknowledging.
+
+Separately from these, a red **"No WiFi"** banner means the controller can't reach your home WiFi and is running its own AP. Reach the dashboard via `http://<ap-ip>` or `http://supercharger.local`. It reconnects automatically when home WiFi comes back.
+
+#### Red — charging has stopped
+
+<img src="pics/banners-charging-stopped.svg" width="620">
+
+| Banner | What it means | What to do |
+| --- | --- | --- |
+| **Pack too cold** | Pack is below **0 °C**. Charging a cold lithium cell plates metallic lithium onto the anode, which permanently reduces capacity and can eventually short the cell. This is the one limit you should never work around. | Nothing. Charging resumes on its own once the pack warms past 2 °C. Riding the bike, or moving it somewhere warmer, is the quickest way. |
+| **Pack too hot** | Pack is above **45 °C**, the cell manufacturer's charging limit. | Nothing. Resumes on its own below 43 °C. If it happens without hard riding beforehand, check for blocked airflow around the pack. |
+| **Pack voltage too low** | Pack is below **70 V** (2.5 V per cell). Below this level the copper current collector inside the cells starts to dissolve, and charging normally can create an internal short. | **Do not force it.** This should never happen in normal use — the bike's own BMS cuts out well above this. Have the pack checked by a technician. |
+| **No data from bike** | The controller has lost contact with the bike's BMS, so it can't see pack voltage or temperature. It will not charge blind. | Check the charge connector is fully seated and the bike is powered on. Charging resumes within a second of data returning. |
+| **Too many chargers** | More than four chargers are answering on the CAN bus. The controller divides commanded current between the chargers it knows about, so an extra unit would make every charger deliver more than intended. | Disconnect the extra charger, or give the chargers distinct CAN instance IDs, before charging. |
+
+#### Amber and blue — charging continues
+
+<img src="pics/banners-charging-continues.svg" width="620">
+
+| Banner | What it means | What to do |
+| --- | --- | --- |
+| **Reduced power — pack warm** | Pack temperature has crossed the hot-cutback threshold and power is being trimmed back. Normal on a hot day or after a fast ride. | Nothing. It speeds back up as the pack cools. |
+| **Reduced power — at cell current limit** | The power you asked for needs more current than the cells are rated to accept (1 C), so it has been capped. | Nothing, unless you'd rather not sit at the limit — in which case lower the power setting. |
+| **Ignoring bad data from bike** | Some CAN messages from the battery are arriving corrupted and are being discarded rather than acted on. | Nothing if it's occasional. If it persists, check the CAN wiring and connector for damage or a loose shield. |
 
 ### Chargers
 
@@ -311,9 +340,51 @@ Screenshot from my Home Assistant power monitor. This monitor sits in front of t
   - **70 % or 80 %**: pack must drop more than **2 V** below the target before a new cycle starts. Frequent small top-offs are fine in this gentle SoC range.
   - **90 %, 100 %**, or any custom target above 110.0 V: the controller waits for the pack to sag all the way down to the **80 % level (110.0 V)** before re-engaging. The cycle is wider (more voltage sag per top-off), but the pack spends far less time hovering near full charge — which is what actually wears Li-ion cells. The trade-off is deliberate: at 100 %, you'll see the pack discharge from 116.4 V down to 110.0 V before the chargers kick back in.
 
-**Already at target when you start**: if you turn charging on and the pack is already at or above the chosen preset's voltage (e.g. you set 80 % but the bike is at 81 %), the controller skips Bulk and Absorption entirely and goes straight to **Float** without ever sending a start command to the chargers. You'll see Float on the dashboard within one tick. The same Float → Bulk re-engage rules above then decide when (if ever) to start a new cycle. No wasted brief charge bursts at the top of the SoC range.
+**Already at target when you start**: if you turn charging on and the pack is already at or above the chosen preset's voltage (e.g. you set 80 % but the bike is at 84 %), the controller skips Bulk and Absorption entirely and goes straight to **Float** without ever sending a start command to the chargers. The same Float → Bulk re-engage rules above then decide when (if ever) to start a new cycle. No wasted brief charge bursts at the top of the SoC range.
+
+Bulk's first job at the start of every session is this comparison, and it waits for real telemetry before making it — so if the controller powers up with charging already enabled (see Boot Defaults) but the bike's BMS hasn't reported in yet, the decision is deferred a tick rather than skipped. The serial log records which way it went:
+
+```
+[RAMP] Start: no charge needed - pack 1112 dV (~84%) >= target 1100 dV (~80%). FLOAT; will top up if the pack sags.
+[RAMP] Start: BULK - pack 1050 dV (~68%) -> target 1100 dV (~80%)
+```
+
+#### Changing the target mid-charge
+
+You can move the % preset at any time and the controller re-evaluates immediately — you don't have to stop and restart charging.
+
+| You change the target to… | Pack is… | What happens |
+| --- | --- | --- |
+| **A higher preset** (e.g. 80 → 100 %) | below the new target | Returns to **Bulk** and carries on charging, from Float or from Absorption. |
+| **A higher preset** | already within 1 V of the new target | Stays where it is. Not worth a whole cycle for under a volt. |
+| **A lower preset** (e.g. 80 → 70 %) | above the new target | Goes straight to **Float**. The chargers stop; no partial cycle at a voltage the pack is already past. |
+| **A lower preset** | still below the new target | Keeps charging, and stops at the new lower ceiling. |
+
+After dropping to a lower preset, the normal Float → Bulk re-engage rules take over — so at 70 % the pack has to sag to 104.0 V before a fresh top-off begins. Lowering the target never leaves the controller stuck: a lower ceiling only makes the re-engage threshold lower too, and the pack always sags there eventually.
 
 **Practical implication of the % presets**: choosing 70 % doesn't just mean "stop earlier" — it also means a much shorter Absorption phase (or none at all if the ceiling is below where the pack would naturally taper). That's why low presets feel quick: the bulk of cell stress in a Li-ion charge is during Absorption at high voltage, and you're skipping most of it.
+
+### Cell Protection Limits
+
+Everything above is about *how much* you charge. This section is about the hard boundaries the controller will not cross regardless of what you ask for.
+
+The Zero monolith uses **Farasis IMP06160230P25A** cells — 25 Ah NMC pouch cells, 28 in series. The limits below come straight off that cell's datasheet, and they override the power slider, the presets, MQTT commands and the boot defaults alike.
+
+| Limit | Value | Why |
+| --- | --- | --- |
+| Charging temperature | **0 to 45 °C** | Datasheet charging range. Below 0 °C charging plates lithium; above 45 °C it accelerates cell degradation. Outside this range the controller refuses to charge at all and shows a red banner. |
+| Maximum charge current | **1.0 C** (25 A per cell) | Datasheet maximum. Applied to the *total* pack current before it's divided between chargers, so it holds no matter how many chargers are connected or what the cutback tables allow. |
+| Minimum pack voltage for charging | **70 V** (2.5 V/cell) | Below this the copper current collector inside the cells dissolves and charging can create an internal short. The controller refuses; this needs a technician, not a charger. |
+| Maximum pack voltage | **116.4 V** (4.157 V/cell) | The 100 % preset. Inside the cell's 4.15–4.20 V constant-voltage window, with margin. |
+
+Two things worth understanding about how these interact with the cutback tables in `battery_tables.h`:
+
+- The **cutback tables shape** charge current inside the safe window — they taper power as the pack warms or approaches full. The **hard limits above are the boundary** of that window. Two independent layers: if a future firmware change broke one, the other still holds.
+- A temperature limit being hit is an **outright stop**, not a cutback. That's the difference between the red "Charging paused" banners and the amber "Reduced power" one. Amber means it's still charging.
+
+**Sub-zero charging is not user-overridable.** There is no setting to bypass it, deliberately. If you need to charge a cold pack, warm the pack — ride it, or move the bike indoors.
+
+**Implausible readings are discarded.** Pack voltage arriving from the bike outside 42–117.6 V (1.5–4.2 V/cell) is treated as a corrupted CAN frame and thrown away rather than acted on. If corrupted frames keep arriving, the blue "Ignoring bad data" banner appears; if they're *all* corrupt the controller ends up with no fresh data and stops charging with the red "No data from bike" banner. Either way it never computes a charge current from a bad voltage reading.
 
 ### System Info
 
@@ -372,6 +443,8 @@ These settings define the charging state the controller wakes into on every boot
 | **Default target voltage** | Which charge limit preset (70 / 80 / 90 / 100 %) to start with. Default: 80% (110.0 V). |
 
 Click **Save AP / Road Defaults** to persist. These take effect on the next boot.
+
+**With "Start with charging enabled" on**, the controller still checks the pack against the target before doing anything — it waits for the bike's BMS to report in, compares pack voltage to the target preset, and goes straight to Float if no charge is needed. So booting with charging enabled and a pack already above the target does *not* produce a brief charge burst. If the BMS is slow to report, the decision is deferred rather than skipped.
 
 ### Boot Defaults — Home WiFi
 
@@ -637,6 +710,24 @@ Try **http://supercharger.local** first — that's mDNS and works on most modern
 **Dashboard blank or stuck**
 Reload the page. If that doesn't help, check `/log` for errors. You can also power cycle the controller by cutting the 12 V from the chargers.
 
+**Charging is on but nothing is happening — and a red banner is showing**
+That's the controller refusing on purpose. See [Status Banners](#status-banners) for what each one means. The short version: too cold, too hot, pack voltage too low, no bike data, or too many chargers on the bus. Four of the five clear themselves.
+
+**Charging is on, no banner, but the phase says Float**
+The pack is already at or above your chosen % preset, so there's nothing to do. Check the % preset row — if the bike is at 84 % and the preset is 80 %, that's expected. Raise the preset and it will start charging within a second. The serial log shows the decision at the point charging was enabled (`no charge needed` vs `BULK`).
+
+**I raised the % preset but it didn't start charging**
+If the pack is already within 1 V of the new target, the controller leaves it alone rather than run a whole cycle for under a volt. Pick the next preset up, or wait for the pack to sag. Anything more than 1 V below the new target starts Bulk immediately.
+
+**Charging stops every time it gets cold outside**
+Working as intended below 0 °C — see [Cell Protection Limits](#cell-protection-limits). There's no override, deliberately. Warm the pack.
+
+**Power never reaches what I set on the slider**
+Check for an amber banner. "At cell current limit" means you've asked for more current than the cells are rated for (1 C) and it's been capped — the pack's capacity, not the chargers, is the constraint. "Pack warm" means thermal cutback. Both are normal.
+
+**"Rebooting…" or other text on a page looks garbled**
+Fixed in current firmware — the OTA page was missing its character-set declaration. If you still see it, you're running an older build; reflash.
+
 ---
 
 ## Technical Reference
@@ -680,5 +771,30 @@ Each attempt has a 15 second timeout before falling through.
 - Ramp rate: 50 W per 1 second tick.
 - Max charge voltage: 116.4 V (1164 dV) — set by the highest threshold in the voltage cutback table (`battery_tables.h`). At 116.4 V the cutback table limits charging to 0.005 C (~570 mA on a 114 Ah pack), effectively a CV trickle finish.
 - Max total power: 13200 W (4 chargers at 3300 W each).
+- Max charge current: **1.0 C** of BMS-reported pack Ah, applied to total pack current before per-charger division. From the Farasis cell rating (25 A on a 25 Ah cell). Independent of the cutback tables.
+- Charging temperature window: **0 to 45 °C**, hard inhibit outside it, with 2 °C hysteresis on re-arm.
+- Charge-inhibit voltage floor: **70.0 V** (700 dV, 2.5 V/cell).
+- Pack voltage plausibility window: **42.0 to 117.6 V** (420–1176 dV, 1.5–4.2 V/cell). Readings outside this are discarded as corrupt CAN frames.
+- BMS staleness timeout: **5 s** without a monolith voltage frame → charger STOP.
+- Charger timeout: **10 s** without a status frame → charger marked absent and the count recomputed.
+- Max chargers commanded: **4**. More than that on the bus raises a red banner and the count is clamped.
+
+### Cell Specification
+
+Zero monolith cells, for reference when reading `battery_tables.h`:
+
+| Parameter | Value |
+| --- | --- |
+| Cell | Farasis IMP06160230P25A, NMC pouch |
+| Capacity | 25 Ah nominal, 23.5 Ah minimum |
+| Configuration | 28 series |
+| Nominal voltage | 3.65 V/cell (102.2 V pack) |
+| Constant-voltage range | 4.15–4.20 V/cell |
+| Discharge minimum | 2.00 V/cell |
+| Max charge current | 25 A (1.0 C) |
+| Charging temperature | 0 to 45 °C |
+| Operating temperature | −20 to 60 °C (discharge; charging is narrower) |
+
+Note that the cutback tables in `battery_tables.h` are capped at 1.0 C to match the cell rating. Earlier firmware allowed table entries up to 3.0 C; the system power ceiling (~1 C at this pack size) meant they never actually bound, but the tables no longer imply headroom that the cells don't have.
 
 ---
