@@ -48,7 +48,7 @@
 //   esp_https_server } built into Espressif ESP32 Arduino core - used for HTTPS port-443 serving
 // ==========================================================================
 
-#define VERSION 202607251501
+#define VERSION 202608151626
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -267,6 +267,12 @@ struct LiveData {
   // exposing the raw arithmetic mean. Useful as a single "cell health" number
   // alongside cellBalanceMv. 0 = not yet received.
   uint16_t cellAvgMv        = 0;
+
+  // Odometer (total distance) from DASH_ODO_FROM_DASH (0x2C0). Stored in
+  // HECTOMETRES (0.1 km units) as decoded from the dash frame — km = /10.
+  // 0 = not yet received. See the decode branch + the [CAN] +-2C0 diagnostic
+  // log line for the byte layout and how to verify/adjust it.
+  uint32_t odometerHm       = 0;
 
   // PowerTank (BMS1)
   long  powerTankVoltageDv  = 0;
@@ -795,6 +801,7 @@ struct MqttSnapshot {
   uint16_t cellBalanceMv     = 65535;   // sentinel, forces first publish
   int16_t  bmsBoardTempC     = -256;    // sentinel (outside int8 range), forces first publish
   uint16_t cellAvgMv         = 65535;   // sentinel, forces first publish
+  uint32_t odometerHm        = 0xFFFFFFFFUL; // sentinel, forces first publish
 } mqttLast;
 
 // MQTT transport — both a plaintext and a TLS client live in BSS so we can
@@ -1597,6 +1604,8 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
       <span class="val" id="heap">—</span></div>
     <div class="card"><div class="label">Cycles Logged</div>
       <span class="val" id="cycleCount">—</span></div>
+    <div class="card"><div class="label">Odometer</div>
+      <span class="val" id="odo">—</span></div>
   </div>
 
   <footer id="footer">Waiting for first update...</footer>
@@ -2061,6 +2070,10 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
                                                             ? fmt(d.free_heap_kb, 1) + ' kB' : '—';
           document.getElementById('cycleCount').textContent = d.cycle_count !== undefined
                                                             ? d.cycle_count : '—';
+          // Odometer: -1 (or absent) means no dash frame decoded yet → "—".
+          document.getElementById('odo').textContent =
+            (d.odometer_km !== undefined && d.odometer_km >= 0)
+              ? (fmt(d.odometer_km, 1) + ' km') : '—';
           document.getElementById('footer').textContent =
             'Last update: ' + new Date().toLocaleTimeString();
         })
@@ -4486,13 +4499,15 @@ static String buildApiStatusJson() {
     response += entry;
     first = false;
   }
-  // Append cell balance, BMS board temp, and per-cell avg then close the object
-  char cellBuf[100];
+  // Append cell balance, BMS board temp, per-cell avg, odometer, then close.
+  // odometer_km is -1 when no dash frame has been decoded yet (dashboard shows "—").
+  char cellBuf[128];
   snprintf(cellBuf, sizeof(cellBuf),
-    "],\"cell_balance_mv\":%u,\"bms_board_temp\":%d,\"cell_avg_mv\":%u}",
+    "],\"cell_balance_mv\":%u,\"bms_board_temp\":%d,\"cell_avg_mv\":%u,\"odometer_km\":%.1f}",
     (unsigned)liveSnap.cellBalanceMv,
     (int)liveSnap.bmsBoardTempC,
-    (unsigned)liveSnap.cellAvgMv);
+    (unsigned)liveSnap.cellAvgMv,
+    liveSnap.odometerHm > 0 ? liveSnap.odometerHm / 10.0f : -1.0f);
   response += cellBuf;
   return response;
 }
@@ -5670,10 +5685,13 @@ void processBikeFrame(const twai_message_t &msg) {
     static unsigned long lastLog389  = 0, lastLog289  = 0, lastLog489  = 0, lastLog509  = 0;
     static unsigned long lastLog308  = 0;
     static unsigned long lastLog188  = 0, lastLog189  = 0;
+    static unsigned long lastLog2C0  = 0, lastLog3C0  = 0;
     unsigned long* slot = nullptr;
     const char*    name = nullptr;
 
-    if      (id == 0x388) { slot = &lastLog388; name = "BMS_CELL_VOLTAGE  (0x388)"; }
+    if      (id == 0x2C0) { slot = &lastLog2C0; name = "DASH_ODO_FROM_DASH(0x2C0)"; }
+    else if (id == 0x3C0) { slot = &lastLog3C0; name = "DASH_ODO_TO_DASH  (0x3C0)"; }
+    else if (id == 0x388) { slot = &lastLog388; name = "BMS_CELL_VOLTAGE  (0x388)"; }
     else if (id == 0x288) { slot = &lastLog288; name = "BMS_PACK_CONFIG   (0x288)"; }
     else if (id == 0x488) { slot = &lastLog488; name = "BMS_PACK_TEMP_DATA(0x488)"; }
     else if (id == 0x508) { slot = &lastLog508; name = "BMS_PACK_TIME     (0x508)"; }
@@ -5711,6 +5729,24 @@ void processBikeFrame(const twai_message_t &msg) {
         LOG("[CAN]  +-388 b[0-1]=%u mV  b[2]=%u  b[2-3]=%u mV  "
             "pack(b3-6)=%u mV  pack(b4-7)=%u mV\n",
             b01, (unsigned)buf[2], b23, b36, b47);
+      }
+
+      if (id == 0x2C0 || id == 0x3C0) {
+        // Odometer candidates. Community Zero reverse-engineering says the value
+        // is a little-endian integer in HECTOMETRES (0.1 km) → km = raw/10.
+        // Print a few byte-range interpretations so the layout can be confirmed
+        // against the bike's displayed odometer (~26600 km expected here).
+        uint32_t b02 = (uint32_t)buf[0] | ((uint32_t)buf[1] << 8)
+                     | ((uint32_t)buf[2] << 16);                       // bytes 0-2 LE
+        uint32_t b03 = b02 | ((uint32_t)buf[3] << 24);                 // bytes 0-3 LE
+        uint32_t b47 = (uint32_t)buf[4] | ((uint32_t)buf[5] << 8)
+                     | ((uint32_t)buf[6] << 16) | ((uint32_t)buf[7] << 24); // bytes 4-7 LE
+        LOG("[CAN]  +-%03X odo: b[0-2]=%lu (%.1f km)  b[0-3]=%lu (%.1f km)  "
+            "b[4-7]=%lu (%.1f km)\n",
+            (unsigned)(id & 0xFFF),
+            (unsigned long)b02, b02 / 10.0f,
+            (unsigned long)b03, b03 / 10.0f,
+            (unsigned long)b47, b47 / 10.0f);
       }
 
       if (id == 0x488 || id == 0x489) {
@@ -5889,6 +5925,25 @@ void processBikeFrame(const twai_message_t &msg) {
     // BMS1_PACK_STATUS (0x189): same byte-0 SoC layout as the monolith 0x188.
     byte soc = zeroDecoder.stateOfCharge(len, buf);
     if (soc != 255) live.powerTankBmsSoc = soc;
+  }
+  else if (id == 0x2C0) {
+    // DASH_ODO_FROM_DASH (0x2C0) — total odometer. Per the community Zero CAN
+    // reverse-engineering the value is a 3-byte little-endian integer in
+    // HECTOMETRES (0.1 km): e.g. bytes 07 5D 02 → 0x025D07 = 154887 →
+    // 15488.7 km. We read bytes 0-2 LE (a 3-byte odometer covers up to
+    // ~1.67M km) and store hectometres. Sanity-gated so a corrupt frame can't
+    // publish a wild value.
+    //
+    // NOTE: verify against the bike's displayed odometer using the
+    // "[CAN] +-2C0 odo:" diagnostic log line (it prints the b[0-2], b[0-3] and
+    // b[4-7] interpretations). If none matches, the source ID may be 0x3C0 on
+    // this bike, or the scale differs — adjust the byte range / divisor here.
+    if (len >= 3) {
+      uint32_t hm = (uint32_t)buf[0] | ((uint32_t)buf[1] << 8)
+                  | ((uint32_t)buf[2] << 16);
+      if (hm > 0 && hm < 16000000UL)   // 0 < km < 1,600,000 (3-byte range)
+        live.odometerHm = hm;
+    }
   }
   // 0x489 (BMS1_PACK_TEMP_DATA) intentionally NOT decoded for temps — see 0x408 note.
 
@@ -7698,15 +7753,24 @@ static void mqttPublishSensorI(const char* name, int value) {
 }
 
 // Publish HA discovery config for one sensor entity
+// withAvail (default true): attach the availability (LWT) topic so Home
+// Assistant marks the entity "unavailable" when the controller goes offline.
+// Pass false for values that should KEEP their last reading when the controller
+// powers down (e.g. State of Charge, odometer) instead of flipping to
+// "unavailable" — the last value is retained on the broker and HA shows it.
+// Two overloads (not a default argument — a default arg on a top-level .ino
+// function can collide with the IDE's auto-generated prototype). The 6-arg form
+// controls availability; the 5-arg form keeps it on, the common case.
 static void mqttDiscoverSensor(
     const char* name, const char* friendlyName,
     const char* unit, const char* deviceClass,
-    const char* stateClass)
+    const char* stateClass, bool withAvail)
 {
   static char topic[120];
   static char payload[512];
   static char stateTopic[80];
   static char availTopic[80];
+  static char availPart[160];
   static char devId[40];
   static char dcPart[60];
   static char scPart[60];
@@ -7722,6 +7786,12 @@ static void mqttDiscoverSensor(
     "supercharger/%s/state", mqttHostname);
   snprintf(devId, sizeof(devId),
     "supercharger_%s", mqttHostname);
+
+  availPart[0] = '\0';
+  if (withAvail)
+    snprintf(availPart, sizeof(availPart),
+      ",\"avty_t\":\"%s\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\"",
+      availTopic);
 
   dcPart[0] = '\0';
   if (deviceClass && strlen(deviceClass) > 0)
@@ -7739,10 +7809,8 @@ static void mqttDiscoverSensor(
     "{"
       "\"name\":\"%s\","
       "\"uniq_id\":\"sc_%s_%s\","
-      "\"stat_t\":\"%s\","
-      "\"avty_t\":\"%s\","
-      "\"pl_avail\":\"online\","
-      "\"pl_not_avail\":\"offline\""
+      "\"stat_t\":\"%s\""
+      "%s"
       "%s%s%s,"
       "\"dev\":{"
         "\"ids\":[\"%s\"],"
@@ -7752,12 +7820,21 @@ static void mqttDiscoverSensor(
       "}"
     "}",
     friendlyName, mqttHostname, name,
-    stateTopic, availTopic,
+    stateTopic, availPart,
     dcPart, scPart, unitPart,
     devId
   );
 
   mqttClient.publish(topic, payload, true);
+}
+
+// 5-arg overload — availability on (default behavior for most sensors).
+static void mqttDiscoverSensor(
+    const char* name, const char* friendlyName,
+    const char* unit, const char* deviceClass,
+    const char* stateClass)
+{
+  mqttDiscoverSensor(name, friendlyName, unit, deviceClass, stateClass, true);
 }
 
 // Same as mqttDiscoverSensor but flags the entity as a diagnostic — HA groups
@@ -7966,7 +8043,10 @@ static void mqttPublishDiscovery() {
   mqttDiscoverSensor("monolith_a",      "Monolith Current",       "A",        "current",     "measurement");
   mqttDiscoverSensor("monolith_tmin",   "Monolith Temp Min",      "\xB0""C",  "temperature", "measurement");
   mqttDiscoverSensor("monolith_tmax",   "Monolith Temp Max",      "\xB0""C",  "temperature", "measurement");
-  mqttDiscoverSensor("monolith_soc",    "Monolith State of Charge", "%",      "battery",     "measurement");
+  // SoC published WITHOUT the availability topic (withAvail=false): when the
+  // controller powers down HA keeps showing the last read value instead of
+  // flipping to "unavailable" (the last value is retained on the broker).
+  mqttDiscoverSensor("monolith_soc",    "Monolith State of Charge", "%",      "battery",     "measurement", false);
   // Available pack capacity right now: nominal AH × SoC. Tracks "how much is
   // actually left in the pack" rather than the constant nominal value.
   mqttDiscoverSensor("monolith_ah_avail","Monolith Capacity Available","Ah",   "",            "measurement");
@@ -8013,6 +8093,10 @@ static void mqttPublishDiscovery() {
   mqttDiscoverSensor("bms_board_temp",    "BMS Board Temp",          "\xB0""C", "temperature", "measurement");
   // Per-cell average voltage — bytes 6-7 of 0x488 (uint16 LE, mV). Tracks pack_v/28.
   mqttDiscoverSensor("cell_avg_mv",       "Cell Average Voltage",    "mV",  "voltage",    "measurement");
+  // Odometer (total distance) from the dash frame 0x2C0. Published WITHOUT the
+  // availability topic (like SoC) so HA keeps the last value when the controller
+  // is off. total_increasing so HA treats it as a lifetime counter.
+  mqttDiscoverSensor("odometer_km",       "Odometer",                "km",  "distance",   "total_increasing", false);
   // Diagnostics — grouped under the HA device's "Diagnostic" section.
   // Published on a fixed 30 s cadence (see mqttPublishChanges), retained.
   // RSSI history is the tool for spotting link trouble; the uptime sawtooth
@@ -8393,6 +8477,14 @@ static bool mqttPublishChanges() {
   if (ls.cellAvgMv > 0 && ls.cellAvgMv != mqttLast.cellAvgMv) {
     mqttPublishSensorI("cell_avg_mv", (int)ls.cellAvgMv);
     mqttLast.cellAvgMv = ls.cellAvgMv;
+    published = true;
+  }
+
+  // Odometer (dash 0x2C0). Only publish once a value has been decoded (>0) and
+  // when it changes. Published in km with one decimal.
+  if (ls.odometerHm > 0 && ls.odometerHm != mqttLast.odometerHm) {
+    mqttPublishSensorF("odometer_km", ls.odometerHm / 10.0f, 1);
+    mqttLast.odometerHm = ls.odometerHm;
     published = true;
   }
 
