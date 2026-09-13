@@ -2,13 +2,13 @@ Ok, so.. I set out to build upon the work [skonk made that is referred to in thi
 
 My goal was to achieve some additional abilities.  
 I wanted to use better hardware. I found his approach to be very clunky and i could not see how I would make it fit on the bike.  
-It didn't help that the CAN cable on the bike was very short and limitting me to basically place it close to the fusebox underneath the seat. An area that is already quite space limitted.  
+It didn't help that the CAN cable on the bike was very short and limiting me to basically place it close to the fusebox underneath the seat. An area that is already quite space limited.  
 Anyway.. I also wanted to include HomeAssistant control as i already have that on my other chargeable vehicles.  
 
 I tried to do the easy approach first, and simply employed CoPilot to just adapt the original code from Arduino to ESP32. This yielded a somewhat result but had issues.  
 I referred to that result in the [same forumthread](https://www.electricmotorcycleforum.com/boards/index.php?topic=13748.0 "Electric Motorcycle Forum") as well as here.
 
-Having kept at it and starting from scratch, I formulated an approach as a project manager and set out to make something with Claude as my assistant. I started using the Sonnet 4.5 model, but eventually moved on to Opus 4.6, and later Opus 4.7.  
+Having kept at it and starting from scratch, I formulated an approach as a project manager and set out to make something with Claude as my assistant. I started using the Sonnet 4.5 model, but eventually moved on to Opus 4.6, and later Opus 4.7, Opus 4.8, Fable 5, Opus 5 and Fable 5.1(this code has yet to be updated).  
 My approach was to always be in control of what was created and dividing the codebase into smaller chunks where I was able to keep up with what was suggested from the AI.
 
 So, the details are as follows:  
