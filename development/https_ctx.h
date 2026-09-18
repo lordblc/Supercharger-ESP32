@@ -116,9 +116,13 @@ struct HttpCtx {
       (code == 400) ? "Bad Request"      :
       (code == 401) ? "Unauthorized"     :
       (code == 404) ? "Not Found"        :
+      (code == 409) ? "Conflict"         :
       (code == 413) ? "Payload Too Large" :
+      (code == 415) ? "Unsupported Media Type" :
       (code == 423) ? "Locked"           :
-      (code == 429) ? "Too Many Requests" : "Unknown";
+      (code == 429) ? "Too Many Requests" :
+      (code == 500) ? "Internal Server Error" :
+      (code == 503) ? "Service Unavailable" : "Unknown";
     char status[40];
     snprintf(status, sizeof(status), "%d %s", code, reason);
     httpd_resp_set_status(idfReq, status);

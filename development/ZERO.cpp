@@ -318,16 +318,23 @@ short Zero::AH(byte &len,byte buf[ZERO_MESSAGE_LENGTH]){
 //
 // 0x7F (127) is the BMS "sensor disconnected" sentinel — guarded against so
 // a single dead thermistor doesn't push the max to +127°C.
+//
+// Both cases below return ZERO_TEMP_INVALID, not 0. Returning 0 was itself a
+// failure mode: 0 °C is a perfectly plausible pack temperature, so a dead hot
+// thermistor looked like a cold-but-healthy pack — the hot cutback stopped
+// limiting power and the 45 °C charge inhibit could never fire. The caller
+// stores the sentinel as-is and rampTask treats "temperature unknown" as its
+// own inhibit reason.
 
 short Zero::highestTemp(byte &len, byte buf[ZERO_MESSAGE_LENGTH]) {
-  if (len < 2) return 0;
-  if ((uint8_t)buf[1] == 0x7F) return 0;   // disconnected sensor
+  if (len < 2) return ZERO_TEMP_INVALID;   // frame too short to hold the byte
+  if ((uint8_t)buf[1] == 0x7F) return ZERO_TEMP_INVALID;   // disconnected sensor
   return (short)(int8_t)buf[1];
 }
 
 short Zero::lowestTemp(byte &len, byte buf[ZERO_MESSAGE_LENGTH]) {
-  if (len < 3) return 0;
-  if ((uint8_t)buf[2] == 0x7F) return 0;   // disconnected sensor
+  if (len < 3) return ZERO_TEMP_INVALID;   // frame too short to hold the byte
+  if ((uint8_t)buf[2] == 0x7F) return ZERO_TEMP_INVALID;   // disconnected sensor
   return (short)(int8_t)buf[2];
 }
 

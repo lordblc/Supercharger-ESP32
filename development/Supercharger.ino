@@ -14,47 +14,78 @@
 //   Charger: MCP2515 via SPI  (CS=10, SCLK=12, MOSI=11, MISO=13, RST=9)
 //   Bike: ESP32-S3 TWAI    (TX=7, RX=6)
 //
-// Written for charger hardware Elcon TC HK-J 3300W
-// Other functions:
-//   Web dashboard (live status, auto-refresh via /api/status JSON)
-//   WiFi – connects to saved network, falls back to AP for setup
-//   OTA firmware update via browser (/update, HTTP Basic Auth)
-//   MQTT communication (for HA)
+// Written for 1-4 x Elcon TC HK-J 3300W chargers (the units supplied in the
+// DigiNow supercharger kit). They all ship with the same CAN instance ID
+// 0x18FF50E5, so one broadcast command drives every unit and charger
+// auto-detect reports 1 no matter how many are wired.
 //
-// MQTT info:
+// Other functions:
+//   Web dashboard (live status, polled via /api/status JSON)
+//   WiFi - connects to saved network, falls back to its own AP for setup
+//   OTA firmware update via browser (/update) - the image must carry a valid
+//     HMAC-SHA256 trailer (sign_ota.py), and the page is behind the same
+//     form-login session cookie as the rest of the UI. NOT HTTP Basic Auth.
+//   MQTT communication (for Home Assistant)
+//   Optional HTTPS on port 443, per-cycle CSV logging to FFat
 //
 // Home Assistant integration:
 //   MQTT discovery prefix : homeassistant/
 //   Device base topic     : supercharger/<HOSTNAME>/
-//   Sensors (read-only)   : actual_volts, target_volts, monolith_volts,
-//                           powertank_volts, charge_amps, monolith_amps,
-//                           powertank_amps, monolith_ah, powertank_ah,
-//                           monolith_min_temp, monolith_max_temp,
-//                           powertank_min_temp, powertank_max_temp,
-//                           charge_power, target_power_w, max_power_w,
-//                           coulombs, watt_hours
-//   Controls (read/write) : target_voltage_dv (number), target_power_set (number),
-//                           charger_count (number), ramp_rate_wps (number),
-//                           c_plus (switch), charging_enabled (switch)
+//   Sensors (read-only)   : monolith_v, monolith_a, monolith_tmin,
+//                           monolith_tmax, monolith_soc, monolith_ah_avail,
+//                           powertank_v, powertank_a, powertank_tmin,
+//                           powertank_tmax, current_power_w, session_wh,
+//                           session_ah, target_preset_pct, thermal_throttle,
+//                           ramp_phase, eta_minutes, cycle_count,
+//                           cell_balance_mv, cell_avg_mv, bms_board_temp,
+//                           odometer_km
+//   Diagnostics           : wifi_rssi, uptime, firmware
+//   Controls (read/write) : target_power_w (number), charger_count (number),
+//                           ramp_rate_wps (number), target_volt_v (number),
+//                           charging_enabled (switch)
+//   Buttons               : preset_70 / preset_80 / preset_90 / preset_100
+//                           (one per TARGET_VOLT_PRESETS entry), reset_session
 //
 // Required libraries (Arduino Library Manager):
 //   mcp_can          by coryjfowler (important. Do not use alternatives, it will fail the code.)
 //   PubSubClient     by Nick O'Leary
-//   ArduinoJson      by Benoit Blanchon  (v6)
-//   BLEDevice        } built into Espressif ESP32 Arduino core - no install needed
+//   ArduinoJson      by Benoit Blanchon - this code uses the v6 API
+//                    (StaticJsonDocument / containsKey). The library installed
+//                    on the build host is 7.x, which still compiles it but
+//                    warns on every use. Pin v6 or migrate the call sites.
 //   ESPmDNS          } built into Espressif ESP32 Arduino core - no install needed
 //   driver/twai.h    } built into Espressif ESP32 Arduino core - no install needed
 //   WiFiClientSecure } built into Espressif ESP32 Arduino core - used for MQTT-TLS client
 //   esp_https_server } built into Espressif ESP32 Arduino core - used for HTTPS port-443 serving
+//   (No BLE: the Zero app's Bluetooth is a wireless bridge for these same CAN
+//    frames, so there is nothing BLEDevice could add here.)
 // ==========================================================================
 
-#define VERSION 202608151626
+#define VERSION 202609131746
 
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include <arduino_secrets.h>
+// Preferred names (2026-09): SECRET_AP_SSID/SECRET_AP_PASS = this device's own
+// access point; SECRET_WIFI_SSID/SECRET_WIFI_PASS = the home network joined as a
+// station. Older secrets files use SECRET_SSID/SECRET_PASS (AP) and
+// SECRET_MQTT_SSID/SECRET_MQTT_PASS (station); map them so both still build.
+// (SECRET_MQTT_HOST / _USER / _BROKER_PASS are the MQTT broker login and are
+// unrelated to either WiFi pair.)
+#ifndef SECRET_AP_SSID
+  #define SECRET_AP_SSID SECRET_SSID
+#endif
+#ifndef SECRET_AP_PASS
+  #define SECRET_AP_PASS SECRET_PASS
+#endif
+#ifndef SECRET_WIFI_SSID
+  #define SECRET_WIFI_SSID SECRET_MQTT_SSID
+#endif
+#ifndef SECRET_WIFI_PASS
+  #define SECRET_WIFI_PASS SECRET_MQTT_PASS
+#endif
 // Fixed AP-mode IP defines are optional — guard so a build host whose
 // arduino_secrets.h predates this feature still compiles. Empty = disabled.
 #ifndef SECRET_AP_IP
@@ -80,6 +111,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include <esp_task_wdt.h>    // task watchdog — rampTask + chargerBusTask subscribe (STAB-5)
+#include <esp_system.h>      // esp_restart() — stack-overflow hook
+#include <rom/ets_sys.h>     // ets_printf() — allocation-free printf for the overflow hook
 #include <lwip/sockets.h>    // select() writability probe + SO_SNDTIMEO — SSE log stream
 #include <PubSubClient.h>
 #include <ArduinoJson.h>     // v6 — used by /api/settings, /api/control body parsing
@@ -222,6 +256,32 @@ static unsigned long lastStaRetryAt    = 0;
 const unsigned long AP_GRACE_MS = 90000UL;       // 90 s of stable STA
 static unsigned long apStaStableSinceMs = 0;
 
+// STA up/down edge latch for STATE_AP_RETRYING. File scope (not a function
+// static) so enterApRetrying() can clear it on every entry — a function static
+// survived the state change and made the first poll after re-entry look like
+// "still up", skipping the reconnect bookkeeping (NET-18a).
+static bool apRetryLastStaUp = false;
+
+// Flap limiter (NET-18c): count CONNECTED → AP_RETRYING entries. More than
+// AP_FLAP_MAX inside AP_FLAP_WINDOW_MS means the link is flapping, and cycling
+// the SoftAP (and mDNS with it) once per flap costs more than it buys — so we
+// keep the AP up and let the 30 s WiFi.reconnect() nudge do the work.
+//
+// Lifetime (B2): once engaged the limiter HOLDS for AP_FLAP_WINDOW_MS measured
+// from the moment it engaged, then releases and normal SoftAP teardown resumes.
+// It used to be timed from apFlapWindowStart — the start of the counting
+// window — which is only ever written in the STATE_CONNECTED drop branch. That
+// branch stops running the moment the limiter engages (the state machine sits
+// in AP_RETRYING from then on), so the window start froze at the FIRST drop and
+// the "expiry" test could already be satisfied seconds later, releasing the
+// hold immediately and defeating the whole mechanism.
+const unsigned long AP_FLAP_WINDOW_MS = 600000UL;  // 10 min
+const uint8_t       AP_FLAP_MAX       = 3;         // entries allowed per window
+static uint8_t       apFlapCount          = 0;
+static unsigned long apFlapWindowStart    = 0;
+static bool          apFlapLimited        = false;
+static unsigned long apFlapLimitedSinceMs = 0;   // millis() when the hold engaged
+
 // ---------------------------------------------------------------------------
 // Live data — written by bikeBusTask() on Core 0, read by /api/status on Core 1
 // Protected by liveMutex. All raw values follow Zero CAN library scaling:
@@ -240,8 +300,14 @@ struct LiveData {
   short monolithSagAdjDv    = 0;  // sagAdjust from BMS_PACK_CONFIG (0x288) bytes 0-1
   short monolithAmps        = 0;
   short monolithAH          = 0;
-  short monolithMinTemp     = 0;
-  short monolithMaxTemp     = 0;
+  // Temperatures start INVALID, not 0 (audit 2026-09). 0 is a perfectly normal
+  // pack reading, so a struct that has never received a 0x408 frame used to be
+  // indistinguishable from a healthy 0 °C pack: the hot cutback saw "cold", the
+  // 45 °C inhibit saw "fine", and the temp-unknown inhibit never armed. The
+  // sentinel makes "no data yet" explicit to every consumer (all of which test
+  // against TEMP_INVALID_THRESHOLD).
+  short monolithMinTemp     = ZERO_TEMP_INVALID;
+  short monolithMaxTemp     = ZERO_TEMP_INVALID;
   short monolithMaxCRate    = 0;
   // BMS-reported SoC % from BMS_PACK_STATUS (0x188 byte 0). 255 = no frame
   // received yet; falls back to voltage-curve estimate in that case.
@@ -279,8 +345,9 @@ struct LiveData {
   short powerTankSagAdjDv   = 0;  // sagAdjust from BMS1_PACK_CONFIG (0x289) bytes 0-1
   short powerTankAmps       = 0;
   short powerTankAH         = 0;
-  short powerTankMinTemp    = 0;
-  short powerTankMaxTemp    = 0;
+  // Same rationale as the monolith pair above — see that comment.
+  short powerTankMinTemp    = ZERO_TEMP_INVALID;
+  short powerTankMaxTemp    = ZERO_TEMP_INVALID;
   short powerTankMaxCRate   = 0;
   byte  powerTankBmsSoc     = 255;  // BMS1_PACK_STATUS (0x189 byte 0)
 
@@ -317,19 +384,35 @@ Zero zeroDecoder;
 // Voltage/current in status frames: unit is 0.1 V / 0.1 A
 // We store as raw 16-bit words and divide at JSON serialisation time.
 //
-// STATUS byte bitfield (byte 4 of status frame):
-//   0x01  Hardware fault
-//   0x02  Overtemperature
-//   0x04  AC input problem
-//   0x08  No battery connected
-//   0x10  Battery disconnect / reverse / not OK
+// STATUS byte bitfield (byte 4 of status frame). Meanings below are per the
+// Elcon TC charger CAN protocol document; they are NOT yet validated against
+// this hardware, so treat them as the best available reading of the spec:
+//   0x01  Hardware failure                      — ACTED ON (latches g_chargerFault)
+//   0x02  Charger over-temperature              — ACTED ON (latches g_chargerFault)
+//   0x04  AC input voltage out of range         — display only
+//   0x08  Battery not detected / starting state — display only
+//   0x10  Communication receive timeout         — display only
+//
+// Only 0x03 (hardware fault | overtemperature) is acted on; see the fault scan
+// in rampTask. The other three are decoded and shown on the dashboard but never
+// stop a charge:
+//   * 0x04 asserts transiently on any mains dip and self-clears — latching a
+//     stop on it would turn a flicker into a manual re-arm.
+//   * 0x08 is the charger's own "no battery / still starting" state, which is
+//     true for the first moments of every session before the output closes.
+//   * 0x10 is the Elcon comm-timeout bit: the charger raises it by design after
+//     ~5 s without a command frame, i.e. it is set on every idle unit and on
+//     every unit that has just been powered up. Acting on it (the old 0x1B mask
+//     did) latched a charger fault against a perfectly healthy idle charger.
 // ---------------------------------------------------------------------------
 
 SemaphoreHandle_t chargerMutex = nullptr;
 
-// Known charger status IDs — low nibble is the charger index (5,7,8,9).
-// Stored as the nibble value for compact bitmask indexing.
-// 0x18FF50E5 -> nibble 5, 0x18FF50E7 -> 7, 0x18FF50E8 -> 8, 0x18FF50E9 -> 9
+// Charger status IDs 0x18FF50E0..EF — the low nibble is the unit's instance
+// index and is used to index chargers[] (hence MAX_CHARGERS = 16). Units with
+// distinct instance IDs (e.g. 5,7,8,9) are counted separately; units that share
+// the factory default 0x18FF50E5 all land in slot 5 and count as ONE (see the
+// HARDWARE NOTE below MAX_ACTIVE_CHARGERS).
 static const uint32_t CHARGER_CMD_ID         = 0x1806E5F4UL;
 static const uint32_t CHARGER_STATUS_ID_BASE = 0x18FF50E0UL; // mask low nibble
 static const uint32_t CHARGER_STATUS_ID_MASK = 0x1FFFFFF0UL; // top 28 bits
@@ -341,13 +424,21 @@ static const uint32_t CHARGER_STATUS_ID_MASK = 0x1FFFFFF0UL; // top 28 bits
 // guard reject every real charger.
 #define MAX_CHARGERS 16
 
-// Largest charger count the rest of the system supports. The preset power
-// table has 4 rows and ctrl.chargerCount (the per-charger current divisor) is
-// validated to 1..4, so a chargerCount above 4 would divide the commanded
-// current by fewer units than are physically drawing it — each charger would
-// then deliver the full per-unit share and the pack would see more than
-// commanded. Detection is clamped here rather than in the nibble guard so
-// extra units are noticed and logged instead of silently ignored.
+// Largest charger count the rest of the system supports. The preset power table
+// has 4 rows and ctrl.chargerCount is validated to 1..4, so rampTask's divisor —
+// max(ctrl.chargerCount, chargerBus.chargerCount) — can never exceed 4. A fifth
+// unit on the bus would therefore be divided for by only four: all units share
+// one command frame, so each of the five would deliver a quarter-share and the
+// pack would receive 5/4 of the commanded current. Detection is clamped here
+// rather than in the nibble guard so extra units are noticed and logged
+// (g_chargerCountClamped) instead of silently ignored.
+//
+// HARDWARE NOTE: the Elcon units on this bike all answer on the SAME instance
+// ID (0x18FF50E5), so only one nibble is ever populated and the detected count
+// is 1 no matter how many units are wired. The count-mismatch protection
+// (g_chargerCountMismatch) is therefore INERT on this hardware — it can only
+// ever fire if a unit is re-strapped to a different instance ID. It is kept
+// because it costs nothing and is the correct behaviour for mixed IDs.
 static const uint8_t MAX_ACTIVE_CHARGERS = 4;
 
 struct ChargerUnit {
@@ -355,8 +446,19 @@ struct ChargerUnit {
   uint16_t voltDv    = 0;    // actual output voltage * 10 (0.1 V units → dV)
   uint16_t ampsDa    = 0;    // actual output current * 10 (0.1 A units → dA)
   uint8_t  status    = 0;    // raw status bitfield
+  // Consecutive status frames seen for this instance since it was last absent.
+  // A unit is only declared `present` (and counted) on the CHARGER_SEEN_MIN_FRAMES'th
+  // frame — one corrupted/aliased ID would otherwise invent a phantom charger
+  // that inflates the divisor and trips the count-mismatch stop. Reset to 0 by
+  // the presence-decay sweep so a returning unit re-qualifies from scratch.
+  uint8_t  seenCount = 0;
   unsigned long lastSeenMs = 0;
 };
+
+// Status frames required before a charger instance counts as really there.
+// 2 is enough: the Elcons broadcast status at ~1 Hz, so a genuine unit
+// qualifies within ~1 s, while a single bit-flipped ID never does.
+static const uint8_t CHARGER_SEEN_MIN_FRAMES = 2;
 
 struct ChargerBusData {
   ChargerUnit chargers[MAX_CHARGERS]; // indexed by low nibble of status ID
@@ -379,6 +481,26 @@ static volatile uint8_t g_rampPhase = 0;
 // charger is forced to STOP rather than left charging on the last command
 // forever. 32-bit read/write is atomic on the ESP32, so no mutex needed.
 static volatile uint32_t g_rampHeartbeat = 0;
+// Unconditional failsafe STOP request (STAB-2). Every rampTask decision that
+// means "the chargers must not be running" raises this BEFORE it attempts the
+// chargerMutex write that zeroes chargerBus.cmd*. Those writes are best-effort:
+// they sit behind a 10 ms xSemaphoreTake with no else branch, so a contended
+// mutex used to leave the previous START command in place — and because
+// g_rampHeartbeat is bumped earlier in the tick, the dead-man in sendHeartbeat()
+// could not catch it either. sendHeartbeat() therefore forces start=false /
+// amps=0 whenever this flag is set, with no lock of its own (bool read/write is
+// atomic on the ESP32). Cleared only by the command-update path at the end of a
+// tick that actually wrote a valid START under the mutex — and only while
+// g_shuttingDown is false (see below).
+static volatile bool g_forceStop = false;
+// Set by stopChargerForRestart() for the whole of its 1.5 s "let one STOP frame
+// reach the wire" wait, and never cleared (the CPU is about to go away).
+// rampTask keeps ticking during that wait — vTaskDelay() yields — so without
+// this flag a single CC or CV tick landing inside the window would write a
+// fresh START under chargerMutex and clear g_forceStop, and the reboot would
+// leave the chargers running on that START until their own ~5 s heartbeat
+// timeout. rampTask therefore only clears g_forceStop when this is false.
+static volatile bool g_shuttingDown = false;
 // True while CC-phase power is being clamped by the hot-temperature cutback.
 // Read by the dashboard to display a "thermal throttling" banner.
 static volatile bool    g_thermalThrottle = false;
@@ -396,20 +518,29 @@ static volatile int16_t g_etaMinutes = -1;
 // chatter the chargers on and off once per second. 8-bit read/write is atomic
 // on the ESP32, so no mutex needed.
 enum ChargeInhibit : uint8_t {
-  INHIBIT_NONE      = 0,
-  INHIBIT_TOO_COLD  = 1,   // coldest cell below CHARGE_TEMP_MIN_C
-  INHIBIT_TOO_HOT   = 2,   // hottest cell above CHARGE_TEMP_MAX_C
-  INHIBIT_PACK_LOW  = 3,   // pack below PACK_V_CHARGE_FLOOR_DV
+  INHIBIT_NONE         = 0,
+  INHIBIT_TOO_COLD     = 1,   // coldest cell below CHARGE_TEMP_MIN_C
+  INHIBIT_TOO_HOT      = 2,   // hottest cell above CHARGE_TEMP_MAX_C
+  INHIBIT_PACK_LOW     = 3,   // pack below PACK_V_CHARGE_FLOOR_DV
+  // At least ONE of the two pack sensors (hottest / coldest) has had no usable
+  // reading (ZERO_TEMP_INVALID) for longer than TEMP_INVALID_INHIBIT_MS. Either
+  // one going dark is enough: the hot sensor guards the 45 °C limit and the hot
+  // cutback, the cold sensor guards the 0 °C plating limit and COLD_CUTBACK, so
+  // losing either leaves one half of the envelope unprotected. Without this the
+  // gate silently stops protecting anything — a failed sensor used to decode as
+  // 0 °C, which is inside the permitted window.
+  INHIBIT_TEMP_UNKNOWN = 4,
 };
 static volatile uint8_t g_chargeInhibit = INHIBIT_NONE;
 
 // Human-readable form for logs and the status API.
 static const char* chargeInhibitName(uint8_t r) {
   switch (r) {
-    case INHIBIT_TOO_COLD: return "pack too cold";
-    case INHIBIT_TOO_HOT:  return "pack too hot";
-    case INHIBIT_PACK_LOW: return "pack voltage too low";
-    default:               return "none";
+    case INHIBIT_TOO_COLD:     return "pack too cold";
+    case INHIBIT_TOO_HOT:      return "pack too hot";
+    case INHIBIT_PACK_LOW:     return "pack voltage too low";
+    case INHIBIT_TEMP_UNKNOWN: return "pack temperature unknown";
+    default:                   return "none";
   }
 }
 
@@ -435,6 +566,31 @@ static volatile bool g_bmsStale = false;
 // every unit would over-deliver. Owned by the charger-bus recount paths.
 static volatile bool g_chargerCountClamped = false;
 
+// More chargers are answering on the CAN bus than ctrl.chargerCount says are
+// installed (STAB-1). The per-charger current divisor is the configured count,
+// so every extra unit would deliver a full share on top of what was asked for.
+// Charging is stopped until the setting matches. Owned by rampTask, recomputed
+// every tick, so it clears itself once the two agree.
+static volatile bool g_chargerCountMismatch = false;
+
+// A charger reported a hardware-failure or over-temperature status bit (mask
+// 0x03 — see the status bitfield table above), or output voltage well above the
+// commanded ceiling (STAB-4). LATCHED: cleared only when the user switches
+// charging off and on again, so a unit that faults, drops off the bus and comes
+// back cannot silently resume. Owned by rampTask.
+//
+// The latch lives in RAM only, so a reboot (deliberate or a crash) also clears
+// it. That is deliberate for now: with the default boot profiles (charging off)
+// a reboot re-runs the whole start sequence and the user still has to press
+// Charge, which is the same manual re-arm the latch demands. Caveat: if
+// def_chg_en / home_chg_en are set to ON, a reboot both clears the latch and
+// re-enables charging without a human in the loop. Persisting
+// it to NVS would survive a power cycle of the chargers themselves — which is
+// the usual way a user clears a genuine charger fault — and would need its own
+// "clear latched fault" UI. Revisit if a fault is ever seen to recur across a
+// reboot without the user noticing.
+static volatile bool g_chargerFault = false;
+
 // The absolute 1.0 C ceiling (CELL_MAX_CHARGE_C × pack Ah) is actively limiting
 // commanded current, i.e. something upstream asked for more than the cells are
 // rated to accept. Owned by rampTask's amp calculation.
@@ -453,7 +609,10 @@ enum ProtState : uint8_t {
   PROT_TOO_COLD,           // charging inhibited — below datasheet minimum
   PROT_TOO_HOT,            // charging inhibited — above datasheet maximum
   PROT_PACK_LOW,           // charging inhibited — risk of copper dissolution
+  PROT_TEMP_UNKNOWN,       // charging inhibited — no valid pack temperature
   PROT_BMS_STALE,          // charging stopped — no fresh bike telemetry
+  PROT_CHARGER_FAULT,      // charging stopped — a charger reports a fault
+  PROT_CHARGER_MISMATCH,   // charging stopped — more chargers than configured
   PROT_CHARGER_CLAMPED,    // wiring/config fault — too many chargers
   PROT_THERMAL_THROTTLE,   // still charging, power reduced by hot cutback
   PROT_CURRENT_CLAMPED,    // still charging, power reduced by the 1 C ceiling
@@ -467,7 +626,10 @@ static const char* protStateKey(uint8_t s) {
     case PROT_TOO_COLD:          return "too_cold";
     case PROT_TOO_HOT:           return "too_hot";
     case PROT_PACK_LOW:          return "pack_low";
+    case PROT_TEMP_UNKNOWN:      return "temp_unknown";
     case PROT_BMS_STALE:         return "bms_stale";
+    case PROT_CHARGER_FAULT:     return "charger_fault";
+    case PROT_CHARGER_MISMATCH:  return "charger_mismatch";
     case PROT_CHARGER_CLAMPED:   return "charger_clamped";
     case PROT_THERMAL_THROTTLE:  return "thermal_throttle";
     case PROT_CURRENT_CLAMPED:   return "current_clamped";
@@ -481,15 +643,18 @@ static const char* protStateKey(uint8_t s) {
 // as well would be actively misleading.
 static uint8_t activeProtection() {
   switch (g_chargeInhibit) {
-    case INHIBIT_TOO_COLD: return PROT_TOO_COLD;
-    case INHIBIT_TOO_HOT:  return PROT_TOO_HOT;
-    case INHIBIT_PACK_LOW: return PROT_PACK_LOW;
+    case INHIBIT_TOO_COLD:     return PROT_TOO_COLD;
+    case INHIBIT_TOO_HOT:      return PROT_TOO_HOT;
+    case INHIBIT_PACK_LOW:     return PROT_PACK_LOW;
+    case INHIBIT_TEMP_UNKNOWN: return PROT_TEMP_UNKNOWN;
     default: break;
   }
-  if (g_bmsStale)            return PROT_BMS_STALE;
-  if (g_chargerCountClamped) return PROT_CHARGER_CLAMPED;
-  if (g_thermalThrottle)     return PROT_THERMAL_THROTTLE;
-  if (g_currentClamped)      return PROT_CURRENT_CLAMPED;
+  if (g_bmsStale)             return PROT_BMS_STALE;
+  if (g_chargerFault)         return PROT_CHARGER_FAULT;
+  if (g_chargerCountMismatch) return PROT_CHARGER_MISMATCH;
+  if (g_chargerCountClamped)  return PROT_CHARGER_CLAMPED;
+  if (g_thermalThrottle)      return PROT_THERMAL_THROTTLE;
+  if (g_currentClamped)       return PROT_CURRENT_CLAMPED;
   if (g_lastBadFrameMs != 0 &&
       (millis() - g_lastBadFrameMs) < BAD_FRAME_BANNER_MS)
     return PROT_FRAMES_REJECTED;
@@ -592,6 +757,19 @@ static const uint16_t PACK_V_CHARGE_FLOOR_DV =
 // how many cells sit in parallel — no need to hard-code the P count.
 static const float CELL_MAX_CHARGE_C = 1.0f;
 
+// (4) Pack-capacity plausibility (STAB-3). The BMS-reported pack Ah from
+// BMS_PACK_CONFIG (0x288 bytes 5-6) is the multiplier on the 1.0 C ceiling
+// above, on every cutback table's power limit, on the CV current floor and on
+// the ETA — an implausibly large value quietly lifts the "absolute" current
+// ceiling out of the way entirely. A stock Zero monolith reports ~114 Ah and a
+// monolith + PowerTank is still well under 200 Ah, so this window is wide
+// enough to never reject a real pack while catching a corrupt frame.
+static const short PACK_AH_PLAUSIBLE_MIN = 20;
+static const short PACK_AH_PLAUSIBLE_MAX = 400;
+// Same ceiling as a float, applied again in rampTask as a belt-and-braces clamp
+// before packAH is used — so the two can never drift apart.
+static constexpr float PACK_AH_MAX = (float)PACK_AH_PLAUSIBLE_MAX;
+
 // ---------------------------------------------------------------------------
 // Charging temperature window — Farasis datasheet "Charging Temp. 0°C to 45°C".
 // (Operating range is -20..60 °C, but that is DISCHARGE; charging is narrower.)
@@ -672,7 +850,21 @@ struct ChargingControl {
 
 // Set to true the first time home WiFi defaults are applied (STATE_CONNECTING →
 // STATE_CONNECTED transition). Prevents re-applying on every WiFi reconnect.
-static bool homeDefaultsApplied = false;
+//
+// C3 — three tasks write this flag, so it is volatile:
+//   * loopTask       — onStaUp() / applyHomeWifiBootDefaults()
+//   * the httpd task — /api/control, after a successful controlMutex take
+//   * mqttTask       — mqttCallback(), likewise only on a command that applied
+// No mutex guards it and none is needed. It is a single byte that is only ever
+// written with the value `true` and only ever read as "has anyone latched it
+// yet" — the write is atomic on this target, there is no read-modify-write to
+// tear, and no ordering between the writers matters because they all agree on
+// the value. volatile is what stops the compiler from caching the read in
+// applyHomeWifiBootDefaults() across a call that a different task could have
+// raced. The worst case remains a benign race the design already tolerates:
+// a user command landing in the same instant as the STA-up edge may or may not
+// beat the profile, which is exactly the ambiguity the flag exists to bound.
+static volatile bool homeDefaultsApplied = false;
 
 // Session energy tracking — accumulated in rampTask, reset on boot or manual reset.
 // Guarded by sessionMutex: rampTask does read-modify-write `+= delta` each tick
@@ -860,7 +1052,8 @@ static String   mqttCaCert         = "";
 // at boot for normal mode, so leave INPUT_PULLUP and only sample after setup().
 // Pressed = LOW (button shorts to GND).
 #define BOOT_BUTTON_PIN 0
-#define BTN_HOLD_AP_RESET_MS    5000UL   // 5 s : clear WiFi creds → AP mode on next boot
+#define BTN_HOLD_AP_RESET_MS    5000UL   // 5 s : clear WiFi creds + ALL login
+                                         //       sessions → AP mode on next boot
 #define BTN_HOLD_FACTORY_MS    10000UL   // 10 s: wipe entire NVS namespace
 
 // ---------------------------------------------------------------------------
@@ -872,10 +1065,12 @@ static String   mqttCaCert         = "";
 // HttpCtx struct, IDF→ctx adapter (initFromIDFReq), URL decode, and
 // parseKVPairs are in https_ctx.h (included above).
 //
-// When httpsEnabled==true and a valid cert+key are loaded in NVS:
-//   • Port 80  WebServer serves the "redirect to https://" handler plus
-//              /api/tls (escape hatch so the user can disable HTTPS over
-//              HTTP if cert upload was misconfigured).
+// When the HTTPS server actually came up (g_httpsRunning):
+//   • Port 80  WebServer serves the HTTP-only routes — /login GET+POST,
+//              /logout POST, /update GET+POST (OTA), /log, /api/log/stream,
+//              /save, /api/tls (escape hatch so the user can disable HTTPS
+//              over HTTP if cert upload was misconfigured) — and redirects
+//              everything else to https:// on the same host.
 //   • Port 443 httpd_ssl_server runs in its own task. Each registered URI
 //              hits a thin idf_*() wrapper that builds an HttpCtx and calls
 //              the same httpsHandle*() function used elsewhere.
@@ -886,15 +1081,26 @@ static String   mqttCaCert         = "";
 // Routes intentionally HTTP-only (not registered on 443):
 //   /update OTA, /api/log/stream SSE, /log, /save — the IDF path needs a
 //   chunked/streaming or multipart-upload story before they can move over.
-//   When httpsEnabled, these endpoints are unavailable; disable HTTPS to
-//   reach them.
+//   SEC-4/NET-2: they are registered on port 80 in BOTH states, so enabling
+//   HTTPS no longer makes OTA and the log viewer vanish from both ports.
+//   /login is likewise on both ports: the 443 cookie carries Secure and is
+//   never sent over HTTP, so these routes need their own (non-Secure) login.
 //   (/api/cycles GET+DELETE moved to 443 in the 2026-07 audit — chunked
 //   file streaming turned out to be enough for it.)
 // ---------------------------------------------------------------------------
 
-// HTTPS server state — only active when httpsEnabled=true.
-static bool            httpsEnabled  = false;
-static httpd_handle_t  g_httpsServer = nullptr;
+// HTTPS server state.
+//   httpsEnabled   — the PERSISTED INTENT (NVS key "https_en"). What the
+//                    Settings page shows and what the next boot will try.
+//   g_httpsRunning — the LIVE FACT: true only after startHTTPSServer()
+//                    actually succeeded in setup(). SEC-15/NET-6: the port-80
+//                    redirect and the port-80 route table consult this and
+//                    NEVER httpsEnabled, so toggling the setting on (which
+//                    only takes effect after a reboot) can't start bouncing
+//                    HTTP clients to a port 443 that nothing is listening on.
+static bool            httpsEnabled   = false;
+static bool            g_httpsRunning = false;
+static httpd_handle_t  g_httpsServer  = nullptr;
 
 // FFat cycle-data logger state
 static bool     g_fatReady   = false;  // true after FFat.begin() succeeds
@@ -903,7 +1109,14 @@ static uint16_t g_cycleCount = 0;      // number of records in /cycles.csv (cach
 // ---------------------------------------------------------------------------
 // Login page — standard HTML form so password managers can autofill.
 // The %s slot is replaced with an empty string (no error) or an error
-// paragraph; use snprintf(buf, sizeof(buf), HTML_LOGIN, errFrag).
+// fragment; use snprintf(buf, sizeof(buf), HTML_LOGIN, errFrag).
+//
+// The fragment carries three cases, all firmware-generated (UX-10): the
+// ?err=1 bad-credentials line, the 423 hard-lock banner and the 429
+// rate-limit banner, the last two built by authBuildRetryFrag() with the
+// same Retry-After countdown the header carries. Nothing derived from the
+// request is ever interpolated here, so the page needs no HTML escaping —
+// keep it that way if the fragment ever grows a fourth case.
 // Note: literal % in CSS must be written %% so snprintf doesn't choke.
 // ---------------------------------------------------------------------------
 
@@ -927,6 +1140,8 @@ const char HTML_LOGIN[] PROGMEM =
   "border-radius:6px;font-size:1rem;cursor:pointer;font-weight:bold}"
   "button:hover{background:#c73652}"
   ".err{color:#e94560;font-size:.9rem;text-align:center;margin:0}"
+  ".hint{color:#8a8aa0;font-size:.78rem;text-align:center;margin:-4px 0 0;"
+  "line-height:1.4;white-space:pre-line}"
   ".rem{display:flex;align-items:center;gap:8px;cursor:pointer;font-size:.85rem;color:#aaa}"
   ".rem input{width:auto}"
   "</style></head><body>"
@@ -951,13 +1166,23 @@ const char HTML_SETTINGS[] PROGMEM = R"rawliteral(
 <html>
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#1a1a2e">
   <title>Settings — Supercharger</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
-    body{font-family:Arial,sans-serif;background:#1a1a2e;color:#eee;padding:16px;max-width:600px;margin:auto}
+    body{font-family:Arial,sans-serif;background:#1a1a2e;color:#eee;padding:16px;max-width:600px;margin:auto;
+         padding-top:calc(16px + env(safe-area-inset-top));
+         padding-bottom:calc(16px + env(safe-area-inset-bottom));
+         padding-left:calc(16px + env(safe-area-inset-left));
+         padding-right:calc(16px + env(safe-area-inset-right))}
     h1{color:#e94560;font-size:1.4em;margin-bottom:6px}
-    nav a{color:#aaa;font-size:0.85em;text-decoration:none;margin-right:14px}
+    nav{display:flex;flex-wrap:wrap}
+    /* UX-11: 44 px minimum touch target. */
+    nav a{color:#aaa;font-size:0.85em;text-decoration:none;margin-right:14px;
+          display:inline-flex;align-items:center;min-height:44px}
     nav a:hover{color:#e94560}
     .section{margin-top:22px;font-size:0.78em;color:#666;text-transform:uppercase;
              letter-spacing:.08em;border-bottom:1px solid #0f3460;padding-bottom:4px;margin-bottom:12px}
@@ -970,13 +1195,44 @@ const char HTML_SETTINGS[] PROGMEM = R"rawliteral(
       background:#0f3460;color:#eee;font-size:14px}
     .row2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
     button{background:#e94560;color:#fff;border:none;padding:11px 24px;
-           border-radius:5px;font-size:15px;cursor:pointer;margin-top:14px;width:100%}
+           border-radius:5px;font-size:15px;cursor:pointer;margin-top:14px;width:100%;
+           min-height:44px}
     button:hover{opacity:0.9}
+    button:disabled{opacity:.45;cursor:progress}
     .btn-secondary{background:#0f3460;border:1px solid #e94560}
-    .msg{text-align:center;padding:14px;border-radius:8px;margin-top:12px;display:none}
-    .msg.ok{display:block;background:#0a3d2a;color:#4ade80}
-    .msg.err{display:block;background:#3d0a0a;color:#f87171}
+    /* UX-1: the message used to sit at the very bottom of a long scrolling
+       page, so a save result was usually off-screen on a phone. Pin it. */
+    .msg{text-align:center;padding:14px;border-radius:8px;display:none;
+         position:fixed;left:12px;right:12px;
+         bottom:calc(14px + env(safe-area-inset-bottom));z-index:1000;
+         max-width:576px;margin:auto;font-weight:bold;
+         box-shadow:0 6px 20px rgba(0,0,0,.55)}
+    .msg.ok{display:block;background:#0a3d2a;color:#7ef0b0;border:1px solid #4ade80}
+    .msg.err{display:block;background:#4a0d0d;color:#ffd4d4;border:1px solid #f87171}
+    /* D4: retry affordance inside the load-failure message. */
+    .msg-reload{width:auto;margin-top:0;margin-left:6px;padding:8px 16px;min-height:36px;
+                font-size:0.85em;background:#0f3460;border:1px solid #f87171;color:#ffd4d4}
     .hint{font-size:0.75em;color:#666;margin-top:3px}
+    /* UX-9: per-field show/hide toggle for password inputs. */
+    .pw-wrap{display:flex;gap:8px;align-items:stretch}
+    .pw-wrap input{flex:1}
+    .pw-toggle{background:#0f3460;color:#aaa;border:1px solid #0f3460;border-radius:5px;
+               font-size:0.78em;cursor:pointer;margin-top:0;width:auto;min-width:64px;
+               min-height:44px;padding:0 10px;flex:0 0 auto}
+    .pw-toggle:hover{color:#eee;border-color:#e94560}
+    /* In-page confirm (UX-3) — same component as the dashboard. */
+    .cfm-overlay{position:fixed;top:0;left:0;right:0;bottom:0;
+                 background:rgba(0,0,0,.72);z-index:1100;
+                 display:flex;align-items:center;justify-content:center;padding:20px}
+    .cfm-box{background:#16213e;border:1px solid #0f3460;border-radius:10px;
+             padding:20px;max-width:380px;width:100%;
+             box-shadow:0 10px 30px rgba(0,0,0,.6)}
+    .cfm-msg{font-size:1em;line-height:1.5;color:#eee;margin-bottom:18px}
+    .cfm-row{display:flex;gap:10px}
+    .cfm-btn{flex:1;min-height:48px;border:none;border-radius:6px;font-size:1em;
+             font-weight:bold;cursor:pointer;padding:12px;margin-top:0;width:auto}
+    .cfm-no {background:#0f3460;color:#eee;border:1px solid #444}
+    .cfm-yes{background:#e94560;color:#fff}
   </style>
 </head>
 <body>
@@ -985,36 +1241,56 @@ const char HTML_SETTINGS[] PROGMEM = R"rawliteral(
 
   <div class="section">WiFi Network</div>
   <div class="box">
-    <label>SSID</label>
-    <input type="text" id="wifiSSID" placeholder="Network name">
-    <label>Password</label>
-    <input type="password" id="wifiPass" placeholder="Password">
-    <button onclick="saveWifi()">Save WiFi &amp; Restart</button>
+    <label for="wifiSSID">SSID</label>
+    <input type="text" id="wifiSSID" name="wifi_ssid" placeholder="Network name"
+           autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false">
+    <label for="wifiPass">Password</label>
+    <!-- UX-9: these are the *device's* credentials for someone else's network,
+         never the user's own login, so autocomplete is off and the field is
+         marked new-password to stop a manager offering the site password. -->
+    <div class="pw-wrap">
+      <input type="password" id="wifiPass" name="wifi_pass" placeholder="Password"
+             autocomplete="new-password" autocapitalize="none" autocorrect="off"
+             spellcheck="false">
+      <button type="button" class="pw-toggle" data-pw="wifiPass"
+              onclick="togglePw('wifiPass', this)" aria-label="Show password">Show</button>
+    </div>
+    <button type="button" onclick="saveWifi()">Save WiFi &amp; Restart</button>
     <div class="hint">Connects to this network on boot. Falls back to AP mode if unavailable.</div>
   </div>
 
   <div class="section">Access Point (Fallback)</div>
   <div class="box">
-    <label>AP Name</label>
-    <input type="text" id="apSSID" placeholder="Supercharger">
-    <label>AP Password</label>
-    <input type="password" id="apPass" placeholder="Min 8 characters">
+    <label for="apSSID">AP Name</label>
+    <input type="text" id="apSSID" name="ap_ssid" placeholder="Supercharger"
+           autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false">
+    <label for="apPass">AP Password</label>
+    <div class="pw-wrap">
+      <input type="password" id="apPass" name="ap_pass" placeholder="Min 8 characters"
+             autocomplete="new-password" autocapitalize="none" autocorrect="off"
+             spellcheck="false">
+      <button type="button" class="pw-toggle" data-pw="apPass"
+              onclick="togglePw('apPass', this)" aria-label="Show password">Show</button>
+    </div>
     <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:14px">
-      <input type="checkbox" id="apStaticEn" onchange="onApStaticToggle()">
+      <input type="checkbox" id="apStaticEn" name="ap_static_en" onchange="onApStaticToggle()">
       <span>Use a fixed AP IP address</span>
     </label>
     <div id="apStaticWrap" style="display:none;margin-top:8px">
-      <label>AP IP Address</label>
-      <input type="text" id="apStaticIp" placeholder="192.168.1.50">
-      <label>Gateway</label>
-      <input type="text" id="apStaticGw" placeholder="192.168.1.1">
-      <label>Subnet Mask</label>
-      <input type="text" id="apStaticSn" placeholder="255.255.255.0">
+      <label for="apStaticIp">AP IP Address</label>
+      <input type="text" id="apStaticIp" name="ap_ip" placeholder="192.168.1.50"
+             inputmode="decimal" autocomplete="off" spellcheck="false">
+      <label for="apStaticGw">Gateway</label>
+      <input type="text" id="apStaticGw" name="ap_gw" placeholder="192.168.1.1"
+             inputmode="decimal" autocomplete="off" spellcheck="false">
+      <label for="apStaticSn">Subnet Mask</label>
+      <input type="text" id="apStaticSn" name="ap_sn" placeholder="255.255.255.0"
+             inputmode="decimal" autocomplete="off" spellcheck="false">
       <div class="hint">AP mode normally serves the dashboard at 192.168.4.1.
         Set a fixed IP that mirrors your home network so one iOS home-screen
         shortcut works both at home and on the road. Applies on next reboot.</div>
     </div>
-    <button onclick="saveAP()">Save AP Settings</button>
+    <button type="button" onclick="saveAP()">Save AP Settings</button>
     <div class="hint">Used when WiFi is unavailable. Name and password for the local hotspot.</div>
   </div>
 
@@ -1026,20 +1302,29 @@ const char HTML_SETTINGS[] PROGMEM = R"rawliteral(
   </div>
   <div id="mqttForm" class="box">
     <div class="row2">
-      <div><label>Host / IP</label>
-        <input type="text" id="mqttHost" placeholder="192.168.1.100"></div>
-      <div><label>Port</label>
-        <input type="number" id="mqttPort" placeholder="1883"></div>
+      <div><label for="mqttHost">Host / IP</label>
+        <input type="text" id="mqttHost" name="mqtt_host" placeholder="192.168.1.100"
+               autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false"></div>
+      <div><label for="mqttPort">Port</label>
+        <input type="number" id="mqttPort" name="mqtt_port" placeholder="1883"
+               inputmode="numeric" autocomplete="off"></div>
     </div>
     <div class="row2">
-      <div><label>Username</label>
-        <input type="text" id="mqttUser" placeholder="(optional)"></div>
-      <div><label>Password</label>
-        <input type="password" id="mqttPass" placeholder="(optional)"></div>
+      <div><label for="mqttUser">Username</label>
+        <input type="text" id="mqttUser" name="mqtt_user" placeholder="(optional)"
+               autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false"></div>
+      <div><label for="mqttPass">Password</label>
+        <div class="pw-wrap">
+          <input type="password" id="mqttPass" name="mqtt_pass" placeholder="(optional)"
+                 autocomplete="new-password" autocapitalize="none" autocorrect="off"
+                 spellcheck="false">
+          <button type="button" class="pw-toggle" data-pw="mqttPass"
+                  onclick="togglePw('mqttPass', this)" aria-label="Show password">Show</button>
+        </div></div>
     </div>
     <div style="margin-top:8px">
       <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
-        <input type="checkbox" id="mqttTls" onchange="onTlsToggle()">
+        <input type="checkbox" id="mqttTls" name="mqtt_tls" onchange="onTlsToggle()">
         <span>Use SSL/TLS (encrypted broker connection)</span>
       </label>
       <div class="hint">Ticking this auto-switches the port to 8883.
@@ -1048,40 +1333,45 @@ const char HTML_SETTINGS[] PROGMEM = R"rawliteral(
         certificate verification.</div>
     </div>
     <div id="mqttCaWrap" style="display:none;margin-top:10px">
-      <label>Broker CA Certificate (PEM)</label>
-      <textarea id="mqttCa" rows="6"
+      <label for="mqttCa">Broker CA Certificate (PEM)</label>
+      <textarea id="mqttCa" name="mqtt_ca" rows="6" spellcheck="false"
         style="width:100%;font-family:monospace;font-size:11px;background:#0f0f1e;
                color:#eee;border:1px solid #0f3460;border-radius:5px;padding:8px"
         placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"></textarea>
       <div class="hint" id="mqttCaStatus">No certificate uploaded yet.</div>
     </div>
-    <button onclick="saveMQTT()">Save MQTT &amp; Reconnect</button>
+    <button type="button" onclick="saveMQTT()">Save MQTT &amp; Reconnect</button>
   </div>
 
   <div class="section">Charger Hardware</div>
   <div class="box">
-    <label>Number of Chargers (1–4)</label>
-    <input type="number" id="ccCount" min="1" max="4" value="3">
-    <button onclick="saveChargerCount()">Save Charger Count</button>
+    <label for="ccCount">Number of Chargers (1–4)</label>
+    <input type="number" id="ccCount" name="charger_count" min="1" max="4" value="3"
+           inputmode="numeric" autocomplete="off">
+    <!-- UX-12: same wording as the dashboard hint. -->
+    <div class="hint">Sets the preset table and slider range only.
+      Does not change what the chargers physically do.</div>
+    <button type="button" onclick="saveChargerCount()">Save Charger Count</button>
   </div>
 
   <div class="section">Charging Behaviour</div>
   <div class="box">
-    <label>Ramp Rate (W/s, 10–500)</label>
-    <input type="number" id="rampRate" min="10" max="500" value="50">
+    <label for="rampRate">Ramp Rate (W/s, 10–500)</label>
+    <input type="number" id="rampRate" name="ramp_rate_wps" min="10" max="500" value="50"
+           inputmode="numeric" autocomplete="off">
     <div class="hint">Power increases/decreases by this many watts per second when ramping. Lower = gentler ramp. Default: 100 W/s.</div>
-    <button onclick="saveRampRate()">Save Ramp Rate</button>
+    <button type="button" onclick="saveRampRate()">Save Ramp Rate</button>
   </div>
 
   <div class="section">Boot Defaults &mdash; AP / Road Mode</div>
   <div class="box">
     <div class="hint" style="margin-top:0;margin-bottom:10px">Applied when the device boots without a home WiFi connection (AP mode or no saved network).</div>
     <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:0">
-      <input type="checkbox" id="defChgEnabled">
+      <input type="checkbox" id="defChgEnabled" name="charging_enabled_default">
       <span>Start with charging enabled</span>
     </label>
-    <label style="margin-top:14px">Default charge speed preset</label>
-    <select id="defPowerPreset">
+    <label style="margin-top:14px" for="defPowerPreset">Default charge speed preset</label>
+    <select id="defPowerPreset" name="power_preset_default">
       <option value="0">Preset 1 &mdash; 0.5 / 1 / 1.5 / 2 kW (1&ndash;4 chargers)</option>
       <option value="1">Preset 2 &mdash; 1 / 2 / 3 / 4 kW (1&ndash;4 chargers)</option>
       <option value="2">Preset 3 &mdash; 1.65 / 3.3 / 5 / 6.6 kW (1&ndash;4 chargers)</option>
@@ -1089,26 +1379,26 @@ const char HTML_SETTINGS[] PROGMEM = R"rawliteral(
       <option value="4">Preset 5 &mdash; 3.3 / 6.6 / 9.9 / 13.2 kW (1&ndash;4 chargers)</option>
     </select>
     <div class="hint">Actual watts depend on charger count. Preset 2 = 2 kW with 2 chargers.</div>
-    <label style="margin-top:14px">Default target voltage</label>
-    <select id="defTargetVolt">
+    <label style="margin-top:14px" for="defTargetVolt">Default target voltage</label>
+    <select id="defTargetVolt" name="target_volt_default">
       <option value="1060">70% &mdash; 106.0 V</option>
       <option value="1100">80% &mdash; 110.0 V</option>
       <option value="1132">90% &mdash; 113.2 V</option>
       <option value="1164">100% &mdash; 116.4 V</option>
     </select>
     <div class="hint">Applied at boot. Can be changed per session from the dashboard.</div>
-    <button onclick="saveBootDefaults()">Save AP / Road Defaults</button>
+    <button type="button" onclick="saveBootDefaults()">Save AP / Road Defaults</button>
   </div>
 
   <div class="section">Boot Defaults &mdash; Home WiFi</div>
   <div class="box">
     <div class="hint" style="margin-top:0;margin-bottom:10px">Applied once when the device first connects to your home WiFi network after boot. Overrides the AP / Road defaults above.</div>
     <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:0">
-      <input type="checkbox" id="homeDefChgEnabled">
+      <input type="checkbox" id="homeDefChgEnabled" name="home_charging_enabled_default">
       <span>Start with charging enabled</span>
     </label>
-    <label style="margin-top:14px">Default charge speed preset</label>
-    <select id="homeDefPowerPreset">
+    <label style="margin-top:14px" for="homeDefPowerPreset">Default charge speed preset</label>
+    <select id="homeDefPowerPreset" name="home_power_preset_default">
       <option value="0">Preset 1 &mdash; 0.5 / 1 / 1.5 / 2 kW (1&ndash;4 chargers)</option>
       <option value="1">Preset 2 &mdash; 1 / 2 / 3 / 4 kW (1&ndash;4 chargers)</option>
       <option value="2">Preset 3 &mdash; 1.65 / 3.3 / 5 / 6.6 kW (1&ndash;4 chargers)</option>
@@ -1116,15 +1406,15 @@ const char HTML_SETTINGS[] PROGMEM = R"rawliteral(
       <option value="4">Preset 5 &mdash; 3.3 / 6.6 / 9.9 / 13.2 kW (1&ndash;4 chargers)</option>
     </select>
     <div class="hint">Actual watts depend on charger count. Preset 2 = 2 kW with 2 chargers.</div>
-    <label style="margin-top:14px">Default target voltage</label>
-    <select id="homeDefTargetVolt">
+    <label style="margin-top:14px" for="homeDefTargetVolt">Default target voltage</label>
+    <select id="homeDefTargetVolt" name="home_target_volt_default">
       <option value="1060">70% &mdash; 106.0 V</option>
       <option value="1100">80% &mdash; 110.0 V</option>
       <option value="1132">90% &mdash; 113.2 V</option>
       <option value="1164">100% &mdash; 116.4 V</option>
     </select>
     <div class="hint">Applied at boot. Can be changed per session from the dashboard.</div>
-    <button onclick="saveHomeDefaults()">Save Home WiFi Defaults</button>
+    <button type="button" onclick="saveHomeDefaults()">Save Home WiFi Defaults</button>
   </div>
 
   <div class="section">HTTPS / TLS</div>
@@ -1135,40 +1425,152 @@ const char HTML_SETTINGS[] PROGMEM = R"rawliteral(
       Use a self-signed cert for local LAN use; a publicly-trusted cert if exposed externally.
     </div>
     <div id="tlsCertStatus" class="hint" style="margin-bottom:10px">No certificate uploaded yet.</div>
-    <label>Certificate (PEM)</label>
-    <textarea id="tlsCert" rows="5"
+    <label for="tlsCert">Certificate (PEM)</label>
+    <textarea id="tlsCert" name="tls_cert" rows="5" spellcheck="false"
       style="width:100%;font-family:monospace;font-size:11px;background:#0f0f1e;
              color:#eee;border:1px solid #0f3460;border-radius:5px;padding:8px"
       placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"></textarea>
-    <label style="margin-top:10px">Private Key (PEM)</label>
-    <textarea id="tlsKey" rows="5"
+    <label style="margin-top:10px" for="tlsKey">Private Key (PEM)</label>
+    <textarea id="tlsKey" name="tls_key" rows="5" spellcheck="false"
       style="width:100%;font-family:monospace;font-size:11px;background:#0f0f1e;
              color:#eee;border:1px solid #0f3460;border-radius:5px;padding:8px"
       placeholder="-----BEGIN RSA PRIVATE KEY-----&#10;...&#10;-----END RSA PRIVATE KEY-----"></textarea>
-    <button onclick="saveTlsCert()" style="margin-top:10px">Upload Cert &amp; Key</button>
+    <button type="button" onclick="saveTlsCert()" style="margin-top:10px">Upload Cert &amp; Key</button>
     <div style="margin-top:14px">
       <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
-        <input type="checkbox" id="httpsEnabled" onchange="saveHttpsToggle()">
+        <input type="checkbox" id="httpsEnabled" name="https_enabled" onchange="saveHttpsToggle()">
         <span>Enable HTTPS (redirect port 80 → 443)</span>
       </label>
       <div class="hint">A certificate must be uploaded before enabling. Reboot required after changing.</div>
     </div>
   </div>
 
-  <div id="msgBox" class="msg"></div>
+  <div id="msgBox" class="msg" role="status" aria-live="polite"></div>
 
   <script>
+    // /log and /update live only on port 80 — see the note in the dashboard.
+    if (location.protocol === 'https:') {
+      document.querySelectorAll('nav a[href="/log"], nav a[href="/update"]').forEach(function(a){
+        a.href = 'http://' + location.hostname + a.getAttribute('href');
+      });
+    }
+
+    var msgTimer = null;
     function showMsg(text, ok) {
       var m = document.getElementById('msgBox');
       m.textContent = text;
       m.className = 'msg ' + (ok ? 'ok' : 'err');
-      setTimeout(function(){ m.className = 'msg'; }, 4000);
+      if (msgTimer) clearTimeout(msgTimer);
+      msgTimer = setTimeout(function(){ m.className = 'msg'; }, 4000);
     }
 
-    // Load current settings on page load
-    fetch('/api/settings').then(function(r){
-      if (r.status === 401) { window.location.href = '/login'; throw new Error('redirecting'); }
-      return r.json();
+    // ---- In-page confirm (UX-3) -----------------------------------------
+    // Same component as the dashboard: window.confirm on iOS prefixes the
+    // hostname and can't be styled, and in a home-screen web app it looks
+    // like a browser error rather than part of the page.
+    function uiConfirm(msg, onYes, onNo) {
+      var ov  = document.createElement('div'); ov.className  = 'cfm-overlay';
+      var box = document.createElement('div'); box.className = 'cfm-box';
+      var p   = document.createElement('div'); p.className   = 'cfm-msg';
+      p.textContent = msg;
+      var row = document.createElement('div'); row.className = 'cfm-row';
+      var no  = document.createElement('button');
+      no.type = 'button'; no.className = 'cfm-btn cfm-no';  no.textContent  = 'Cancel';
+      var yes = document.createElement('button');
+      yes.type = 'button'; yes.className = 'cfm-btn cfm-yes'; yes.textContent = 'Confirm';
+      var closed = false;
+      function close(cancelled) {
+        if (closed) return; closed = true;
+        if (ov.parentNode) ov.parentNode.removeChild(ov);
+        document.removeEventListener('keydown', onKey);
+        if (cancelled && onNo) onNo();
+      }
+      function onKey(e){ if (e.key === 'Escape') close(true); }
+      no.onclick  = function(){ close(true); };
+      yes.onclick = function(){ close(false); if (onYes) onYes(); };
+      ov.onclick  = function(e){ if (e.target === ov) close(true); };
+      document.addEventListener('keydown', onKey);
+      row.appendChild(no); row.appendChild(yes);
+      box.appendChild(p);  box.appendChild(row);
+      ov.appendChild(box);
+      document.body.appendChild(ov);
+      yes.focus();
+    }
+
+    // ---- Password show/hide (UX-9) ---------------------------------------
+    function togglePw(id, btn) {
+      var el = document.getElementById(id);
+      if (!el) return;
+      var show = (el.type === 'password');
+      el.type = show ? 'text' : 'password';
+      btn.textContent = show ? 'Hide' : 'Show';
+      btn.setAttribute('aria-label', show ? 'Hide password' : 'Show password');
+    }
+
+    // ---- Unsaved-changes guard (UX-15) -----------------------------------
+    // dirty is set by any input/change event AFTER the initial load has
+    // populated the form, and cleared by every successful save.
+    var formLoaded = false;
+    var dirty      = false;
+    function markDirty(e){
+      if (!formLoaded) return;
+      // The HTTPS checkbox saves itself on change, so it is never an unsaved
+      // edit — counting it would leave a stale warning behind a cancelled
+      // confirm.
+      if (e && e.target && e.target.id === 'httpsEnabled') return;
+      dirty = true;
+    }
+    function clearDirty(){ dirty = false; }
+    document.addEventListener('input',  markDirty, true);
+    document.addEventListener('change', markDirty, true);
+    window.addEventListener('beforeunload', function(e){
+      if (!dirty) return;
+      e.preventDefault();
+      e.returnValue = '';   // required by Chrome/Safari to show the prompt
+      return '';
+    });
+
+    // D4: a failed load leaves every field holding its HTML default, which is
+    // NOT what the device is running. Leaving the Save buttons live would let
+    // one tap write preset 1 / 1060 dV / 3 chargers / 50 W/s that the user
+    // never chose. So on any load failure: say what went wrong, keep it on
+    // screen (no 4 s auto-hide), offer a Reload, disable every Save, and leave
+    // formLoaded false so the dirty guard stays quiet too.
+    function loadFailed(text) {
+      formLoaded = false;
+      clearDirty();
+      setSaveDisabled(true);
+      if (msgTimer) { clearTimeout(msgTimer); msgTimer = null; }
+      var m = document.getElementById('msgBox');
+      m.textContent = '';
+      m.className = 'msg err';
+      var span = document.createElement('span');
+      span.textContent = text + ' ';
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'msg-reload';
+      btn.textContent = 'Reload';
+      btn.onclick = function(){ location.reload(); };
+      m.appendChild(span);
+      m.appendChild(btn);
+    }
+
+    // Load current settings on page load.
+    // D5: read the body BEFORE judging the status, so the server error text
+    // survives. The builder answers {"ok":false,...} with HTTP 500 when the
+    // JSON overflowed its buffer; populating the form from that would blank
+    // every field, so it takes the same disabled-form path as a transport
+    // failure rather than being a dead branch behind an earlier throw.
+    fetch('/api/settings', {credentials:'same-origin'}).then(function(r){
+      return r.text().then(function(txt){
+        if (r.status === 401) { window.location.href = '/login'; throw new Error('__auth__'); }
+        var d = null;
+        try { d = JSON.parse(txt); } catch (e) {}
+        if (!d)               throw new Error(txt || ('HTTP ' + r.status));
+        if (d.ok === false)   throw new Error(d.error || 'Settings unavailable');
+        if (!r.ok)            throw new Error(d.error || ('HTTP ' + r.status));
+        return d;
+      });
     }).then(function(d){
       document.getElementById('wifiSSID').value = d.wifi_ssid || '';
       document.getElementById('apSSID').value   = d.ap_ssid   || '';
@@ -1214,6 +1616,13 @@ const char HTML_SETTINGS[] PROGMEM = R"rawliteral(
         ? 'Certificate stored on device. Paste new PEM to replace.'
         : 'No certificate uploaded yet.';
       // Passwords are never returned from the API for security
+      // UX-15: only start watching for edits once the form holds real values,
+      // so the population above doesn't itself count as an unsaved change.
+      formLoaded = true;
+      clearDirty();
+    }).catch(function(e){
+      if (e && e.message === '__auth__') return;   // navigating to /login
+      loadFailed('Could not load settings — ' + ((e && e.message) || 'connection error') + '.');
     });
 
     // Auto-switch port when SSL is toggled. Only overwrites the port field
@@ -1228,26 +1637,86 @@ const char HTML_SETTINGS[] PROGMEM = R"rawliteral(
       if (!on && (cur === 8883 || isNaN(cur))) portEl.value = 1883;
     }
 
-    function postSettings(data, successMsg, restart) {
-      fetch('/api/settings', {
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body: JSON.stringify(data)
-      }).then(function(r){ return r.json(); }).then(function(d){
-        if (d.ok) {
-          showMsg(successMsg, true);
-          if (restart) setTimeout(function(){ location.href='/'; }, 3000);
-        } else {
-          showMsg(d.error || 'Save failed', false);
+    // ---- Shared POST helper (UX-1 / UX-4) --------------------------------
+    // Disables every button on the page while a save is in flight, checks the
+    // status BEFORE parsing the body (a 401 answers text/plain, which
+    // r.json() would reject as a generic connection error and so hide the
+    // fact that the session had simply expired), and surfaces the error text
+    // the server itself sent.
+    var saveBusy = false;
+    var savePrev = null;
+    function setSaveDisabled(on) {
+      if (on) {
+        var btns = document.querySelectorAll('button');
+        savePrev = [];
+        for (var i = 0; i < btns.length; i++) {
+          var cn = btns[i].className || '';
+          if (cn.indexOf('cfm-btn') >= 0) continue;      // confirm dialog
+          if (cn.indexOf('msg-reload') >= 0) continue;   // D4 retry affordance
+          if (cn.indexOf('pw-toggle') >= 0) continue;    // show/hide is not a save
+          savePrev.push([btns[i], btns[i].disabled]);
+          btns[i].disabled = true;
         }
-      }).catch(function(){ showMsg('Connection error', false); });
+      } else if (savePrev) {
+        for (var j = 0; j < savePrev.length; j++) savePrev[j][0].disabled = savePrev[j][1];
+        savePrev = null;
+      }
     }
 
+    // url/data → promise resolving to the parsed body. Rejects with an Error
+    // whose message is fit to show the user. A message of __auth__ means we
+    // are already navigating to the login page, so callers stay silent on it.
+    function postJson(url, data) {
+      if (saveBusy) return Promise.reject(new Error('__busy__'));
+      saveBusy = true;
+      setSaveDisabled(true);
+      return fetch(url, {
+        method:'POST',
+        credentials:'same-origin',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(data)
+      }).then(function(r){
+        return r.text().then(function(txt){
+          if (r.status === 401) { window.location.href = '/login'; throw new Error('__auth__'); }
+          var d = null;
+          try { d = JSON.parse(txt); } catch (e) {}
+          if (r.status === 503) throw new Error('Controller busy — try again');
+          if (!r.ok) throw new Error((d && d.error) || txt || ('HTTP ' + r.status));
+          if (!d || d.ok !== true) throw new Error((d && d.error) || 'Save failed');
+          return d;
+        });
+      }).then(function(d){
+        saveBusy = false; setSaveDisabled(false);
+        return d;
+      }, function(e){
+        if (!e || e.message !== '__busy__') { saveBusy = false; setSaveDisabled(false); }
+        throw e;
+      });
+    }
+
+    function postSettings(data, successMsg, restart) {
+      postJson('/api/settings', data).then(function(){
+        showMsg(successMsg, true);
+        clearDirty();                       // UX-15: saved, so no longer dirty
+        if (restart) {
+          setSaveDisabled(true);            // nothing useful to press while it reboots
+          setTimeout(function(){ location.href='/'; }, 3000);
+        }
+      }).catch(function(e){
+        if (e && (e.message === '__auth__' || e.message === '__busy__')) return;
+        showMsg((e && e.message) || 'Connection error', false);
+      });
+    }
+
+    // UX-3: this POST reboots the controller, which stops any charge in
+    // progress — confirm before it fires.
     function saveWifi() {
       var ssid = document.getElementById('wifiSSID').value.trim();
       var pass = document.getElementById('wifiPass').value;
       if (!ssid) { showMsg('SSID cannot be empty', false); return; }
-      postSettings({wifi_ssid: ssid, wifi_pass: pass}, 'WiFi saved — restarting...', true);
+      uiConfirm('Save and restart the controller? Charging will stop.', function(){
+        postSettings({wifi_ssid: ssid, wifi_pass: pass}, 'WiFi saved — restarting...', true);
+      });
     }
     function onApStaticToggle() {
       var on = document.getElementById('apStaticEn').checked;
@@ -1298,22 +1767,28 @@ const char HTML_SETTINGS[] PROGMEM = R"rawliteral(
       }
       postSettings(data, 'MQTT saved — reconnecting...', false);
     }
+    // UX-7: parseInt('') is NaN, and NaN fails every comparison — so the old
+    // "cc < 1 || cc > 4" check passed an empty field straight through to the
+    // POST. Test for an actual integer instead.
     function saveChargerCount() {
-      var cc = parseInt(document.getElementById('ccCount').value);
-      if (cc < 1 || cc > 4) { showMsg('Must be 1-4', false); return; }
+      var cc = parseInt(document.getElementById('ccCount').value, 10);
+      if (!Number.isInteger(cc) || cc < 1 || cc > 4) { showMsg('Enter 1-4', false); return; }
       postSettings({charger_count: cc}, 'Charger count saved', false);
     }
     function saveRampRate() {
-      var rr = parseInt(document.getElementById('rampRate').value);
-      if (rr < 10 || rr > 500) { showMsg('Ramp rate must be 10–500 W/s', false); return; }
-      fetch('/api/control', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ramp_rate_wps: rr})
-      }).then(function(r){ return r.json(); }).then(function(d){
-        if (d.ok) showMsg('Ramp rate saved', true);
-        else showMsg(d.error || 'Save failed', false);
-      }).catch(function(){ showMsg('Connection error', false); });
+      var rr = parseInt(document.getElementById('rampRate').value, 10);
+      if (!Number.isInteger(rr) || rr < 10 || rr > 500) {
+        showMsg('Ramp rate must be 10–500 W/s', false); return;
+      }
+      // Ramp rate lives on /api/control, not /api/settings — same 401 and
+      // error handling via postJson() (UX-4).
+      postJson('/api/control', {ramp_rate_wps: rr}).then(function(){
+        showMsg('Ramp rate saved', true);
+        clearDirty();
+      }).catch(function(e){
+        if (e && (e.message === '__auth__' || e.message === '__busy__')) return;
+        showMsg((e && e.message) || 'Connection error', false);
+      });
     }
     function saveBootDefaults() {
       var ce  = document.getElementById('defChgEnabled').checked;
@@ -1346,35 +1821,78 @@ const char HTML_SETTINGS[] PROGMEM = R"rawliteral(
       if (cert.indexOf('-----BEGIN CERTIFICATE-----') < 0) {
         showMsg('Certificate must be PEM with BEGIN CERTIFICATE marker', false); return;
       }
-      fetch('/api/tls', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({cert: cert, key: key})
-      }).then(function(r){ return r.json(); }).then(function(d){
-        if (d.ok) {
-          showMsg('Certificate uploaded. Enable HTTPS below and reboot.', true);
-          document.getElementById('tlsCertStatus').textContent =
-            'Certificate stored on device. Paste new PEM to replace.';
-          document.getElementById('tlsCert').value = '';
-          document.getElementById('tlsKey').value  = '';
-        } else { showMsg(d.error || 'Upload failed', false); }
-      }).catch(function(){ showMsg('Connection error', false); });
+      postJson('/api/tls', {cert: cert, key: key}).then(function(){
+        showMsg('Certificate uploaded. Enable HTTPS below and reboot.', true);
+        document.getElementById('tlsCertStatus').textContent =
+          'Certificate stored on device. Paste new PEM to replace.';
+        document.getElementById('tlsCert').value = '';
+        document.getElementById('tlsKey').value  = '';
+        clearDirty();
+      }).catch(function(e){
+        if (e && (e.message === '__auth__' || e.message === '__busy__')) return;
+        showMsg((e && e.message) || 'Connection error', false);
+      });
     }
+    // UX-3: flipping this checkbox changes boot-time state and only takes
+    // effect after a restart — which stops charging and moves the dashboard
+    // to a different scheme/port. Confirm first; put the checkbox back if
+    // the user cancels. (The POST itself does NOT reboot — the firmware
+    // answers "Saved. Reboot the controller for this to take effect." — so
+    // the wording says restart-required rather than restarting-now.)
     function saveHttpsToggle() {
-      var en = document.getElementById('httpsEnabled').checked;
-      fetch('/api/tls', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({enabled: en})
-      }).then(function(r){ return r.json(); }).then(function(d){
-        if (d.ok) showMsg('HTTPS ' + (en ? 'enabled' : 'disabled') + ' — reboot to apply', true);
-        else { showMsg(d.error || 'Save failed', false); document.getElementById('httpsEnabled').checked = !en; }
-      }).catch(function(){ showMsg('Connection error', false); document.getElementById('httpsEnabled').checked = !en; });
+      var box = document.getElementById('httpsEnabled');
+      var en  = box.checked;
+      uiConfirm((en ? 'Enable' : 'Disable') + ' HTTPS? It takes effect when the ' +
+                'controller is restarted, and restarting stops charging.', function(){
+        postJson('/api/tls', {enabled: en}).then(function(){
+          showMsg('HTTPS ' + (en ? 'enabled' : 'disabled') + ' — reboot to apply', true);
+          clearDirty();
+        }).catch(function(e){
+          if (e && e.message === '__auth__') return;
+          box.checked = !en;                 // failed → revert the checkbox
+          if (e && e.message === '__busy__') return;
+          showMsg((e && e.message) || 'Connection error', false);
+        });
+      }, function(){
+        box.checked = !en;                   // cancelled → revert the checkbox
+      });
     }
   </script>
 </body>
 </html>
 )rawliteral";
+
+// ---------------------------------------------------------------------------
+// D11 — what the Arduino preprocessor can and cannot survive inside these
+// R"rawliteral(...)" page strings. This note lives in C comment space, outside
+// every literal, because that is the one place it cannot itself trip the thing
+// it describes.
+//
+// The ctags 5.8 that ships with the Arduino toolchain predates C++11 raw
+// string literals. It has no concept of R"delim(...)delim", so it walks the
+// page bodies as ordinary C source and tracks quoting and comments as it goes.
+// The auto-prototype pass is driven by its output, so when its state desyncs it
+// emits no prototypes at all — and the build fails with a cascade of bogus
+// "'foo' was not declared in this scope" errors pointing at perfectly good
+// functions far below. That error signature is the tell: suspect the page
+// literals, not the code the compiler is pointing at.
+//
+// Two constructs have actually been observed to desync it:
+//   * an unpaired double quote — easy to introduce in HTML attribute syntax,
+//     where single and double quotes get mixed freely;
+//   * a data: URL, whose "//" ctags may take for the start of a comment.
+// The favicon note that used to be repeated inside all four page literals was
+// describing this second case.
+//
+// What is NOT a problem, despite the caution the old note invited: apostrophes
+// in ordinary prose. Fourteen such lines are in these literals today and the
+// sketch builds clean — ctags only cares about the double quote. Write "don't"
+// and "the pack's voltage" normally.
+//
+// Rule of thumb when editing the pages: keep double quotes balanced on every
+// line, prefer single quotes for HTML attributes, and do not inline a data: URL
+// (add a real route and link to it instead).
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Dashboard — served at / when connected to a network
@@ -1387,13 +1905,24 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
 <html>
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#1a1a2e">
   <title>Supercharger</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
-    body{font-family:Arial,sans-serif;background:#1a1a2e;color:#eee;padding:16px}
+    body{font-family:Arial,sans-serif;background:#1a1a2e;color:#eee;padding:16px;
+         padding-top:calc(16px + env(safe-area-inset-top));
+         padding-bottom:calc(16px + env(safe-area-inset-bottom));
+         padding-left:calc(16px + env(safe-area-inset-left));
+         padding-right:calc(16px + env(safe-area-inset-right))}
     h1{color:#e94560;font-size:1.4em;margin-bottom:6px}
-    nav a{color:#aaa;font-size:0.85em;text-decoration:none;margin-right:14px}
+    /* UX-11: nav links are a 44 px touch target, and wrap rather than
+       overflowing a 375 px-wide phone screen. */
+    nav{display:flex;flex-wrap:wrap;row-gap:2px}
+    nav a{color:#aaa;font-size:0.85em;text-decoration:none;margin-right:14px;
+          display:inline-flex;align-items:center;min-height:44px}
     nav a:hover{color:#e94560}
     .section{margin-top:18px;font-size:0.78em;color:#666;text-transform:uppercase;
              letter-spacing:.08em;border-bottom:1px solid #0f3460;padding-bottom:4px;
@@ -1429,18 +1958,21 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
     .preset-label{font-size:0.70em;color:#888;text-transform:uppercase;
                   letter-spacing:.05em;margin-bottom:6px}
     .preset-row{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px}
+    /* UX-11: 44 px minimum touch height on every tap target. */
     .preset-btn{background:#0f3460;color:#eee;border:1px solid #e94560;padding:7px 14px;
-                border-radius:5px;font-size:0.85em;cursor:pointer}
+                border-radius:5px;font-size:0.85em;cursor:pointer;min-height:44px}
     .preset-btn:hover{background:#e94560}
     .preset-btn.active{background:#e94560}
     .slider-wrap{display:flex;align-items:center;gap:10px}
     input[type=range]{flex:1;accent-color:#e94560;height:6px}
     .slider-readout{min-width:70px;text-align:right;font-size:0.9em;color:#eee}
-    .cc-row{display:flex;align-items:center;gap:10px;margin-top:14px}
+    .cc-row{display:flex;align-items:center;gap:10px;margin-top:14px;flex-wrap:wrap}
     .cc-row .preset-label{margin-bottom:0}
     .cc-btn{background:#0f3460;color:#eee;border:1px solid #0f3460;padding:6px 14px;
-            border-radius:5px;font-size:0.85em;cursor:pointer;min-width:32px;text-align:center}
+            border-radius:5px;font-size:0.85em;cursor:pointer;min-width:44px;
+            min-height:44px;text-align:center}
     .cc-btn.active{background:#e94560;border-color:#e94560}
+    .cc-hint{font-size:0.72em;color:#666;margin-top:6px;line-height:1.4}
     /* SOC card */
     .soc-card{grid-column:span 2}
     .soc-val{font-size:2.2em!important}
@@ -1459,11 +1991,43 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
     .tgt-btn .tgt-v{font-size:0.72em;color:rgba(255,255,255,0.65);display:block;
                     font-weight:normal;margin-top:2px}
     .tgt-btn.active .tgt-v{color:rgba(255,255,255,0.85)}
+    /* Reset-session button (UX-23) — a real button element, not a clickable div. */
+    .mini-btn{background:#0f3460;color:#eee;border:1px solid #0f3460;border-radius:5px;
+              font-size:1em;cursor:pointer;padding:8px 12px;min-height:44px;width:100%;
+              text-align:left;margin-top:2px}
+    .mini-btn:hover{border-color:#e94560}
+    /* Disabled state while a control POST is in flight (UX-1). */
+    button:disabled,input:disabled{opacity:.45;cursor:progress}
+    /* Toast (UX-1) — bottom of the screen, high contrast, above the
+       home-indicator inset, auto-hides after 4 s. */
+    .toast{position:fixed;left:12px;right:12px;
+           bottom:calc(14px + env(safe-area-inset-bottom));
+           padding:14px 16px;border-radius:8px;font-size:0.95em;font-weight:bold;
+           text-align:center;z-index:1000;opacity:0;pointer-events:none;
+           transform:translateY(12px);transition:opacity .18s,transform .18s;
+           box-shadow:0 6px 20px rgba(0,0,0,.55)}
+    .toast.show{opacity:1;transform:translateY(0)}
+    .toast.ok {background:#0a3d2a;color:#7ef0b0;border:1px solid #4ade80}
+    .toast.err{background:#4a0d0d;color:#ffd4d4;border:1px solid #f87171}
+    /* In-page confirm (UX-2/UX-3) — replaces window.confirm, which iOS renders
+       with the page hostname and no styling control. */
+    .cfm-overlay{position:fixed;top:0;left:0;right:0;bottom:0;
+                 background:rgba(0,0,0,.72);z-index:1100;
+                 display:flex;align-items:center;justify-content:center;padding:20px}
+    .cfm-box{background:#16213e;border:1px solid #0f3460;border-radius:10px;
+             padding:20px;max-width:380px;width:100%;
+             box-shadow:0 10px 30px rgba(0,0,0,.6)}
+    .cfm-msg{font-size:1em;line-height:1.5;color:#eee;margin-bottom:18px}
+    .cfm-row{display:flex;gap:10px}
+    .cfm-btn{flex:1;min-height:48px;border:none;border-radius:6px;font-size:1em;
+             font-weight:bold;cursor:pointer;padding:12px}
+    .cfm-no {background:#0f3460;color:#eee;border:1px solid #444}
+    .cfm-yes{background:#e94560;color:#fff}
   </style>
 </head>
 <body>
   <h1>&#9889; Supercharger
-    <span class="badge stale" id="badge">NO DATA</span>
+    <span class="badge stale" id="badge" role="status" aria-live="polite">NO DATA</span>
   </h1>
   <nav><a href="/settings">&#9881; Settings</a><a href="/update">&#128190; OTA Update</a><a href="/log">&#128220; Log</a><a href="/api/cycles" download="cycles.csv">&#11015; Cycles</a><a href="#" onclick="logout();return false">&#128274; Logout</a></nav>
 
@@ -1479,7 +2043,8 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
        severe (activeProtection()), so the UI only ever has one thing to say.
        Colour, icon and copy are all set from d.protection in updateStatus().
        Replaces the former separate thermalBanner / inhibitBanner. -->
-  <div id="protBanner" style="display:none;border-radius:8px;padding:12px 16px;
+  <div id="protBanner" role="status" aria-live="polite"
+       style="display:none;border-radius:8px;padding:12px 16px;
        margin-top:12px;text-align:center;border:1px solid #888;background:#222">
     <span id="protTitle" style="font-weight:bold"></span>
     <span id="protMsg" style="color:#aaa"></span>
@@ -1535,16 +2100,17 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
       <span class="val" id="etaTime">—</span></div>
     <div class="card"><div class="label">Ramp Rate</div>
       <span class="val" id="rampRate">—</span><span class="unit">W/s</span></div>
-    <div class="card" style="cursor:pointer" onclick="resetSession()" title="Click to reset session">
+    <div class="card">
       <div class="label">Reset Session</div>
-      <span class="val" style="font-size:1em;color:#888">&#8635; Reset</span></div>
+      <button type="button" id="btnReset" class="mini-btn" onclick="resetSession()">
+        &#8635; Reset</button></div>
   </div>
 
   <div class="section">Charging Control</div>
   <div class="ctrl-box">
 
     <div class="ctrl-row">
-      <button class="big-btn" id="btnEnable" onclick="toggleEnable()">&#9654; Charging ON</button>
+      <button type="button" class="big-btn" id="btnEnable" onclick="toggleEnable()">&#9654; Charging ON</button>
       <div class="pwr-display">
         <div class="pwr-label">Current</div>
         <span class="pwr-val" id="curPwr">—</span><span class="pwr-unit">W</span>
@@ -1572,11 +2138,13 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
 
     <div class="cc-row">
       <span class="preset-label">Chargers</span>
-      <button class="cc-btn" onclick="setChargerCount(1)">1</button>
-      <button class="cc-btn" onclick="setChargerCount(2)">2</button>
-      <button class="cc-btn active" onclick="setChargerCount(3)">3</button>
-      <button class="cc-btn" onclick="setChargerCount(4)">4</button>
+      <button type="button" class="cc-btn" onclick="setChargerCount(1)">1</button>
+      <button type="button" class="cc-btn" onclick="setChargerCount(2)">2</button>
+      <button type="button" class="cc-btn active" onclick="setChargerCount(3)">3</button>
+      <button type="button" class="cc-btn" onclick="setChargerCount(4)">4</button>
     </div>
+    <div class="cc-hint">Sets the preset table and slider range only.
+      Does not change what the chargers physically do.</div>
   </div>
 
   <div class="section">Target Voltage</div>
@@ -1611,7 +2179,85 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
   <footer id="footer">Waiting for first update...</footer>
 
   <script>
-    var fmt = function(v, d){ return (v === null || isNaN(v)) ? '—' : (+v).toFixed(d); };
+    // /log and /update are served ONLY on port 80 (multipart OTA and the SSE
+    // log stream have no equivalent on the IDF TLS server). Reached over
+    // https:// they resolve to port 443, where nothing is registered, and the
+    // user gets a bare 404. Point them at http:// explicitly when this page
+    // itself arrived over TLS.
+    if (location.protocol === 'https:') {
+      document.querySelectorAll('nav a[href="/log"], nav a[href="/update"]').forEach(function(a){
+        a.href = 'http://' + location.hostname + a.getAttribute('href');
+      });
+    }
+
+    var fmt = function(v, d){
+      return (v === null || v === undefined || v === '' || isNaN(v)) ? '—' : (+v).toFixed(d);
+    };
+    // UX-13: fmt() + a unit suffix, but never "— V" / "undefined A" — a missing
+    // field renders as a bare em dash.
+    var unit = function(v, d, u){ var s = fmt(v, d); return s === '—' ? s : (s + u); };
+    // Raw (already-integer) value with a suffix, or an em dash when absent.
+    var rawUnit = function(v, u){
+      return (v === null || v === undefined || v === '' || isNaN(v)) ? '—' : (v + u);
+    };
+    // D10: a min/max pair with BOTH sensors dead read as "— / — °C", which
+    // looks like two readings. One dash means "no data" much more clearly.
+    // A half-dead pair still shows both halves so the live one is visible.
+    var pairUnit = function(a, b, dec, u){
+      var sa = fmt(a, dec), sb = fmt(b, dec);
+      if (sa === '—' && sb === '—') return '—';
+      return sa + ' / ' + sb + u;
+    };
+
+    // ---- Toast (UX-1) ----------------------------------------------------
+    // One reusable element, created on first use, auto-hidden after 4 s.
+    var toastTimer = null;
+    function toast(msg, ok) {
+      var t = document.getElementById('toast');
+      if (!t) {
+        t = document.createElement('div');
+        t.id = 'toast';
+        t.setAttribute('role', 'status');
+        t.setAttribute('aria-live', 'polite');
+        document.body.appendChild(t);
+      }
+      t.textContent = msg;
+      t.className = 'toast show ' + (ok ? 'ok' : 'err');
+      if (toastTimer) clearTimeout(toastTimer);
+      toastTimer = setTimeout(function(){ t.className = 'toast ' + (ok ? 'ok' : 'err'); }, 4000);
+    }
+
+    // ---- In-page confirm (UX-2) -----------------------------------------
+    // Built from DOM nodes (textContent, never innerHTML) so a message can
+    // never become an injection sink.
+    function uiConfirm(msg, onYes, onNo) {
+      var ov  = document.createElement('div'); ov.className  = 'cfm-overlay';
+      var box = document.createElement('div'); box.className = 'cfm-box';
+      var p   = document.createElement('div'); p.className   = 'cfm-msg';
+      p.textContent = msg;
+      var row = document.createElement('div'); row.className = 'cfm-row';
+      var no  = document.createElement('button');
+      no.type = 'button'; no.className = 'cfm-btn cfm-no';  no.textContent  = 'Cancel';
+      var yes = document.createElement('button');
+      yes.type = 'button'; yes.className = 'cfm-btn cfm-yes'; yes.textContent = 'Confirm';
+      var closed = false;
+      function close(cancelled) {
+        if (closed) return; closed = true;
+        if (ov.parentNode) ov.parentNode.removeChild(ov);
+        document.removeEventListener('keydown', onKey);
+        if (cancelled && onNo) onNo();
+      }
+      function onKey(e){ if (e.key === 'Escape') close(true); }
+      no.onclick  = function(){ close(true); };
+      yes.onclick = function(){ close(false); if (onYes) onYes(); };
+      ov.onclick  = function(e){ if (e.target === ov) close(true); };
+      document.addEventListener('keydown', onKey);
+      row.appendChild(no); row.appendChild(yes);
+      box.appendChild(p);  box.appendChild(row);
+      ov.appendChild(box);
+      document.body.appendChild(ov);
+      yes.focus();
+    }
 
     // Preset table — mirrors POWER_PRESETS on the ESP32.
     // Each row = charger_count * [500, 1000, 1650, 2200, 3300] rounded.
@@ -1633,15 +2279,20 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
 
     var chargingEnabled = false; // updated from server on first refresh
     var lastChargerCount = -1;  // track when count changes to rebuild presets
+    var curTargetDv = 0;        // last target voltage seen from the server
+    var redirecting = false;    // true once we've started navigating to /login
 
     // Status bitfield labels
     var STATUS_BITS = [
       [0x01, 'HW Fault'],
       [0x02, 'Overtemp'],
       [0x04, 'AC Fault'],
-      [0x08, 'No Battery'],
-      [0x10, 'Batt Fault']
+      [0x08, 'Starting/No Batt'],
+      [0x10, 'Comm Timeout']
     ];
+    // 0x08 and 0x10 are informational (Elcon TC protocol: starting state /
+    // command-frame timeout) and are normal while idle; the firmware only
+    // acts on 0x01 and 0x02 — keep these labels in step with the C table.
     function statusText(s) {
       if (s === 0) return 'OK';
       var out = [];
@@ -1653,20 +2304,96 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
     function statusClass(s) { return s === 0 ? 'ok' : 'stale'; }
 
     // ---- Control helpers ----
+    //
+    // UX-1: every /api/control POST goes through postControl(). It
+    //   * disables every control while the request is in flight, so a second
+    //     tap can't race the first,
+    //   * treats a non-2xx *or* {"ok":false} as a failure and shows the
+    //     server's own error text in a toast,
+    //   * maps 401 → /login and 503 → "Controller busy — try again"
+    //     (applyApiControlBody() returns 503 when controlMutex timed out and
+    //     NOTHING was applied — the old fire-and-forget code silently showed
+    //     the user a stop/start that never happened), and
+    //   * forces an immediate /api/status poll on both paths, so an optimistic
+    //     button state is always overwritten by the controller's real state.
 
-    function sendControl(targetW, enabled) {
+    var ctrlBusy = false;
+    var ctrlPrev = null;   // [element, wasDisabled] pairs, for exact restore
+
+    function controlEls() {
+      var out = [];
+      var one = document.getElementById('btnEnable');
+      if (one) out.push(one);
+      var sel = document.querySelectorAll('.preset-btn, .tgt-btn, .cc-btn, #pwrSlider, #btnReset');
+      for (var i = 0; i < sel.length; i++) out.push(sel[i]);
+      return out;
+    }
+
+    // Restores the prior disabled state rather than blanket-enabling — the
+    // slider is legitimately disabled when the charger count is out of range.
+    function setCtrlDisabled(on) {
+      if (on) {
+        var els = controlEls();
+        ctrlPrev = [];
+        for (var i = 0; i < els.length; i++) {
+          ctrlPrev.push([els[i], els[i].disabled]);
+          els[i].disabled = true;
+        }
+      } else if (ctrlPrev) {
+        for (var j = 0; j < ctrlPrev.length; j++) ctrlPrev[j][0].disabled = ctrlPrev[j][1];
+        ctrlPrev = null;
+      }
+    }
+
+    function postControl(body, onOk) {
+      if (ctrlBusy) return;
+      ctrlBusy = true;
+      setCtrlDisabled(true);
+      var settle = function(){
+        ctrlBusy = false;
+        // On the 401 path we are already navigating to /login — clear the
+        // busy latch, but leave the controls inert rather than re-arming a
+        // page that is on its way out.
+        if (redirecting) return;
+        setCtrlDisabled(false);
+        refreshSoon();          // re-sync the UI from the controller's truth
+      };
       fetch('/api/control', {
         method: 'POST',
+        credentials: 'same-origin',
         headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({target_w: targetW, enabled: enabled})
-      });
+        body: JSON.stringify(body)
+      }).then(function(r){
+        return r.text().then(function(txt){
+          if (r.status === 401) { redirecting = true; window.location.href = '/login';
+                                  throw new Error('__auth__'); }
+          // The HTTP path answers "No body" as text/plain, everything else as
+          // JSON — parse defensively rather than assuming r.json() succeeds.
+          var d = null;
+          try { d = JSON.parse(txt); } catch (e) {}
+          if (r.status === 503) throw new Error('Controller busy — try again');
+          if (!r.ok) throw new Error((d && d.error) || txt || ('HTTP ' + r.status));
+          if (!d || d.ok !== true) throw new Error((d && d.error) || 'Command not applied');
+          return d;
+        });
+      }).then(function(d){
+        // D8: a throw inside onOk is a rendering bug, not a failed command —
+        // don't report it to the user as one. Log it and carry on.
+        if (onOk) {
+          try { onOk(d); }
+          catch (err) { if (window.console) console.error('onOk failed', err); }
+        }
+      }).catch(function(e){
+        if (e && e.message === '__auth__') return;   // navigating away
+        toast((e && e.message) ? e.message : 'Connection error', false);
+      }).then(settle, settle);   // D8: settle runs on every path
     }
 
     function setPreset(w) {
       var slider = document.getElementById('pwrSlider');
       slider.value = w;
       document.getElementById('sliderVal').textContent = w;
-      sendControl(w, chargingEnabled);
+      postControl({target_w: w, enabled: chargingEnabled});
     }
 
     // Live readout while dragging — don't send until release
@@ -1676,28 +2403,54 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
 
     // Commit on mouse/touch release
     function onSliderCommit(v) {
-      sendControl(parseInt(v), chargingEnabled);
+      postControl({target_w: parseInt(v), enabled: chargingEnabled});
     }
 
+    // Human-readable current target, for the start-charging confirm text.
+    function targetPctText() {
+      for (var i = 0; i < TARGET_VOLT_PRESETS.length; i++) {
+        if (TARGET_VOLT_PRESETS[i].dv === curTargetDv) return TARGET_VOLT_PRESETS[i].pct + '%';
+      }
+      return (curTargetDv > 0) ? ((curTargetDv / 10).toFixed(1) + ' V') : 'the current target';
+    }
+
+    // UX-2: starting and stopping a charge are both confirmed. The optimistic
+    // button flip stays, but a failed POST is reverted by the forced poll in
+    // postControl()'s settle().
     function toggleEnable() {
-      chargingEnabled = !chargingEnabled;
-      updateEnableBtn();
       var slider = document.getElementById('pwrSlider');
-      sendControl(parseInt(slider.value), chargingEnabled);
+      var want   = !chargingEnabled;
+      var msg    = want ? ('Start charging at ' + (parseInt(slider.value) || 0) +
+                           ' W to ' + targetPctText() + '?')
+                        : 'Stop charging?';
+      uiConfirm(msg, function(){
+        // D9: the confirm is modal to this page only. Home Assistant, a second
+        // browser, or the ramp task reaching Float can all change the state
+        // while the dialog is open, and the poll keeps running behind it — so
+        // re-read everything at accept time instead of acting on the snapshot
+        // taken when the dialog opened.
+        if (chargingEnabled !== !want) {
+          toast('State changed — try again', false);
+          return;
+        }
+        var w = parseInt(document.getElementById('pwrSlider').value) || 0;
+        chargingEnabled = want;
+        updateEnableBtn();
+        postControl({target_w: w, enabled: want}, function(){
+          toast(want ? 'Charging started' : 'Charging stopped', true);
+        });
+      });
     }
 
     function setChargerCount(n) {
-      fetch('/api/control', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({charger_count: n})
+      postControl({charger_count: n}, function(){
+        var btns = document.querySelectorAll('.cc-btn');
+        for (var i = 0; i < btns.length; i++) {
+          btns[i].className = 'cc-btn' + (i + 1 === n ? ' active' : '');
+        }
+        lastChargerCount = -1; // force preset rebuild
+        rebuildPresets(n);
       });
-      var btns = document.querySelectorAll('.cc-btn');
-      for (var i = 0; i < btns.length; i++) {
-        btns[i].className = 'cc-btn' + (i + 1 === n ? ' active' : '');
-      }
-      lastChargerCount = -1; // force preset rebuild
-      rebuildPresets(n);
     }
 
     function updateEnableBtn() {
@@ -1732,16 +2485,16 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
     }
 
     function setTargetVolt(dv) {
-      fetch('/api/control', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({target_volt_dv: dv})
+      postControl({target_volt_dv: dv}, function(){
+        curTargetDv = dv;
+        // Optimistic highlight — only once the controller confirmed it. A
+        // failed POST leaves the old highlight, and the forced poll in
+        // postControl() re-asserts the real target either way.
+        for (var i = 0; i < TARGET_VOLT_PRESETS.length; i++) {
+          var b = document.getElementById('tvBtn_' + TARGET_VOLT_PRESETS[i].dv);
+          if (b) b.className = 'tgt-btn' + (TARGET_VOLT_PRESETS[i].dv === dv ? ' active' : '');
+        }
       });
-      // Optimistic highlight
-      for (var i = 0; i < TARGET_VOLT_PRESETS.length; i++) {
-        var b = document.getElementById('tvBtn_' + TARGET_VOLT_PRESETS[i].dv);
-        if (b) b.className = 'tgt-btn' + (TARGET_VOLT_PRESETS[i].dv === dv ? ' active' : '');
-      }
     }
 
     function syncTargetVoltBtns(dv) {
@@ -1755,10 +2508,8 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
     // ---- Session reset ----
 
     function resetSession() {
-      fetch('/api/control', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({reset_session: true})
+      uiConfirm('Reset the session Wh/Ah counters? This cannot be undone.', function(){
+        postControl({reset_session: true}, function(){ toast('Session counters reset', true); });
       });
     }
 
@@ -1821,19 +2572,66 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
       document.body.appendChild(f); f.submit();
     }
 
+    // ---- Polling (UX-14) ------------------------------------------------
+    // Self-rescheduling: the next request is only issued 2 s AFTER the
+    // previous one settled, so a slow or hung link can't stack up requests
+    // (the old setInterval fired regardless). Each request is aborted after
+    // 5 s, and two consecutive failures flip the existing badge to NO DATA.
+    var pollTimer  = null;
+    var pollDue    = 0;      // timestamp the pending poll is scheduled for
+    var pollFails  = 0;
+    var refreshing = false;
+
+    // D7: never push a pending poll further out. An in-flight poll that
+    // settles just after a control POST called refreshSoon() used to replace
+    // the forced 250 ms resync with its own 2 s one — so the UI sat in the
+    // optimistic state, and a payload captured before the command landed
+    // could snap the button back. Anything already queued sooner wins.
+    function scheduleRefresh(ms) {
+      if (redirecting) return;
+      var due = Date.now() + ms;
+      if (pollTimer && pollDue <= due) return;     // something sooner is queued
+      if (pollTimer) clearTimeout(pollTimer);
+      pollDue   = due;
+      pollTimer = setTimeout(function(){ pollTimer = null; refresh(); }, ms);
+    }
+    // Called after a control POST so the UI re-syncs immediately instead of
+    // sitting in an optimistic state for up to 2 s.
+    function refreshSoon(){ scheduleRefresh(250); }
+
     function refresh(){
-      fetch('/api/status')
+      if (redirecting) return;
+      if (refreshing) { scheduleRefresh(2000); return; }   // previous still in flight
+      refreshing = true;
+
+      var opts = {credentials:'same-origin'};
+      var ctl = null, tmr = null;
+      if (window.AbortController) {
+        ctl = new AbortController();
+        opts.signal = ctl.signal;
+        tmr = setTimeout(function(){ try { ctl.abort(); } catch(e) {} }, 5000);
+      }
+      var settle = function(){
+        refreshing = false;
+        if (tmr) { clearTimeout(tmr); tmr = null; }
+        scheduleRefresh(2000);
+      };
+
+      fetch('/api/status', opts)
         .then(function(r){
           // Session expired (or never existed) → bounce to /login.
           // The cookie is HttpOnly so we can't inspect it from JS —
           // a 401 from /api/status is our cue to redirect.
           if (r.status === 401) {
+            redirecting = true;
             window.location.href = '/login';
-            throw new Error('redirecting to /login');
+            throw new Error('__auth__');
           }
+          if (!r.ok) throw new Error('HTTP ' + r.status);
           return r.json();
         })
         .then(function(d){
+          pollFails = 0;
           var b = document.getElementById('badge');
           b.textContent = d.fresh ? 'LIVE' : 'NO DATA';
           b.className   = 'badge ' + (d.fresh ? 'ok' : 'stale');
@@ -1855,8 +2653,14 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
               msg:' Pack is above 45 °C, the cell manufacturer’s charging limit. Charging will resume on its own once it cools below 43 °C. If this happens without hard riding beforehand, check for blocked airflow around the pack.' },
             pack_low: { sev:'stop', icon:'⚠', title:'Charging blocked — pack voltage too low',
               msg:' Pack is below 70 V (2.5 V per cell). Below this level the copper inside the cells starts to dissolve, and charging normally can create an internal short. This should not happen in normal use — the bike’s BMS cuts out well above it. Have the pack checked by a technician before charging; do not force it.' },
+            temp_unknown: { sev:'stop', icon:'🌡', title:'Pack temperature unknown',
+              msg:' The BMS is not reporting a valid pack temperature. Charging is inhibited until temperature data returns.' },
             bms_stale: { sev:'stop', icon:'🔌', title:'Charging stopped — no data from bike',
               msg:' The controller has lost contact with the bike’s battery management system, so it cannot see pack voltage or temperature and will not charge blind. Check that the charge connector is fully seated and the bike is powered on. Charging resumes automatically within a second of data returning.' },
+            charger_fault: { sev:'stop', icon:'⛔', title:'Charger fault',
+              msg:' A charger reports a fault (see charger status). Charging stopped — fix the cause, then press Stop and Charge again to re-arm.' },
+            charger_mismatch: { sev:'stop', icon:'⚠', title:'Charger count mismatch',
+              msg:' More chargers detected on the bus than configured. Charging stopped — set the charger count in Settings to match.' },
             charger_clamped: { sev:'stop', icon:'⚠', title:'Wiring problem — too many chargers',
               msg:' More than four chargers are answering on the CAN bus. The controller divides the requested current between the chargers it knows about, so an extra unit would make every charger deliver more than intended. Disconnect the extra charger, or set distinct CAN instance IDs, before charging.' },
             thermal_throttle: { sev:'warn', icon:'🌡', title:'Reduced power — pack warm',
@@ -1908,17 +2712,23 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
           var dispMonoA    = charging ? Math.abs(d.monolith_a) : d.monolith_a;
           var dispPtA      = charging ? Math.abs(d.powertank_a) : d.powertank_a;
 
-          document.getElementById('mV').textContent  = fmt(d.monolith_v,  1) + ' V';
-          document.getElementById('mA').textContent  = dispMonoA + ' A';
+          // UX-13: every field below goes through fmt()/unit()/rawUnit(), so a
+          // key missing from /api/status renders "—" rather than "undefined V".
+          document.getElementById('mV').textContent  = unit(d.monolith_v, 1, ' V');
+          document.getElementById('mA').textContent  = unit(dispMonoA, 1, ' A');
           // Capacity card: shows "available / total Ah" so the user sees both
           // how much is actually left in the pack right now (avail = total × SoC)
           // and the BMS's nominal capacity constant.
-          var mAvail = (d.monolith_ah_avail !== undefined) ? d.monolith_ah_avail : null;
+          var mAvail  = (d.monolith_ah_avail !== undefined) ? d.monolith_ah_avail : null;
+          var mAhTot  = rawUnit(d.monolith_ah, '');   // keeps the BMS's own precision
           document.getElementById('mAH').textContent = (mAvail !== null)
-            ? (fmt(mAvail, 1) + ' / ' + d.monolith_ah + ' Ah')
-            : (d.monolith_ah + ' Ah');
-          document.getElementById('mT').textContent  = fmt(d.monolith_tmin, 0)
-                                               + ' / ' + fmt(d.monolith_tmax, 0) + ' \u00B0C';
+            ? (fmt(mAvail, 1) + ' / ' + mAhTot + ' Ah')
+            : (mAhTot === '—' ? '—' : (mAhTot + ' Ah'));
+          // Pack temps arrive as JSON null when the BMS reports a disconnected
+          // thermistor; fmt() already maps null/undefined to an em dash, so a
+          // dead sensor shows a dash rather than a bogus reading.
+          document.getElementById('mT').textContent  =
+            pairUnit(d.monolith_tmin, d.monolith_tmax, 0, ' \u00B0C');
 
           // Cell balance tile \u2014 colour-coded: green <10 mV, amber 10\u201350 mV, red >50 mV
           var balEl = document.getElementById('mCellBal');
@@ -1942,13 +2752,17 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
             ? ((d.cell_avg_mv / 1000).toFixed(3) + ' V') : '\u2014';
 
           // SOC card
-          var soc = d.monolith_soc !== undefined ? d.monolith_soc : null;
+          var soc = (d.monolith_soc !== undefined && d.monolith_soc !== null &&
+                     !isNaN(d.monolith_soc)) ? d.monolith_soc : null;
           var socEl  = document.getElementById('mSOC');
           var socBar = document.getElementById('mSOCBar');
           if (soc !== null) {
             socEl.textContent = soc + ' %';
             socBar.style.width = soc + '%';
             socBar.style.background = socColour(soc);
+          } else {
+            socEl.textContent  = '—';
+            socBar.style.width = '0%';
           }
           // SOC source label: blank when reading the BMS (the truth — same number
           // the bike's dashboard uses), "(est.)" while we're still falling back
@@ -1972,23 +2786,26 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
             var m = etaMin % 60;
             etaEl.textContent = h + 'h ' + (m < 10 ? '0' + m : m) + 'm';
           }
-          document.getElementById('rampRate').textContent = d.ramp_rate_wps !== undefined
-                                                            ? d.ramp_rate_wps : '—';
+          document.getElementById('rampRate').textContent = rawUnit(d.ramp_rate_wps, '');
 
           // Target voltage buttons
+          curTargetDv = d.target_volt_dv || 0;
           syncTargetVoltBtns(d.target_volt_dv);
 
           var ptSec = document.getElementById('ptSection');
           if (d.powertank_decided && d.powertank_present) {
             ptSec.style.display = 'block';
-            document.getElementById('pV').textContent  = fmt(d.powertank_v,  1) + ' V';
-            document.getElementById('pA').textContent  = dispPtA + ' A';
+            document.getElementById('pV').textContent  = unit(d.powertank_v, 1, ' V');
+            document.getElementById('pA').textContent  = unit(dispPtA, 1, ' A');
             var pAvail = (d.powertank_ah_avail !== undefined) ? d.powertank_ah_avail : null;
+            var pAhTot = rawUnit(d.powertank_ah, '');
             document.getElementById('pAH').textContent = (pAvail !== null)
-              ? (fmt(pAvail, 1) + ' / ' + d.powertank_ah + ' Ah')
-              : (d.powertank_ah + ' Ah');
-            document.getElementById('pT').textContent  = fmt(d.powertank_tmin, 0)
-                                                 + ' / ' + fmt(d.powertank_tmax, 0) + ' \u00B0C';
+              ? (fmt(pAvail, 1) + ' / ' + pAhTot + ' Ah')
+              : (pAhTot === '—' ? '—' : (pAhTot + ' Ah'));
+            // null (disconnected thermistor) renders as a dash via fmt();
+            // both dead collapses to a single dash (D10).
+            document.getElementById('pT').textContent  =
+              pairUnit(d.powertank_tmin, d.powertank_tmax, 0, ' \u00B0C');
           } else if (d.powertank_decided && !d.powertank_present) {
             ptSec.style.display = 'none';
           }
@@ -2003,9 +2820,12 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
           if (chargers.length > 0) {
             var totalA = 0; var avgV = 0; var worstStatus = 0;
             for (var i = 0; i < chargers.length; i++) {
-              totalA += chargers[i].a;
-              avgV += chargers[i].v;
-              if (chargers[i].status > worstStatus) worstStatus = chargers[i].status;
+              // UX-13: a charger entry missing a field must not poison the
+              // sum into NaN and blank the whole tile.
+              var ca = +chargers[i].a, cv = +chargers[i].v, cs = +chargers[i].status;
+              totalA += isNaN(ca) ? 0 : ca;
+              avgV   += isNaN(cv) ? 0 : cv;
+              if (!isNaN(cs) && cs > worstStatus) worstStatus = cs;
             }
             avgV = avgV / chargers.length;
             grid.innerHTML =
@@ -2024,7 +2844,7 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
 
           // Control section — sync from server state
           rebuildPresets(d.charger_count || 0);
-          chargingEnabled = d.charging_enabled;
+          chargingEnabled = !!d.charging_enabled;
           updateEnableBtn();
 
           // Sync charger count button highlight from server
@@ -2038,12 +2858,14 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
           // as the absorption mode badge to flag the swap.
           var curPwrEl = document.getElementById('curPwr');
           if (inAbsorption) {
-            var pwrW = Math.abs(d.monolith_a) * d.monolith_v;
+            // UX-13: any missing BMS field would make this NaN — fall back to
+            // the charger-reported figure instead of printing "NaN".
+            var pwrW = Math.abs(+d.monolith_a) * (+d.monolith_v);
             if (d.powertank_decided && d.powertank_present) {
-              pwrW += Math.abs(d.powertank_a) * d.powertank_v;
+              pwrW += Math.abs(+d.powertank_a) * (+d.powertank_v);
             }
-            curPwrEl.textContent = Math.round(pwrW);
-            curPwrEl.style.color = '#4ab4f8';
+            curPwrEl.textContent = isNaN(pwrW) ? (d.current_power_w || 0) : Math.round(pwrW);
+            curPwrEl.style.color = isNaN(pwrW) ? '' : '#4ab4f8';
           } else {
             curPwrEl.textContent = d.current_power_w || 0;
             curPwrEl.style.color = '';
@@ -2061,11 +2883,13 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
             document.getElementById('sliderVal').textContent = slider.value;
           }
 
-          document.getElementById('uptime').textContent = d.uptime_s + ' s';
-          document.getElementById('rssi').textContent   = d.rssi + ' dBm';
-          document.getElementById('ver').textContent    = d.version;
-          document.getElementById('cpu0').textContent   = d.cpu0 !== undefined ? d.cpu0 + ' %' : '—';
-          document.getElementById('cpu1').textContent   = d.cpu1 !== undefined ? d.cpu1 + ' %' : '—';
+          document.getElementById('uptime').textContent = rawUnit(d.uptime_s, ' s');
+          document.getElementById('rssi').textContent   = rawUnit(d.rssi, ' dBm');
+          document.getElementById('ver').textContent    = (d.version === undefined ||
+                                                           d.version === null ||
+                                                           d.version === '') ? '—' : d.version;
+          document.getElementById('cpu0').textContent   = rawUnit(d.cpu0, ' %');
+          document.getElementById('cpu1').textContent   = rawUnit(d.cpu1, ' %');
           document.getElementById('heap').textContent       = d.free_heap_kb !== undefined
                                                             ? fmt(d.free_heap_kb, 1) + ' kB' : '—';
           document.getElementById('cycleCount').textContent = d.cycle_count !== undefined
@@ -2076,10 +2900,20 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
               ? (fmt(d.odometer_km, 1) + ' km') : '—';
           document.getElementById('footer').textContent =
             'Last update: ' + new Date().toLocaleTimeString();
+          settle();
         })
-        .catch(function(){
-          var b = document.getElementById('badge');
-          b.textContent = 'OFFLINE'; b.className = 'badge stale';
+        .catch(function(e){
+          if (e && e.message === '__auth__') return;   // navigating to /login
+          // UX-14: one dropped poll on a phone that just roamed is normal —
+          // only call it stale after two consecutive failures.
+          pollFails++;
+          if (pollFails >= 2) {
+            var b = document.getElementById('badge');
+            b.textContent = 'NO DATA'; b.className = 'badge stale';
+            document.getElementById('footer').textContent =
+              'No response from controller since ' + new Date().toLocaleTimeString();
+          }
+          settle();
         });
     }
     // ---- Collapsible System section ----
@@ -2102,8 +2936,9 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
       } catch(e) {}
     })();
 
+    // UX-14: the loop reschedules itself from refresh()'s settle(); no
+    // setInterval, so a stalled request can never stack up behind itself.
     refresh();
-    setInterval(refresh, 2000);
   </script>
 </body>
 </html>
@@ -2118,10 +2953,17 @@ const char HTML_OTA[] PROGMEM = R"rawliteral(
 <html>
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#1a1a2e">
   <title>OTA Update</title>
   <style>
-    body{font-family:Arial;text-align:center;background:#1a1a2e;color:#eee;padding:20px}
+    body{font-family:Arial;text-align:center;background:#1a1a2e;color:#eee;padding:20px;
+         padding-top:calc(20px + env(safe-area-inset-top));
+         padding-bottom:calc(20px + env(safe-area-inset-bottom));
+         padding-left:calc(20px + env(safe-area-inset-left));
+         padding-right:calc(20px + env(safe-area-inset-right))}
     h2{color:#e94560}
     .box{background:#16213e;padding:30px;border-radius:10px;
          box-shadow:0 4px 12px rgba(0,0,0,.4);max-width:480px;margin:auto}
@@ -2136,8 +2978,10 @@ const char HTML_OTA[] PROGMEM = R"rawliteral(
          width:0%;transition:width .3s}
     #status{margin-top:14px;font-size:15px;min-height:22px}
     .ver{font-size:12px;color:#555;margin-top:20px}
-    nav{margin-bottom:14px}
-    nav a{color:#aaa;font-size:0.85em;text-decoration:none}
+    nav{margin-bottom:14px;display:flex;flex-wrap:wrap}
+    /* UX-11: 44 px minimum touch target. */
+    nav a{color:#aaa;font-size:0.85em;text-decoration:none;
+          display:inline-flex;align-items:center;min-height:44px}
     nav a:hover{color:#e94560}
   </style>
 </head>
@@ -2146,6 +2990,9 @@ const char HTML_OTA[] PROGMEM = R"rawliteral(
     <nav><a href="/">&#8592; Dashboard</a></nav>
     <h2>&#128190; Firmware Update</h2>
     <p>Select a compiled <code>.bin</code> file to upload.</p>
+    <p style="font-size:0.78em;color:#888">This page is always served over plain
+      HTTP on port 80. With HTTPS enabled it needs its own login, separate from
+      the one used on the secure dashboard.</p>
     <input type="file" id="bin" accept=".bin"><br>
     <button id="btn" onclick="upload()">Upload Firmware</button>
     <div id="bar-wrap"><div id="bar"></div></div>
@@ -2153,11 +3000,46 @@ const char HTML_OTA[] PROGMEM = R"rawliteral(
     <div class="ver" id="ver">Loading version...</div>
   </div>
   <script>
-    fetch('/api/status')
-      .then(function(r){ return r.json(); })
-      .then(function(d){
-        document.getElementById('ver').textContent = 'Current firmware: ' + d.version;
+    // /update is registered on port 80 only. If this page was somehow reached
+    // over TLS, keep the upload on http:// rather than POSTing to a port 443
+    // that has no /update handler.
+    var httpBase = (location.protocol === 'https:') ? 'http://' + location.hostname : '';
+    if (location.protocol === 'https:') {
+      document.querySelectorAll('nav a[href="/log"], nav a[href="/update"]').forEach(function(a){
+        a.href = 'http://' + location.hostname + a.getAttribute('href');
       });
+    }
+
+    // UX-5 / C6: the version read-out is a nicety — the Upload button must
+    // stay usable whatever happens to it.
+    //   * 401 → the session expired, go and log in.
+    //   * anything else (including the cross-origin failure you get when this
+    //     page was loaded over TLS and httpBase points at http://) → say
+    //     "unavailable" once and stop. Deliberately no retry loop: on the
+    //     https: → http: hop the browser blocks the request every time.
+    (function(){
+      var verEl = document.getElementById('ver');
+      function unavailable(){ verEl.textContent = 'Firmware version unavailable'; }
+      fetch(httpBase + '/api/status', {credentials:'same-origin'})
+        .then(function(r){
+          // D13: same login target as the upload path — this page and /update
+          // both live on port 80, so follow httpBase when it is set.
+          if (r.status === 401) {
+            window.location.href = (httpBase || '') + '/login';
+            throw new Error('__auth__');
+          }
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return r.json();
+        })
+        .then(function(d){
+          verEl.textContent = (d && d.version)
+            ? ('Current firmware: ' + d.version) : 'Firmware version unavailable';
+        })
+        .catch(function(e){
+          if (e && e.message === '__auth__') return;
+          unavailable();
+        });
+    })();
 
     function upload(){
       var file = document.getElementById('bin').files[0];
@@ -2175,7 +3057,7 @@ const char HTML_OTA[] PROGMEM = R"rawliteral(
       fd.append('firmware', file, file.name);
 
       var xhr = new XMLHttpRequest();
-      xhr.open('POST','/update',true);
+      xhr.open('POST', httpBase + '/update', true);
       xhr.upload.onprogress=function(e){
         if(e.lengthComputable){
           var p=Math.round(e.loaded/e.total*100);
@@ -2200,6 +3082,11 @@ const char HTML_OTA[] PROGMEM = R"rawliteral(
             setTimeout(tick,1000);
           }
           tick();
+        } else if(xhr.status===401){
+          // UX-5: the OTA session expired mid-upload — /update is HTTP-only, so
+          // send the user to the port-80 login rather than showing a raw 401.
+          stat.innerText='Session expired — signing in again...';
+          window.location.href = (httpBase || '') + '/login';
         } else {
           stat.innerText='Failed (HTTP '+xhr.status+'): '+xhr.responseText;
           btn.disabled=false;
@@ -2222,19 +3109,28 @@ const char HTML_LOG[] PROGMEM = R"rawliteral(
 <html>
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#1a1a2e">
   <title>Serial Log</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
     body{font-family:Arial,sans-serif;background:#1a1a2e;color:#eee;
-         padding:16px;display:flex;flex-direction:column;height:100vh}
+         padding:16px;display:flex;flex-direction:column;height:100vh;
+         padding-top:calc(16px + env(safe-area-inset-top));
+         padding-bottom:calc(16px + env(safe-area-inset-bottom));
+         padding-left:calc(16px + env(safe-area-inset-left));
+         padding-right:calc(16px + env(safe-area-inset-right))}
     h1{color:#e94560;font-size:1.2em;margin-bottom:6px;flex-shrink:0}
-    nav{font-size:0.85em;margin-bottom:8px;flex-shrink:0}
-    nav a{color:#aaa;text-decoration:none;margin-right:14px}
+    nav{font-size:0.85em;margin-bottom:8px;flex-shrink:0;display:flex;flex-wrap:wrap}
+    /* UX-11: 44 px minimum touch target on links and toolbar buttons. */
+    nav a{color:#aaa;text-decoration:none;margin-right:14px;
+          display:inline-flex;align-items:center;min-height:44px}
     nav a:hover{color:#e94560}
-    .toolbar{display:flex;gap:8px;margin-bottom:8px;flex-shrink:0}
+    .toolbar{display:flex;gap:8px;margin-bottom:8px;flex-shrink:0;flex-wrap:wrap}
     button{background:#e94560;color:#fff;border:none;padding:6px 14px;
-           border-radius:5px;font-size:0.8em;cursor:pointer}
+           border-radius:5px;font-size:0.8em;cursor:pointer;min-height:44px;min-width:64px}
     button.inactive{background:#0f3460}
     #status{font-size:0.75em;color:#888;margin-left:auto;align-self:center}
     #log{flex:1;background:#0a0a1a;border:1px solid #0f3460;border-radius:6px;
@@ -2250,12 +3146,24 @@ const char HTML_LOG[] PROGMEM = R"rawliteral(
   <h1>&#128220; Serial Log</h1>
   <nav><a href="/">&#8592; Dashboard</a></nav>
   <div class="toolbar">
-    <button id="btnPause" onclick="togglePause()">Pause</button>
-    <button onclick="clearLog()">Clear</button>
-    <span id="status">Connecting...</span>
+    <button type="button" id="btnPause" onclick="togglePause()">Pause</button>
+    <button type="button" onclick="clearLog()">Clear</button>
+    <span id="status" role="status" aria-live="polite">Connecting...</span>
   </div>
+  <div style="font-size:0.72em;color:#888;margin-bottom:6px">Served over plain
+    HTTP on port 80; with HTTPS enabled this page needs its own login.</div>
   <div id="log"></div>
   <script>
+    // /api/log/stream is registered on port 80 only — the IDF TLS server has
+    // no long-lived SSE story. Keep the stream on http:// if this page was
+    // somehow loaded over TLS, and fix the nav links for the same reason.
+    var httpBase = (location.protocol === 'https:') ? 'http://' + location.hostname : '';
+    if (location.protocol === 'https:') {
+      document.querySelectorAll('nav a[href="/log"], nav a[href="/update"]').forEach(function(a){
+        a.href = 'http://' + location.hostname + a.getAttribute('href');
+      });
+    }
+
     var paused   = false;
     var autoScroll = true;
     var logEl    = document.getElementById('log');
@@ -2285,14 +3193,19 @@ const char HTML_LOG[] PROGMEM = R"rawliteral(
     }
 
     var lastEvt = 0;
+    var esFails = 0;        // consecutive failed/aborted connections
+    var esDead  = false;    // true once we've stopped retrying
+    var MAX_ES_FAILS = 5;
 
     function connect() {
+      if (esDead) return;
       if (es) es.close();
-      es = new EventSource('/api/log/stream');
+      es = new EventSource(httpBase + '/api/log/stream');
       lastEvt = Date.now();
 
       es.onopen = function() {
         statusEl.textContent = 'Connected';
+        esFails = 0;            // a successful open clears the retry budget
         lastEvt = Date.now();
       };
 
@@ -2306,11 +3219,35 @@ const char HTML_LOG[] PROGMEM = R"rawliteral(
       // Not shown in the log — it only feeds the staleness watchdog below.
       es.addEventListener('ping', function() { lastEvt = Date.now(); });
 
+      // UX-6: EventSource hides the HTTP status, so a 401 (session expired)
+      // is indistinguishable here from a dropped link — it just errors. The
+      // pre-flight below catches the 401 case; this only has to stop the
+      // endless 3 s retry loop that otherwise hammers the ESP32 forever.
       es.onerror = function() {
-        statusEl.textContent = 'Reconnecting...';
         es.close();
+        if (++esFails >= MAX_ES_FAILS) {
+          esDead = true;
+          statusEl.textContent = 'Disconnected — reload to retry';
+          return;
+        }
+        statusEl.textContent = 'Reconnecting... (' + esFails + '/' + MAX_ES_FAILS + ')';
         setTimeout(connect, 3000);
       };
+    }
+
+    // UX-6: pre-flight the session before opening the stream. /api/status is
+    // the cheapest authenticated GET and answers 401 with a readable status,
+    // which EventSource would have swallowed.
+    function startLog() {
+      fetch(httpBase + '/api/status', {credentials:'same-origin'})
+        .then(function(r){
+          if (r.status === 401) { window.location.href = (httpBase || '') + '/login'; return; }
+          // Any other status (including a cross-origin failure on the
+          // https: → http: hop) is not proof of a dead session — try the
+          // stream anyway and let the retry cap above handle it.
+          connect();
+        })
+        .catch(function(){ connect(); });
     }
 
     // Staleness watchdog: a half-open TCP stream (WiFi drop, device reboot,
@@ -2318,6 +3255,7 @@ const char HTML_LOG[] PROGMEM = R"rawliteral(
     // forever — onerror never fires. With server pings every 20 s, more than
     // 45 s of total silence means the stream is dead: force a reconnect.
     setInterval(function() {
+      if (esDead) return;
       if (es && lastEvt && Date.now() - lastEvt > 45000) {
         statusEl.textContent = 'Stale - reconnecting...';
         connect();
@@ -2338,7 +3276,7 @@ const char HTML_LOG[] PROGMEM = R"rawliteral(
       autoScroll = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 5;
     });
 
-    connect();
+    startLog();
   </script>
 </body>
 </html>
@@ -2599,9 +3537,44 @@ struct AuthSession {
   char          token[33];     // 32 hex + NUL; token[0]=='\0' → slot free
   unsigned long lastUsedMs;
   bool          persistent;    // true → "keep me signed in": NVS-backed, no idle expiry
+  uint32_t      mintedEpoch;   // SEC-5: wall-clock mint time, 0 = unknown (no NTP)
 };
 static const int           MAX_SESSIONS              = 4;
 static const unsigned long SESSION_IDLE_TIMEOUT_MS   = 6UL * 60UL * 60UL * 1000UL; // 6 h
+
+// SEC-5(a) — absolute lifetime cap for "keep me signed in" sessions.
+//
+// Persistent sessions have no idle timeout and survive reboots, so without
+// this they lived forever. millis() can't express that (it restarts at every
+// power-on, which on this device is every charge session), so the cap is
+// measured in WALL-CLOCK time: the mint epoch is stored next to the token in
+// NVS as "token:epoch" and checked against time(nullptr) on load and on every
+// touch. Anything older than 30 days is forgotten.
+//
+// Documented limitation: if NTP never becomes valid — an AP-mode-only device,
+// or a LAN with no route out — time(nullptr) stays near 0, no epoch can be
+// recorded or compared, and persistent sessions do NOT expire. That is the
+// pre-existing behaviour, not a regression; logout, eviction, the BOOT-button
+// WiFi reset and factory reset all still clear them.
+static const uint32_t SESSION_PERSIST_MAX_AGE_S = 30UL * 24UL * 60UL * 60UL;  // 30 days
+// time(nullptr) below this means the clock was never set (NTP not yet valid).
+static const uint32_t NTP_EPOCH_VALID_MIN = 1000000000UL;  // 2001-09-09
+
+// Current wall-clock epoch, or 0 when the clock has not been set by NTP yet.
+static uint32_t authNowEpoch() {
+  time_t t = time(nullptr);
+  return ((uint32_t)t >= NTP_EPOCH_VALID_MIN) ? (uint32_t)t : 0;
+}
+
+// True when `mintedEpoch` is old enough that the session must be dropped.
+// Returns false whenever either clock reading is unavailable — fail open on
+// time, never on credentials.
+static bool authPersistExpired(uint32_t mintedEpoch) {
+  if (mintedEpoch == 0) return false;
+  uint32_t now = authNowEpoch();
+  if (now == 0) return false;
+  return (now > mintedEpoch) && ((now - mintedEpoch) > SESSION_PERSIST_MAX_AGE_S);
+}
 static AuthSession         authSessions[MAX_SESSIONS];
 
 // Set-Cookie Max-Age values. Short = ordinary login (6 h, matches the RAM
@@ -2654,18 +3627,20 @@ static inline void settingsUnlock() {
 static volatile bool mqttReconnectRequested = false;
 
 // ---------------------------------------------------------------------------
-// Capped request-body collection for port-80 POST routes (audit 2026-07).
+// Capped request-body collection for port-80 POST routes (audit 2026-07,
+// reworked into RawBodyHandler 2026-09 — SEC-1).
 //
 // The Arduino WebServer's default body handling malloc()s the ENTIRE request
 // body (Content-Length sized) into RAM before the route handler — and thus
 // its auth check — ever runs, so an unauthenticated client could POST a huge
 // body and force large allocations. Every body-consuming POST/DELETE route is
-// therefore registered with rawBodyCollect() as its "upload" function: on
-// ESP32 core 3.x that flips the route into RAW streaming mode, where the body
-// arrives in fixed ~1.4 KB chunks and we accumulate at most RAW_BODY_CAP
-// bytes. Anything larger is drained off the socket through the fixed chunk
-// buffer and discarded; the completion handler answers 413. Unmatched URIs
-// are covered by WebBodyGuardHandler (registered last in setup()).
+// therefore served by RawBodyHandler (defined next to OtaUpdateHandler, near
+// setup()), which declares canRaw and collects the body in RAW streaming mode:
+// it arrives in fixed ~1.4 KB chunks and we accumulate at most RAW_BODY_CAP
+// bytes into g_rawBody. Anything larger is drained off the socket through the
+// fixed chunk buffer and discarded; the completion handler answers 413.
+// Unmatched URIs are covered by WebBodyGuardHandler (registered last in
+// setup()).
 //
 // Side effect of RAW mode: the WebServer no longer parses the body into
 // server.arg() — completion handlers read g_rawBody directly (JSON routes)
@@ -2676,47 +3651,19 @@ static volatile bool mqttReconnectRequested = false;
 // Single-threaded by construction: the WebServer serves one client at a time
 // from loop(), so one static buffer suffices. RAW_START resets it per request.
 //
-// Residual gap (can't be closed at sketch level): multipart/form-data bodies
-// bypass RAW mode entirely — the core's _parseForm() accumulates non-file
-// field VALUES into an unbounded String (Parsing.cpp). File parts are safe
-// (streamed and discarded without a canUpload handler). Closing it would
-// mean patching the bundled WebServer library; accepted for a LAN device
-// whose worst case is a heap-pressure reboot into charging-off defaults.
+// multipart/form-data on these routes: RawBodyHandler::canUpload() returns
+// false, so the core streams-and-discards the parts and RawBodyHandler::handle()
+// answers 415 without ever invoking the route function. That both closes the
+// SEC-1 null-deref (see the class comment) and keeps the route from acting on
+// a body it never captured. The core's _parseForm() still buffers non-file
+// FIELD values into an unbounded String before handle() runs — that residual
+// heap-pressure gap can only be closed by patching the bundled WebServer
+// library; accepted for a LAN device whose worst case is a reboot into
+// charging-off defaults.
 // ---------------------------------------------------------------------------
 static const size_t RAW_BODY_CAP = 8192;
 static String g_rawBody;
 static bool   g_rawTooLarge = false;
-
-static void rawBodyCollect() {
-  HTTPRaw& r = server.raw();
-  switch (r.status) {
-    case RAW_START: {
-      int cl = server.clientContentLength();
-      g_rawBody     = String();
-      g_rawTooLarge = (cl > (int)RAW_BODY_CAP);
-      if (!g_rawTooLarge && cl > 0) g_rawBody.reserve(cl + 1);
-      break;
-    }
-    case RAW_WRITE:
-      if (!g_rawTooLarge) {
-        if (g_rawBody.length() + r.currentSize > RAW_BODY_CAP) {
-          // Body exceeded the cap despite the Content-Length check (lying
-          // header). Flip to discard mode; chunks keep draining harmlessly.
-          g_rawTooLarge = true;
-          g_rawBody = String();
-        } else {
-          g_rawBody.concat((const char*)r.buf, r.currentSize);
-        }
-      }
-      break;
-    case RAW_END:
-      break;
-    case RAW_ABORTED:
-      g_rawBody     = String();
-      g_rawTooLarge = false;
-      break;
-  }
-}
 
 // Standardised response strings for the locked / rate-limited paths so both
 // HTTP and HTTPS handlers say the same thing.
@@ -2726,6 +3673,84 @@ static const char* AUTH_LOCK_MSG =
   "reboot the device, or wait for the cooldown to expire.\n";
 static const char* AUTH_RATE_LIMIT_MSG =
   "Too many failed attempts. Please wait and try again.\n";
+
+// UX-10 — the 423 (hard lock) and 429 (rate limit) responses used to be raw
+// text/plain dumps of the two constants above: a white page of unstyled text
+// with no indication of how long the wait actually is, reached from a styled
+// login form. Both paths now re-render HTML_LOGIN with a banner that states
+// the reason AND the countdown, taken from the same value that populates the
+// Retry-After header, so the page and the header can never disagree. Status
+// codes and headers are unchanged — only the body is.
+//
+// Size of the buffer the fragment is built into. The widest fragment is the
+// hard-lock one at 251 bytes: AUTH_LOCK_MSG's 179 plus 72 of headline and
+// markup. 320 leaves comfortable headroom without pretending to a budget the
+// page buffer cannot honour (D6 — the earlier 384 paired with a 2048-byte page
+// buffer described an invariant that was arithmetically false: HTML_LOGIN
+// alone formats to ~1668 bytes, so 2048 could not have absorbed a 384-byte
+// fragment. The page buffers are 2304 for exactly that reason: 1668 + 320
+// = 1988, with 316 to spare. The handlers check snprintf's return anyway —
+// see AUTH_PAGE_BUF below — so a future edit to either constant or to the page
+// itself gets a log line instead of a silently half-rendered form.)
+static const size_t AUTH_FRAG_BUF = 320;
+// Size of the buffer the whole login page is formatted into. See the
+// arithmetic above; keep the two in step if HTML_LOGIN grows.
+static const size_t AUTH_PAGE_BUF = 2304;
+
+// Render a Retry-After second count as something a human reads at a glance.
+// Under a minute stays in seconds; a minute-plus but under two shows both
+// parts; anything longer rounds UP to whole minutes (the tail of a 15-minute
+// hard lock reads "15 min", not "14 min 57 s" — the extra precision is noise,
+// and rounding up is what guarantees the page never advises coming back before
+// the lock has actually cleared).
+static void authFormatRetry(char* out, size_t outSz, unsigned long sec) {
+  if (sec == 0)        snprintf(out, outSz, "a moment");
+  else if (sec < 60)   snprintf(out, outSz, "%lu s", sec);
+  else if (sec < 120)  snprintf(out, outSz, "1 min %lu s", sec - 60);
+  else                 snprintf(out, outSz, "%lu min", (sec + 59) / 60);
+}
+
+// Build the login-page error fragment for a locked / rate-limited response.
+// Every byte written here is a firmware constant or a number this device
+// computed — no request data reaches it, which is why HTML_LOGIN can stay
+// escaping-free. `hardLocked` picks the 423 wording, otherwise the 429 one.
+static void authBuildRetryFrag(char* out, size_t outSz, bool hardLocked,
+                               unsigned long retrySec) {
+  char when[32];
+  authFormatRetry(when, sizeof(when), retrySec);
+  if (hardLocked)
+    snprintf(out, outSz,
+             "<p class='err'>&#128274; Locked &mdash; try again in %s.</p>"
+             "<p class='hint'>%s</p>", when, AUTH_LOCK_MSG);
+  else
+    snprintf(out, outSz,
+             "<p class='err'>&#9203; Too many attempts &mdash; try again in %s.</p>"
+             "<p class='hint'>%s</p>", when, AUTH_RATE_LIMIT_MSG);
+}
+
+// Format HTML_LOGIN into `out` around the given fragment. Single point of
+// truth for the truncation check (D6) so all four login handlers — HTTP and
+// HTTPS, GET and POST — get it without four copies that could drift apart.
+// A truncated page is a half-rendered form, which fails in a confusing way for
+// the user and silently for us; the log line is what makes it diagnosable.
+static void authRenderLoginPage(char* out, size_t outSz, const char* frag) {
+  int n = snprintf(out, outSz, HTML_LOGIN, frag);
+  if (n < 0 || (size_t)n >= outSz)
+    LOG("[AUTH] login page truncated (%d)\n", n);
+}
+
+// D16 — buffers the HTTPS login handlers format into, deliberately NOT on the
+// stack. esp_http_server services requests from a single worker task, one at a
+// time, so the two HTTPS login handlers can never run concurrently and one
+// shared pair is safe. Worth the ~2.6 KB of BSS because cfg.httpd.stack_size is
+// 10240 and the live TLS session already sits on that stack — the page
+// formatting is the part that does not need to be there. The HTTP twins keep
+// their buffers automatic: loopTask has the room and no TLS state competing
+// for it.
+// ASSUMPTION: single httpd worker task. If esp_http_server is ever configured
+// for more than one, these must go back on the stack or gain a mutex.
+static char g_httpsLoginPage[AUTH_PAGE_BUF];
+static char g_httpsLoginFrag[AUTH_FRAG_BUF];
 
 // LoginOutcome / LoginResult — returned by tryLogin(). Definitions live in
 // auth_types.h to dodge the Arduino IDE 2.x auto-prototype generator (which
@@ -2941,6 +3966,12 @@ static String sessionParseCookieToken() {
   return sessionParseCookieTokenStr(server.header("Cookie"));
 }
 
+// Forward declaration — the touch path below re-syncs NVS when it drops a
+// persistent session that hit the 30-day cap, and the definition sits further
+// down. The Arduino IDE's auto-prototype pass does not emit prototypes for
+// `static` free functions, so this has to be written out by hand.
+static void sessionsPersistToNvs_nolock();
+
 // Core session-touch logic — takes a token string directly. Internal — caller
 // must hold authMutex. The public wrapper below takes the lock.
 static bool sessionTouchOrFailToken_nolock(const String& token) {
@@ -2949,14 +3980,35 @@ static bool sessionTouchOrFailToken_nolock(const String& token) {
   for (int i = 0; i < MAX_SESSIONS; i++) {
     if (authSessions[i].token[0] == '\0') continue;
     // Lazy expiry sweep — persistent ("keep me signed in") sessions never
-    // idle-expire; they live until logout, eviction, or factory reset.
+    // idle-expire; they live until logout, eviction, factory reset, or the
+    // 30-day absolute cap below.
     if (!authSessions[i].persistent &&
         (now - authSessions[i].lastUsedMs) > SESSION_IDLE_TIMEOUT_MS) {
       authSessions[i].token[0] = '\0';
       continue;
     }
+    // SEC-5(a): absolute age cap for persistent sessions, wall-clock based.
+    if (authSessions[i].persistent &&
+        authPersistExpired(authSessions[i].mintedEpoch)) {
+      authSessions[i].token[0]   = '\0';
+      authSessions[i].persistent = false;
+      LOG("[AUTH] Session slot %d expired (30-day cap for remembered device)\n", i);
+      sessionsPersistToNvs_nolock();   // drop it from the NVS copy too
+      continue;
+    }
     if (authConstTimeTokenEqual(token.c_str(), authSessions[i].token)) {
       authSessions[i].lastUsedMs = now;
+      // SEC-5(a): a persistent session with no mint epoch came either from a
+      // pre-SEC-5 NVS blob or from a mint that happened before NTP was up.
+      // Stamp it the first time we see a valid clock so its 30-day cap starts
+      // ticking instead of never applying.
+      if (authSessions[i].persistent && authSessions[i].mintedEpoch == 0) {
+        uint32_t nowEpoch = authNowEpoch();
+        if (nowEpoch != 0) {
+          authSessions[i].mintedEpoch = nowEpoch;
+          sessionsPersistToNvs_nolock();
+        }
+      }
       return true;
     }
   }
@@ -2992,7 +4044,10 @@ static bool sessionTouchOrFailStr(const String& cookieHeader) {
 // Eviction prefers the oldest NON-persistent slot, so a "keep me signed in"
 // device isn't silently kicked out by an ordinary login on another device.
 // Only if every slot is persistent does it evict the oldest persistent one.
-static void sessionMint_nolock(char* outToken, bool persistent) {
+//
+// Returns the slot index used, so the caller can log which slot was minted
+// without logging any part of the token itself (SEC-12).
+static int sessionMint_nolock(char* outToken, bool persistent) {
   unsigned long now = millis();
   int           slot         = -1;
   unsigned long oldestAny    = ULONG_MAX;  int oldestAnySlot = 0;
@@ -3021,22 +4076,33 @@ static void sessionMint_nolock(char* outToken, bool persistent) {
     snprintf(&tmp[i * 2], 3, "%02x", b);
   }
   tmp[32] = '\0';
-  authSessions[slot].lastUsedMs = now;
-  authSessions[slot].persistent = persistent;
+  authSessions[slot].lastUsedMs  = now;
+  authSessions[slot].persistent  = persistent;
+  authSessions[slot].mintedEpoch = authNowEpoch();  // 0 when NTP isn't up yet
   memcpy(authSessions[slot].token, tmp, 33);  // publishes new token
   strncpy(outToken, tmp, 33);
+  return slot;
 }
 
 // Write every persistent session token to NVS as one comma-joined blob.
 // Internal — caller must hold authMutex. Called after any mint or after a
 // persistent slot is cleared, so the NVS copy always matches the RAM table.
 // NVS putString() de-dups identical writes, so a redundant call is cheap.
+//
+// Entry format (SEC-5a): "<32-hex token>:<mint epoch>", or the bare token when
+// no epoch is known. Writing the bare form in that case keeps the blob
+// byte-identical to what pre-SEC-5 builds wrote, and sessionsLoadFromNvs()
+// accepts both, so the two formats interoperate in either direction.
 static void sessionsPersistToNvs_nolock() {
   String blob;
   for (int i = 0; i < MAX_SESSIONS; i++) {
     if (authSessions[i].token[0] != '\0' && authSessions[i].persistent) {
       if (blob.length()) blob += ',';
       blob += authSessions[i].token;
+      if (authSessions[i].mintedEpoch != 0) {
+        blob += ':';
+        blob += String((unsigned long)authSessions[i].mintedEpoch);
+      }
     }
   }
   preferences.putString(NVS_KEY_AUTH_SESS, blob);
@@ -3044,27 +4110,89 @@ static void sessionsPersistToNvs_nolock() {
 
 // Restore persistent session tokens from NVS into the RAM table. Called once
 // from setup() before any server task starts — single-threaded, so no lock.
+//
+// SEC-5(a): each entry may be "token" (written by an older build) or
+// "token:epoch". Entries past the 30-day cap are dropped here rather than
+// loaded; entries with no epoch are stamped with the CURRENT epoch, so an
+// upgrade starts their 30-day clock from first boot on the new firmware
+// instead of expiring them all at once.
+//
+// B7 — when the work here actually happens: this runs early in setup(), long
+// before SNTP has answered, so authNowEpoch() returns a usable value only on a
+// WARM restart, where the RTC kept running and libc's clock is already set
+// (software reset, OTA reboot, settings-save reboot). On a COLD boot the clock
+// starts at 0, nothing can be compared or stamped here, and the work falls to
+// the touch path instead: sessionTouchOrFailToken_nolock() stamps a 0-epoch
+// persistent session and drops an over-age one the first time it is used after
+// NTP becomes valid. Either way an expired remembered device stops working
+// within one request of the clock being right; this function is just the early
+// opportunity, not the only one.
 static void sessionsLoadFromNvs() {
   String blob = preferences.getString(NVS_KEY_AUTH_SESS, "");
   if (blob.length() == 0) return;
-  unsigned long now = millis();
-  int slot = 0, start = 0;
+  unsigned long now      = millis();
+  uint32_t      nowEpoch = authNowEpoch();
+  int slot = 0, start = 0, dropped = 0, malformed = 0, rewritten = 0;
   while (start < (int)blob.length() && slot < MAX_SESSIONS) {
     int comma = blob.indexOf(',', start);
     if (comma < 0) comma = blob.length();
-    String tok = blob.substring(start, comma);
-    tok.trim();
-    if (tok.length() == 32) {
-      strncpy(authSessions[slot].token, tok.c_str(), 33);
-      authSessions[slot].token[32] = '\0';
-      authSessions[slot].lastUsedMs = now;
-      authSessions[slot].persistent = true;
-      slot++;
-    }
+    String entry = blob.substring(start, comma);
+    entry.trim();
     start = comma + 1;
+    // An empty field (a stray or trailing comma) is nothing to salvage and
+    // nothing to complain about — skip it without counting it as corruption,
+    // so it can't trigger a pointless NVS rewrite on every boot.
+    if (entry.length() == 0) continue;
+
+    String   tok   = entry;
+    uint32_t epoch = 0;
+    int      colon = entry.indexOf(':');
+    if (colon >= 0) {
+      tok   = entry.substring(0, colon);
+      epoch = (uint32_t)strtoul(entry.substring(colon + 1).c_str(), nullptr, 10);
+      tok.trim();
+    }
+    // B8: length alone is not enough — mint only ever produces LOWERCASE hex,
+    // so anything else in the blob is corruption or a hand-edited NVS value.
+    // Reject it rather than load a token that can never legitimately match.
+    //
+    // C8: the test is spelled out rather than using isxdigit(), which also
+    // accepts A-F and so contradicted the comment: an uppercased copy of a real
+    // token would have loaded into a slot where the constant-time compare could
+    // never match it, silently burning one of the four session slots until the
+    // 30-day cap expired it. A rejected entry is now COUNTED, not silently
+    // skipped: the count is what forces the rewrite at the end of this
+    // function, so the junk does not survive into the next boot (and every
+    // boot after that) unnoticed.
+    bool hexOk = (tok.length() == 32);
+    for (int c = 0; c < 32 && hexOk; c++) {
+      char ch = tok.charAt(c);
+      if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))) hexOk = false;
+    }
+    if (!hexOk) { malformed++; continue; }
+
+    if (authPersistExpired(epoch)) { dropped++; continue; }
+    if (epoch == 0 && nowEpoch != 0) { epoch = nowEpoch; rewritten++; }
+
+    strncpy(authSessions[slot].token, tok.c_str(), 33);
+    authSessions[slot].token[32]   = '\0';
+    authSessions[slot].lastUsedMs  = now;
+    authSessions[slot].persistent  = true;
+    authSessions[slot].mintedEpoch = epoch;
+    slot++;
   }
   if (slot > 0)
     LOG("[AUTH] Restored %d persistent session(s) from NVS\n", slot);
+  if (dropped > 0)
+    LOG("[AUTH] Dropped %d persistent session(s) past the 30-day cap\n", dropped);
+  if (malformed > 0)
+    LOG("[AUTH] Dropped %d malformed persistent session entr%s from NVS\n",
+        malformed, malformed == 1 ? "y" : "ies");
+  // Re-sync so a dropped, malformed or freshly-stamped entry is reflected in
+  // NVS (C8 — a malformed entry used to be skipped without being counted, so
+  // it stayed in the blob and was re-parsed and re-rejected on every boot).
+  // Runs single-threaded from setup(), so the _nolock form is correct here.
+  if (dropped > 0 || malformed > 0 || rewritten > 0) sessionsPersistToNvs_nolock();
 }
 
 // Invalidate the session matching the given token string. Internal — caller
@@ -3075,8 +4203,9 @@ static void sessionForgetToken_nolock(const String& token) {
     if (authSessions[i].token[0] != '\0' &&
         authConstTimeTokenEqual(token.c_str(), authSessions[i].token)) {
       bool wasPersistent = authSessions[i].persistent;
-      authSessions[i].token[0]   = '\0';
-      authSessions[i].persistent = false;
+      authSessions[i].token[0]    = '\0';
+      authSessions[i].persistent  = false;
+      authSessions[i].mintedEpoch = 0;
       LOG("[AUTH] Session slot %d invalidated by logout\n", i);
       // Drop it from the NVS copy too, so it doesn't come back on reboot.
       if (wasPersistent) sessionsPersistToNvs_nolock();
@@ -3100,6 +4229,37 @@ static void sessionForgetCurrent() {
 // HTTPS-path variant.
 static void sessionForgetStr(const String& cookieHeader) {
   sessionForgetToken(sessionParseCookieTokenStr(cookieHeader));
+}
+
+// SEC-5(b) — invalidate EVERY session, RAM table and NVS copy alike.
+//
+// Used by the BOOT-button 5-10 s "clear WiFi creds" hold. That gesture is how
+// a user hands the device to someone else or recovers it from a network they
+// no longer control, and leaving remembered ("keep me signed in") sessions
+// alive across it meant the previous owner's browser cookie still opened the
+// dashboard on the new network. Factory reset (10 s+) already cleared them via
+// preferences.clear(); this makes the 5-10 s hold consistent with it.
+//
+// Takes authMutex itself. Safe to call from loopTask.
+static void sessionsClearAll(const char* reason) {
+  if (!authLock()) {
+    // Can't take the lock (should be impossible) — still drop the NVS copy so
+    // nothing comes back after the reboot that follows this call.
+    preferences.remove(NVS_KEY_AUTH_SESS);
+    LOG("[AUTH] Session clear (%s): mutex busy, NVS copy removed only\n", reason);
+    return;
+  }
+  int cleared = 0;
+  for (int i = 0; i < MAX_SESSIONS; i++) {
+    if (authSessions[i].token[0] != '\0') cleared++;
+    authSessions[i].token[0]    = '\0';
+    authSessions[i].persistent  = false;
+    authSessions[i].mintedEpoch = 0;
+  }
+  preferences.remove(NVS_KEY_AUTH_SESS);
+  authUnlock();
+  LOG("[AUTH] All %d session(s) invalidated and NVS copy removed (%s)\n",
+      cleared, reason);
 }
 
 // Gate a request on a valid session. Used by every protected handler.
@@ -3240,7 +4400,7 @@ static LoginOutcome tryLogin(const String& username, const String& password,
   // reach this branch, so it only ever forgives the owner's own typos.
   authGlobalFails       = 0;
   authGlobalWindowStart = 0;
-  sessionMint_nolock(out.token, remember);
+  int mintedSlot = sessionMint_nolock(out.token, remember);
   // Always re-sync NVS after a mint: writes the persistent set if `remember`,
   // and also catches the case where minting evicted a persistent slot.
   // putString() de-dups identical blobs so a no-op call costs nothing.
@@ -3250,8 +4410,13 @@ static LoginOutcome tryLogin(const String& username, const String& password,
   if (prevFails > 0) {
     LOG("[AUTH] Login OK — clearing fail counter (was %d)\n", (int)prevFails);
   }
-  LOG("[AUTH] Login OK — session minted (token ...%s, %s)\n",
-      out.token + 26, remember ? "persistent" : "6 h");
+  // SEC-12: no part of the token goes in the log. The serial console and the
+  // /log SSE stream are both readable by anyone who can already reach them,
+  // but the log buffer also survives in RAM and gets pasted into bug reports —
+  // and 6 of 32 hex characters is 6 characters an attacker no longer has to
+  // guess. The slot index identifies the session just as well for debugging.
+  LOG("[AUTH] Login OK — session minted in slot %d (%s)\n",
+      mintedSlot, remember ? "persistent" : "6 h");
   out.result = LOGIN_OK;
   return out;
 }
@@ -3305,20 +4470,28 @@ void handleLoginGet() {
     return;
   }
 
+  // HTML_LOGIN formats to ~1668 bytes; the widest fragment is 251. See
+  // AUTH_PAGE_BUF / AUTH_FRAG_BUF for the arithmetic. authRenderLoginPage()
+  // logs if this ever stops being true.
+  char buf[AUTH_PAGE_BUF];
+
   unsigned long lockRemSec = 0;
   if (peekLockStatus(webClientIp(), lockRemSec)) {
     char retryHdr[16];
     snprintf(retryHdr, sizeof(retryHdr), "%lu", lockRemSec);
     server.sendHeader("Retry-After", retryHdr);
-    server.send(423, "text/plain", AUTH_LOCK_MSG);
+    // UX-10: styled page, same 423 and same Retry-After as before.
+    char frag[AUTH_FRAG_BUF];
+    authBuildRetryFrag(frag, sizeof(frag), /*hardLocked=*/true, lockRemSec);
+    authRenderLoginPage(buf, sizeof(buf), frag);
+    server.send(423, "text/html; charset=utf-8", buf);
     return;
   }
 
   const char* errFrag = server.hasArg("err")
     ? "<p class='err'>&#10006; Invalid username or password.</p>"
     : "";
-  char buf[2048];   // HTML_LOGIN is ~1300 bytes formatted; was 1100 — truncated mid-form
-  snprintf(buf, sizeof(buf), HTML_LOGIN, errFrag);
+  authRenderLoginPage(buf, sizeof(buf), errFrag);
   server.send(200, "text/html; charset=utf-8", buf);
 }
 
@@ -3331,7 +4504,7 @@ void handleLoginPost() {
     return;
   }
 
-  // RAW body mode (rawBodyCollect): the WebServer no longer parses the
+  // RAW body mode (RawBodyHandler): the WebServer no longer parses the
   // urlencoded form into server.arg() — parse the capped g_rawBody here with
   // the same helpers the HTTPS path uses. An oversized body yields empty
   // credentials, which fail closed through tryLogin.
@@ -3355,17 +4528,22 @@ void handleLoginPost() {
   char cookieHdr[140];
 
   switch (o.result) {
+    // UX-10: one arm for both refusals — identical mechanics, the only
+    // differences are the status code and the wording, and both are derived
+    // from o.result. Status codes (423 / 429) and Retry-After are unchanged;
+    // the body is now the styled login page carrying the same countdown.
     case LOGIN_HARD_LOCKED:
+    case LOGIN_RATE_LIMITED: {
+      const bool hardLocked = (o.result == LOGIN_HARD_LOCKED);
       snprintf(retryHdr, sizeof(retryHdr), "%lu", o.retryAfterSec);
       server.sendHeader("Retry-After", retryHdr);
-      server.send(423, "text/plain", AUTH_LOCK_MSG);
+      char frag[AUTH_FRAG_BUF];
+      authBuildRetryFrag(frag, sizeof(frag), hardLocked, o.retryAfterSec);
+      char page[AUTH_PAGE_BUF];
+      authRenderLoginPage(page, sizeof(page), frag);
+      server.send(hardLocked ? 423 : 429, "text/html; charset=utf-8", page);
       return;
-
-    case LOGIN_RATE_LIMITED:
-      snprintf(retryHdr, sizeof(retryHdr), "%lu", o.retryAfterSec);
-      server.sendHeader("Retry-After", retryHdr);
-      server.send(429, "text/plain", AUTH_RATE_LIMIT_MSG);
-      return;
+    }
 
     case LOGIN_BAD_CREDS:
       // Redirect back to the form with an error flag rather than re-serving
@@ -3397,6 +4575,14 @@ void handleLoginPost() {
 // POST (not GET) so that link previews / prefetchers don't accidentally
 // log the user out.
 void handleLogout() {
+  // SEC-8 — no state changes without a valid token, and nothing is logged in
+  // that case. sessionForgetCurrent() → sessionForgetToken_nolock() returns
+  // immediately unless the cookie carries a 32-char token that constant-time
+  // matches a live slot; only that branch clears a slot, re-writes NVS and
+  // emits the "[AUTH] Session slot N invalidated by logout" line. An
+  // unauthenticated POST /logout therefore just gets the cookie-clear and the
+  // page below, which is the correct response for a browser holding a stale or
+  // forged cookie.
   sessionForgetCurrent();
   // Clear the cookie and return a 200 page — NOT a redirect.
   // A redirect to /login would be followed by the browser's cached Digest
@@ -3472,19 +4658,25 @@ static void httpsHandleLoginGet(HttpCtx& ctx) {
     ctx.send(302, "text/plain", "");
     return;
   }
+  // D16 — shared static buffers, not stack: the TLS session already occupies
+  // much of this task's 10240-byte stack. See g_httpsLoginPage.
   unsigned long lockRemSec = 0;
   if (peekLockStatus(idfClientIp(ctx.idfReq), lockRemSec)) {
     char retryHdr[16];
     snprintf(retryHdr, sizeof(retryHdr), "%lu", lockRemSec);
     ctx.addRespHdr("Retry-After", String(retryHdr));
-    ctx.send(423, "text/plain", AUTH_LOCK_MSG);
+    // UX-10 — same styled 423 page as the HTTP twin (handleLoginGet).
+    authBuildRetryFrag(g_httpsLoginFrag, sizeof(g_httpsLoginFrag),
+                       /*hardLocked=*/true, lockRemSec);
+    authRenderLoginPage(g_httpsLoginPage, sizeof(g_httpsLoginPage),
+                        g_httpsLoginFrag);
+    ctx.send(423, "text/html; charset=utf-8", String(g_httpsLoginPage));
     return;
   }
   const char* errFrag = ctx.hasArg("err")
     ? "<p class='err'>&#10006; Invalid username or password.</p>" : "";
-  char buf[2048];   // HTML_LOGIN is ~1300 bytes formatted; was 1100 — truncated mid-form
-  snprintf(buf, sizeof(buf), HTML_LOGIN, errFrag);
-  ctx.send(200, "text/html; charset=utf-8", String(buf));
+  authRenderLoginPage(g_httpsLoginPage, sizeof(g_httpsLoginPage), errFrag);
+  ctx.send(200, "text/html; charset=utf-8", String(g_httpsLoginPage));
 }
 
 // POST /login (HTTPS) — uses the same tryLogin() helper as the HTTP path.
@@ -3512,17 +4704,21 @@ static void httpsHandleLoginPost(HttpCtx& ctx) {
   char cookieHdr[160];
 
   switch (o.result) {
+    // UX-10 — mirrors handleLoginPost: one arm, both status codes preserved.
     case LOGIN_HARD_LOCKED:
+    case LOGIN_RATE_LIMITED: {
+      const bool hardLocked = (o.result == LOGIN_HARD_LOCKED);
       snprintf(retryHdr, sizeof(retryHdr), "%lu", o.retryAfterSec);
       ctx.addRespHdr("Retry-After", String(retryHdr));
-      ctx.send(423, "text/plain", AUTH_LOCK_MSG);
+      // D16 — shared static buffers (see g_httpsLoginPage).
+      authBuildRetryFrag(g_httpsLoginFrag, sizeof(g_httpsLoginFrag),
+                         hardLocked, o.retryAfterSec);
+      authRenderLoginPage(g_httpsLoginPage, sizeof(g_httpsLoginPage),
+                          g_httpsLoginFrag);
+      ctx.send(hardLocked ? 423 : 429, "text/html; charset=utf-8",
+               String(g_httpsLoginPage));
       return;
-
-    case LOGIN_RATE_LIMITED:
-      snprintf(retryHdr, sizeof(retryHdr), "%lu", o.retryAfterSec);
-      ctx.addRespHdr("Retry-After", String(retryHdr));
-      ctx.send(429, "text/plain", AUTH_RATE_LIMIT_MSG);
-      return;
+    }
 
     case LOGIN_BAD_CREDS:
       ctx.addRespHdr("Location", "/login?err=1");
@@ -3541,6 +4737,8 @@ static void httpsHandleLoginPost(HttpCtx& ctx) {
 
 // POST /logout (HTTPS)
 static void httpsHandleLogout(HttpCtx& ctx) {
+  // SEC-8: same no-token-no-state-change guarantee as handleLogout — both go
+  // through sessionForgetToken_nolock(). See the note there.
   sessionForgetStr(ctx.header("Cookie"));
   // SameSite=Lax matches the live cookie — see note in handleLogout.
   char clearHdr[160];
@@ -3578,11 +4776,18 @@ static void httpsHandleApiStatus(HttpCtx& ctx) {
 
 // GET /api/settings (HTTPS) — forward-declare builder.
 static String buildApiSettingsJson();
+// NET-13 — defined just above setup(); every ESP.restart() path calls it first
+// so the chargers are commanded STOP before the heartbeat disappears.
+// Declared here explicitly rather than relying on the IDE's auto-prototype pass,
+// which does not emit prototypes for `static` free functions.
+static void stopChargerForRestart(const char* reason);
 
 static void httpsHandleApiSettingsGet(HttpCtx& ctx) {
   if (!requireAuthCtx(ctx, true)) return;
   String json = buildApiSettingsJson();
-  ctx.send(200, "application/json", json);
+  // B9 — see handleApiSettingsGet.
+  int code = json.startsWith("{\"ok\":false") ? 500 : 200;
+  ctx.send(code, "application/json", json);
 }
 
 // POST /api/settings (HTTPS) — reuse the logic factored out of handleApiSettingsPost.
@@ -3598,16 +4803,25 @@ static void httpsHandleApiSettingsPost(HttpCtx& ctx) {
     ctx.send(400, "application/json", "{\"ok\":false,\"error\":\"No body\"}");
     return;
   }
-  bool locked = settingsLock();   // serialise vs the HTTP WebServer task (#8)
+  // NET-12: 503 rather than apply unlocked — see handleApiSettingsPost.
+  if (!settingsLock()) {   // serialise vs the HTTP WebServer task (#8)
+    ctx.send(503, "application/json", "{\"ok\":false,\"error\":\"busy, retry\"}");
+    return;
+  }
   String result = applyApiSettingsBody(ctx.body);
-  if (locked) settingsUnlock();
+  // B12: snapshot inside the lock — see handleApiSettingsPost.
+  bool needRestart = settingsNeedRestart;
+  settingsUnlock();
   // Determine HTTP status from result JSON
   int code = (result.indexOf("\"ok\":true") >= 0) ? 200 : 400;
   if (result.indexOf("\"error\":\"Payload too large\"") >= 0) code = 413;
   ctx.send(code, "application/json", result);
-  if (settingsNeedRestart) {
+  // NET-4: reboot only on a successful save — see handleApiSettingsPost.
+  if (code == 200 && needRestart) {
     LOG("[SETTINGS] Restarting for WiFi changes (TLS path)...\n");
-    delay(1500);
+    // Response is already sent above; the helper's 1.5 s wait replaces the
+    // delay that used to sit here and also lets the STOP frame go out.
+    stopChargerForRestart("settings save, HTTPS");
     ESP.restart();
   }
 }
@@ -3679,13 +4893,22 @@ static void handleApiTlsPost(HttpCtx& ctx) {
     return;
   }
   String body = ctx.isWS ? g_rawBody : ctx.body;
+  // One response sink for both transports — the HTTP and HTTPS paths differ
+  // only in which object sends the bytes.
+  auto respond = [&](int code, const char* json) {
+    if (ctx.isWS) server.send(code, "application/json", json);
+    else          ctx.send  (code, "application/json", json);
+  };
+
   DynamicJsonDocument doc(body.length() + 512);
   if (deserializeJson(doc, body)) {
-    if (ctx.isWS) server.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid JSON\"}");
-    else ctx.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid JSON\"}");
+    respond(400, "{\"ok\":false,\"error\":\"Invalid JSON\"}");
     return;
   }
 
+  // B6: there is no "changed but no reboot needed" case — both mutable fields
+  // (cert/key and the enable flag) are only read at boot — so `changed` alone
+  // decides the response and a separate rebootNeeded flag was dead weight.
   bool changed = false;
   if (doc.containsKey("cert") && doc.containsKey("key")) {
     const char* cert = doc["cert"] | "";
@@ -3697,10 +4920,7 @@ static void handleApiTlsPost(HttpCtx& ctx) {
     // leave the namespace in an indeterminate state).
     const size_t PEM_MIN = 64;
     const size_t PEM_MAX = 4096;
-    auto reject = [&](const char* msg) {
-      if (ctx.isWS) server.send(400, "application/json", msg);
-      else          ctx.send  (400, "application/json", msg);
-    };
+    auto reject = [&](const char* msg) { respond(400, msg); };
     if (certLen < PEM_MIN || certLen > PEM_MAX ||
         strstr(cert, "-----BEGIN CERTIFICATE-----") == nullptr) {
       reject("{\"ok\":false,\"error\":\"Invalid cert PEM (need BEGIN CERTIFICATE marker, 64-4096 bytes)\"}");
@@ -3719,31 +4939,57 @@ static void handleApiTlsPost(HttpCtx& ctx) {
     // Mutations under settingsLock (audit 2026-07) — this handler is reachable
     // from BOTH the WebServer task and the IDF httpd task, same as
     // /api/settings, so it must serialise the same way (#8). Validation above
-    // stays outside the lock; only the NVS writes + flag flip are inside.
-    bool locked = settingsLock();
+    // stays outside the lock; only the NVS writes are inside.
+    // NET-12: a failed lock is a hard 503 now — proceeding unlocked was the
+    // whole hazard the mutex exists to prevent.
+    if (!settingsLock()) {
+      respond(503, "{\"ok\":false,\"error\":\"busy, retry\"}");
+      return;
+    }
     preferences.putString("tls_cert", cert);
     preferences.putString("tls_key",  key);
-    if (locked) settingsUnlock();
+    settingsUnlock();
     changed = true;
     LOG("[TLS] Cert+key stored in NVS (%u / %u bytes)\n",
         (unsigned)certLen, (unsigned)keyLen);
   }
   if (doc.containsKey("enabled")) {
     bool en = doc["enabled"] | false;
-    bool locked = settingsLock();
+    if (!settingsLock()) {   // NET-12
+      respond(503, "{\"ok\":false,\"error\":\"busy, retry\"}");
+      return;
+    }
+    // SEC-15: refuse to arm HTTPS when NVS has no cert/key pair to serve it
+    // with. Without this the next boot finds "https_en" true, fails to start
+    // the TLS server, and — before g_httpsRunning existed — port 80 would
+    // still have been redirecting to a port nothing listens on. The check runs
+    // after the cert/key branch above, so uploading and enabling in one POST
+    // still works. Note this only writes the persisted INTENT: the live
+    // g_httpsRunning is set once, in setup().
+    if (en) {
+      bool haveCert = preferences.getString("tls_cert", "").length() > 0;
+      bool haveKey  = preferences.getString("tls_key",  "").length() > 0;
+      if (!haveCert || !haveKey) {
+        settingsUnlock();
+        LOG("[TLS] Refused to enable HTTPS — no cert/key in NVS\n");
+        respond(400, "{\"ok\":false,\"error\":\"upload a certificate and key first\"}");
+        return;
+      }
+    }
     httpsEnabled = en;
     preferences.putBool("https_en", en);
-    if (locked) settingsUnlock();
+    settingsUnlock();
     changed = true;
-    LOG("[TLS] HTTPS %s\n", en ? "enabled" : "disabled");
+    LOG("[TLS] HTTPS %s (takes effect on next reboot)\n", en ? "enabled" : "disabled");
   }
   if (!changed) {
-    if (ctx.isWS) server.send(400, "application/json", "{\"ok\":false,\"error\":\"No recognized fields\"}");
-    else ctx.send(400, "application/json", "{\"ok\":false,\"error\":\"No recognized fields\"}");
+    respond(400, "{\"ok\":false,\"error\":\"No recognized fields\"}");
     return;
   }
-  if (ctx.isWS) server.send(200, "application/json", "{\"ok\":true}");
-  else ctx.send(200, "application/json", "{\"ok\":true}");
+  // Anything accepted here changes only boot-time state, so the answer is
+  // always "saved, now reboot".
+  respond(200, "{\"ok\":true,\"reboot_required\":true,"
+               "\"message\":\"Saved. Reboot the controller for this to take effect.\"}");
 }
 
 // Wrapper for WebServer route registration
@@ -3839,8 +5085,16 @@ static bool startHTTPSServer(const String& cert, const String& key) {
   s_key  = key;
 
   httpd_ssl_config_t cfg = HTTPD_SSL_CONFIG_DEFAULT();
-  cfg.cacert_pem             = (const uint8_t*)s_cert.c_str();
-  cfg.cacert_len             = s_cert.length() + 1;
+  // NET-1: the SERVER certificate goes in servercert/servercert_len. In IDF
+  // 5.x cacert_pem/cacert_len is the CLIENT CA (the CA used to verify client
+  // certificates in mutual-TLS) — this code used to put the server cert there,
+  // leaving the handshake with a private key and no certificate to match it.
+  // Lengths are +1 so the trailing NUL is included, which mbedTLS requires for
+  // PEM input (same convention as prvtkey_len below).
+  cfg.servercert             = (const uint8_t*)s_cert.c_str();
+  cfg.servercert_len         = s_cert.length() + 1;
+  cfg.cacert_pem             = nullptr;   // no client-cert auth
+  cfg.cacert_len             = 0;
   cfg.prvtkey_pem            = (const uint8_t*)s_key.c_str();
   cfg.prvtkey_len            = s_key.length() + 1;
   cfg.port_secure            = 443;
@@ -3855,6 +5109,8 @@ static bool startHTTPSServer(const String& cert, const String& key) {
   }
 
   // Helper avoids C++ aggregate-init pitfalls if httpd_uri_t gains fields.
+  // NET-1: a failed registration used to be silent — the route then answered
+  // 404 over TLS with nothing in the log to explain it. Log the URI instead.
   auto reg = [&](const char* uri, httpd_method_t method,
                  esp_err_t (*handler)(httpd_req_t*)) {
     httpd_uri_t u = {};
@@ -3862,7 +5118,11 @@ static bool startHTTPSServer(const String& cert, const String& key) {
     u.method   = method;
     u.handler  = handler;
     u.user_ctx = nullptr;
-    httpd_register_uri_handler(g_httpsServer, &u);
+    esp_err_t rerr = httpd_register_uri_handler(g_httpsServer, &u);
+    if (rerr != ESP_OK) {
+      LOG("[TLS] register %s failed (%d) — route unavailable over HTTPS\n",
+          uri, (int)rerr);
+    }
   };
   reg("/",              HTTP_GET,  idf_root_get);
   reg("/settings",      HTTP_GET,  idf_settings_get);
@@ -3882,15 +5142,25 @@ static bool startHTTPSServer(const String& cert, const String& key) {
   return true;
 }
 
+// UNUSED — nothing calls this. HTTPS is only ever started once, from setup();
+// the /api/tls "enabled" toggle persists the intent and asks for a reboot
+// rather than tearing the TLS server down under live connections (SEC-15).
+// Kept as the counterpart to startHTTPSServer() should a runtime stop ever be
+// wanted; delete both together if that never happens.
+__attribute__((unused))
 static void stopHTTPSServer() {
   if (!g_httpsServer) return;
   httpd_ssl_stop(g_httpsServer);
-  g_httpsServer = nullptr;
+  g_httpsServer  = nullptr;
+  g_httpsRunning = false;
   LOG("[TLS] HTTPS server stopped\n");
 }
 
-// Port-80 redirect handler — installed as onNotFound when httpsEnabled.
-// Redirects every HTTP request to the same path on HTTPS.
+// Port-80 redirect handler — installed as onNotFound when g_httpsRunning, and
+// invoked by WebBodyGuardHandler for every port-80 URI that has no explicit
+// route. It therefore only ever sees the URIs that moved to 443; the HTTP-only
+// routes (/login, /logout, /update, /log, /api/log/stream, /save, /api/tls) are
+// registered on port 80 in both states (SEC-4/NET-2) and never land here.
 static void handleHTTPSRedirect() {
   String host = server.hostHeader();
   // Strip port number from host if present
@@ -3929,6 +5199,9 @@ static String buildApiSettingsJson() {
   // Read the shared config globals under settingsLock so we can't snapshot a
   // half-written mqttHost/apStatic*/mqttCaCert while the other server task is
   // mutating it (#8).
+  // NET-12: best-effort by design here — this is a read-only snapshot, so on a
+  // lock timeout we serve a possibly-torn field rather than fail the settings
+  // page. The mutating paths (/api/settings POST, /api/tls) answer 503 instead.
   bool locked = settingsLock();
   String ssid = preferences.getString("ssid", "");
   String aps  = preferences.getString("ap_ssid", String(apSSID));
@@ -3938,12 +5211,30 @@ static String buildApiSettingsJson() {
   bool hasApPass = (strlen(apPass) > 0 ||
                     preferences.getString("ap_pass", "").length() > 0);
 
+  // SEC-9: control characters (< 0x20) are illegal raw inside a JSON string —
+  // an SSID or MQTT username carrying one used to be copied through verbatim
+  // and broke JSON.parse() in the settings page. Escape them the way the spec
+  // does: the named forms where they exist, \u00XX otherwise.
   auto jsonEscape = [](const String& in) -> String {
     String out;
     out.reserve(in.length() + 8);
     for (unsigned int i = 0; i < in.length(); i++) {
       char c = in.charAt(i);
-      if (c == '"' || c == '\\') out += '\\';
+      if (c == '"' || c == '\\') { out += '\\'; out += c; continue; }
+      switch (c) {
+        case '\n': out += "\\n"; continue;
+        case '\r': out += "\\r"; continue;
+        case '\t': out += "\\t"; continue;
+        case '\b': out += "\\b"; continue;
+        case '\f': out += "\\f"; continue;
+        default: break;
+      }
+      if ((uint8_t)c < 0x20) {
+        char u[7];
+        snprintf(u, sizeof(u), "\\u%04x", (unsigned)(uint8_t)c);
+        out += u;
+        continue;
+      }
       out += c;
     }
     return out;
@@ -3953,6 +5244,13 @@ static String buildApiSettingsJson() {
   String jAps  = jsonEscape(aps);
   String jMh   = jsonEscape(mh);
   String jMu   = jsonEscape(mu);
+  // SEC-10: the AP address strings come from NVS and are emitted into the same
+  // JSON — escape them too. They should always be dotted quads (the POST path
+  // parse-checks them now), but a blob written by an older build or a direct
+  // NVS edit must not be able to break the document.
+  String jAip  = jsonEscape(String(apStaticIp));
+  String jAgw  = jsonEscape(String(apStaticGateway));
+  String jAsn  = jsonEscape(String(apStaticSubnet));
 
   bool   caSet   = mqttCaCert.length() > 0;
   size_t caBytes = mqttCaCert.length();
@@ -3960,7 +5258,7 @@ static String buildApiSettingsJson() {
   bool   tlsCertSet = preferences.getString("tls_cert", "").length() > 0;
 
   char buf[1100];
-  snprintf(buf, sizeof(buf),
+  int jsonLen = snprintf(buf, sizeof(buf),
     "{\"ap_mode\":%s,\"wifi_ssid\":\"%s\",\"ap_ssid\":\"%s\",\"ap_pass_set\":%s,"
     "\"ap_static_en\":%s,\"ap_ip\":\"%s\",\"ap_gw\":\"%s\",\"ap_sn\":\"%s\","
     "\"mqtt_host\":\"%s\",\"mqtt_port\":%d,\"mqtt_user\":\"%s\","
@@ -3972,7 +5270,7 @@ static String buildApiSettingsJson() {
     apIsBroadcasting() ? "true" : "false",
     jSsid.c_str(), jAps.c_str(), hasApPass ? "true" : "false",
     apStaticIpEnabled ? "true" : "false",
-    apStaticIp, apStaticGateway, apStaticSubnet,
+    jAip.c_str(), jAgw.c_str(), jAsn.c_str(),
     jMh.c_str(), (int)mqttPort, jMu.c_str(),
     mqttTls ? "true" : "false", caSet ? "true" : "false", (unsigned)caBytes,
     (int)cc, (int)ctrl.rampStepW,
@@ -3986,17 +5284,41 @@ static String buildApiSettingsJson() {
     tlsCertSet   ? "true" : "false"
   );
   if (locked) settingsUnlock();
+  // SEC-11: same guard buildApiStatusJson() carries. A long SSID / MQTT host
+  // (each up to 64 chars, and escaping can double them) can overrun buf, and
+  // snprintf would hand back a silently truncated — therefore unparseable —
+  // document that the settings page renders as a blank form.
+  if (jsonLen < 0 || jsonLen >= (int)sizeof(buf)) {
+    LOG("[WEB] settings JSON truncated (%d >= %u) — sending error stub\n",
+        jsonLen, (unsigned)sizeof(buf));
+    return String("{\"ok\":false,\"error\":\"settings buffer overflow\"}");
+  }
   return String(buf);
 }
 
 // GET /api/settings — returns current settings as JSON (protected)
 void handleApiSettingsGet() {
   if (!requireAuth(true)) return;   // API route
-  server.send(200, "application/json", buildApiSettingsJson());
+  String json = buildApiSettingsJson();
+  // B9: the overflow stub (SEC-11) is an error, not a settings document —
+  // answering 200 made it indistinguishable from real data to anything but the
+  // page's own JS. 500 is the honest code: the request was fine, we failed.
+  int code = json.startsWith("{\"ok\":false") ? 500 : 200;
+  server.send(code, "application/json", json);
 }
 
 // Apply a /api/settings JSON body. Returns a JSON ack string.
 // Sets settingsNeedRestart=true if the caller should restart after responding.
+//
+// NET-4 — two passes, strictly separated:
+//   Pass 1 parses and validates EVERY field present into locals and returns
+//          the error JSON on the first failure, having written nothing.
+//   Pass 2 commits the validated values to NVS and to the RAM globals.
+// Before this split the function wrote each field as it went and returned on
+// the first bad one, so a body with a good wifi_ssid and a bad mqtt_ca left
+// new WiFi credentials in NVS, answered 400, and — because settingsNeedRestart
+// had already been latched by the wifi_ssid branch — still rebooted the
+// controller into them. Callers additionally gate the reboot on a 200 now.
 static String applyApiSettingsBody(const String& body) {
   settingsNeedRestart = false;
 
@@ -4027,212 +5349,302 @@ static String applyApiSettingsBody(const String& body) {
 
   String err;
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // PASS 1 — parse + validate into locals. No NVS write, no global mutation,
+  // no settingsNeedRestart latch. Any `return err` here leaves the device
+  // exactly as it was.
+  // ─────────────────────────────────────────────────────────────────────────
+
   // WiFi credentials.
+  bool hasWifi = false;
+  char vSsid[65]     = {0};
+  char vWifiPass[65] = {0};
   if (doc.containsKey("wifi_ssid")) {
     const char* ssid = doc["wifi_ssid"] | "";
     if (strlen(ssid) == 0) return "{\"ok\":false,\"error\":\"SSID empty\"}";
-    char tmp[65];
-    err = copyChecked(ssid, tmp, sizeof(tmp), "wifi_ssid");
+    err = copyChecked(ssid, vSsid, sizeof(vSsid), "wifi_ssid");
     if (err.length()) return err;
-    preferences.putString("ssid", tmp);
     const char* pass = doc["wifi_pass"] | "";
-    char tmpPass[65];
-    err = copyChecked(pass, tmpPass, sizeof(tmpPass), "wifi_pass");
+    err = copyChecked(pass, vWifiPass, sizeof(vWifiPass), "wifi_pass");
     if (err.length()) return err;
-    preferences.putString("pass", tmpPass);
-    LOG("[SETTINGS] WiFi credentials saved\n");
-    settingsNeedRestart = true;
+    hasWifi = true;
   }
 
-  // AP credentials.
-  if (doc.containsKey("ap_ssid")) {
+  // AP credentials. An empty ap_ssid is ignored (kept from the original), but
+  // ap_pass is still honoured alongside it.
+  bool hasApBlock = doc.containsKey("ap_ssid");
+  bool hasApSsid  = false;
+  bool hasApPass  = false;
+  char vApSsid[sizeof(apSSID)] = {0};
+  char vApPass[sizeof(apPass)] = {0};
+  if (hasApBlock) {
     const char* aps = doc["ap_ssid"] | "";
     if (strlen(aps) > 0) {
-      char tmp[sizeof(apSSID)];
-      err = copyChecked(aps, tmp, sizeof(tmp), "ap_ssid");
+      err = copyChecked(aps, vApSsid, sizeof(vApSsid), "ap_ssid");
       if (err.length()) return err;
-      preferences.putString("ap_ssid", tmp);
-      strncpy(apSSID, tmp, sizeof(apSSID) - 1);
-      apSSID[sizeof(apSSID) - 1] = '\0';
+      hasApSsid = true;
     }
     if (doc.containsKey("ap_pass")) {
       const char* app = doc["ap_pass"] | "";
       size_t apl = strlen(app);
-      if (apl > 0 && apl < 8)
+      // SEC-6: an EMPTY ap_pass used to pass this check and then be stored,
+      // silently turning the access point open. The settings JS only sends the
+      // key when the user typed something (saveAP: `if (pass.length > 0)`), so
+      // rejecting empty costs the UI nothing — verified, no UI change needed.
+      if (apl < 8)
         return "{\"ok\":false,\"error\":\"AP password must be 8+ chars\"}";
-      char tmpPass[sizeof(apPass)];
-      err = copyChecked(app, tmpPass, sizeof(tmpPass), "ap_pass");
+      err = copyChecked(app, vApPass, sizeof(vApPass), "ap_pass");
       if (err.length()) return err;
-      preferences.putString("ap_pass", tmpPass);
-      strncpy(apPass, tmpPass, sizeof(apPass) - 1);
-      apPass[sizeof(apPass) - 1] = '\0';
+      hasApPass = true;
     }
-    LOG("[SETTINGS] AP credentials saved: \"%s\"\n", apSSID);
   }
 
   // Fixed AP-mode IP. ap_static_en gates the feature; ap_ip/ap_gw/ap_sn are
   // always persisted (even when disabled) so toggling off then on again keeps
-  // the user's typed values. IP strings are only parse-validated when the
-  // feature is being enabled.
-  if (doc.containsKey("ap_static_en")) {
-    bool        apEn = doc["ap_static_en"] | false;
-    const char* aip  = doc["ap_ip"] | "";
-    const char* agw  = doc["ap_gw"] | "";
-    const char* asn  = doc["ap_sn"] | "";
-    if (apEn) {
-      IPAddress t;
-      if (!t.fromString(aip))
-        return "{\"ok\":false,\"error\":\"AP IP address invalid\"}";
-      if (!t.fromString(agw))
-        return "{\"ok\":false,\"error\":\"AP gateway invalid\"}";
-      if (!t.fromString(asn))
-        return "{\"ok\":false,\"error\":\"AP subnet mask invalid\"}";
-    }
-    char tip[16], tgw[16], tsn[16];
-    err = copyChecked(aip, tip, sizeof(tip), "ap_ip");  if (err.length()) return err;
-    err = copyChecked(agw, tgw, sizeof(tgw), "ap_gw");  if (err.length()) return err;
-    err = copyChecked(asn, tsn, sizeof(tsn), "ap_sn");  if (err.length()) return err;
-    preferences.putBool("ap_ip_en", apEn);
-    preferences.putString("ap_ip", tip);
-    preferences.putString("ap_gw", tgw);
-    preferences.putString("ap_sn", tsn);
-    apStaticIpEnabled = apEn;
-    strncpy(apStaticIp,      tip, sizeof(apStaticIp) - 1);
-    apStaticIp[sizeof(apStaticIp) - 1] = '\0';
-    strncpy(apStaticGateway, tgw, sizeof(apStaticGateway) - 1);
-    apStaticGateway[sizeof(apStaticGateway) - 1] = '\0';
-    strncpy(apStaticSubnet,  tsn, sizeof(apStaticSubnet) - 1);
-    apStaticSubnet[sizeof(apStaticSubnet) - 1] = '\0';
-    LOG("[SETTINGS] AP fixed IP %s: %s gw %s mask %s\n",
-        apEn ? "enabled" : "disabled", tip, tgw, tsn);
+  // the user's typed values.
+  // SEC-10: each address is now parse-checked whenever it is present and
+  // non-empty, not only while enabling — storing garbage that only blows up at
+  // the next AP bring-up was a booby trap. Empty still means "not configured"
+  // and is accepted while the feature is off; enabling requires all three.
+  bool hasApStatic = doc.containsKey("ap_static_en");
+  bool vApEn = false;
+  char vAip[16] = {0}, vAgw[16] = {0}, vAsn[16] = {0};
+  if (hasApStatic) {
+    vApEn = doc["ap_static_en"] | false;
+    const char* aip = doc["ap_ip"] | "";
+    const char* agw = doc["ap_gw"] | "";
+    const char* asn = doc["ap_sn"] | "";
+    IPAddress t;
+    if ((vApEn || strlen(aip) > 0) && !t.fromString(aip))
+      return "{\"ok\":false,\"error\":\"AP IP address invalid\"}";
+    if ((vApEn || strlen(agw) > 0) && !t.fromString(agw))
+      return "{\"ok\":false,\"error\":\"AP gateway invalid\"}";
+    if ((vApEn || strlen(asn) > 0) && !t.fromString(asn))
+      return "{\"ok\":false,\"error\":\"AP subnet mask invalid\"}";
+    err = copyChecked(aip, vAip, sizeof(vAip), "ap_ip");  if (err.length()) return err;
+    err = copyChecked(agw, vAgw, sizeof(vAgw), "ap_gw");  if (err.length()) return err;
+    err = copyChecked(asn, vAsn, sizeof(vAsn), "ap_sn");  if (err.length()) return err;
   }
 
-  // MQTT settings.
-  if (doc.containsKey("mqtt_host")) {
+  // MQTT broker settings. mqtt_port / mqtt_user / mqtt_pass are only read
+  // alongside mqtt_host, as before. An out-of-range port is ignored rather
+  // than rejected — unchanged behaviour.
+  bool hasMqttHost = doc.containsKey("mqtt_host");
+  bool hasMqttPort = false, hasMqttUser = false, hasMqttPass = false;
+  char     vMqttHost[sizeof(mqttHost)]       = {0};
+  char     vMqttUser[sizeof(mqttUser)]       = {0};
+  char     vMqttPass[sizeof(mqttBrokerPass)] = {0};
+  uint16_t vMqttPort = 0;
+  if (hasMqttHost) {
     const char* mh = doc["mqtt_host"] | "";
-    char tmp[sizeof(mqttHost)];
-    err = copyChecked(mh, tmp, sizeof(tmp), "mqtt_host");
+    err = copyChecked(mh, vMqttHost, sizeof(vMqttHost), "mqtt_host");
     if (err.length()) return err;
-    preferences.putString("mqtt_host", tmp);
-    strncpy(mqttHost, tmp, sizeof(mqttHost) - 1);
-    mqttHost[sizeof(mqttHost) - 1] = '\0';
 
     int port = doc["mqtt_port"] | 0;
-    if (port > 0 && port <= 65535) {
-      preferences.putUShort("mqtt_port", (uint16_t)port);
-      mqttPort = (uint16_t)port;
-    }
+    if (port > 0 && port <= 65535) { vMqttPort = (uint16_t)port; hasMqttPort = true; }
+
     if (doc.containsKey("mqtt_user")) {
       const char* mu = doc["mqtt_user"] | "";
-      char tmpUser[sizeof(mqttUser)];
-      err = copyChecked(mu, tmpUser, sizeof(tmpUser), "mqtt_user");
+      err = copyChecked(mu, vMqttUser, sizeof(vMqttUser), "mqtt_user");
       if (err.length()) return err;
-      preferences.putString("mqtt_user", tmpUser);
-      strncpy(mqttUser, tmpUser, sizeof(mqttUser) - 1);
-      mqttUser[sizeof(mqttUser) - 1] = '\0';
+      hasMqttUser = true;
     }
     if (doc.containsKey("mqtt_pass")) {
       const char* mp = doc["mqtt_pass"] | "";
-      char tmpPass[sizeof(mqttBrokerPass)];
-      err = copyChecked(mp, tmpPass, sizeof(tmpPass), "mqtt_pass");
+      err = copyChecked(mp, vMqttPass, sizeof(vMqttPass), "mqtt_pass");
       if (err.length()) return err;
-      preferences.putString("mqtt_pass", tmpPass);
-      strncpy(mqttBrokerPass, tmpPass, sizeof(mqttBrokerPass) - 1);
-      mqttBrokerPass[sizeof(mqttBrokerPass) - 1] = '\0';
+      hasMqttPass = true;
     }
-    LOG("[SETTINGS] MQTT settings saved: %s:%d\n", mqttHost, mqttPort);
-    mqttReconnectRequested = true;  // mqttTask owns mqttClient — don't touch it here (#7)
   }
 
   // MQTT TLS toggle + CA cert.
-  bool mqttSettingsTouched = doc.containsKey("mqtt_tls") || doc.containsKey("mqtt_ca");
-  if (doc.containsKey("mqtt_ca")) {
+  bool   hasCa    = doc.containsKey("mqtt_ca");
+  bool   vCaClear = false;
+  String vCa;
+  if (hasCa) {
     const char* ca = doc["mqtt_ca"] | "";
     size_t calen = strlen(ca);
     if (calen == 0) {
-      mqttCaCert = "";
-      preferences.remove("mqtt_ca");
-      LOG("[SETTINGS] MQTT CA cert cleared\n");
+      vCaClear = true;
     } else {
       if (calen > 4096)
         return "{\"ok\":false,\"error\":\"CA cert too large (max 4 KB)\"}";
       if (!strstr(ca, "-----BEGIN CERTIFICATE-----") ||
           !strstr(ca, "-----END CERTIFICATE-----"))
         return "{\"ok\":false,\"error\":\"CA cert must be PEM (BEGIN/END markers required)\"}";
-      mqttCaCert = ca;
-      preferences.putString("mqtt_ca", mqttCaCert);
-      LOG("[SETTINGS] MQTT CA cert saved (%u bytes)\n", (unsigned)calen);
+      vCa = ca;
     }
   }
-  if (doc.containsKey("mqtt_tls")) {
-    bool tls = doc["mqtt_tls"] | false;
-    if (tls && mqttCaCert.length() == 0)
+  bool hasMqttTls = doc.containsKey("mqtt_tls");
+  bool vMqttTls   = false;
+  if (hasMqttTls) {
+    vMqttTls = doc["mqtt_tls"] | false;
+    // Validate against the CA this same body would leave in place, not just
+    // the one currently stored — upload-and-enable in one POST still works,
+    // and clear-and-enable is still refused.
+    size_t effCaLen = hasCa ? (vCaClear ? 0 : vCa.length()) : mqttCaCert.length();
+    if (vMqttTls && effCaLen == 0)
       return "{\"ok\":false,\"error\":\"Cannot enable TLS without a CA cert. Upload one first.\"}";
-    mqttTls = tls;
-    preferences.putBool("mqtt_tls", tls);
-    LOG("[SETTINGS] MQTT TLS: %s\n", tls ? "ON" : "off");
   }
-  if (mqttSettingsTouched) mqttReconnectRequested = true;  // consumed by mqttTask (#7)
 
-  // Charger count.
+  // Charger count and the two boot-default profiles. Out-of-range values are
+  // silently ignored here exactly as they were before — not an error.
+  bool    hasCc = false; uint8_t vCc = 0;
   if (doc.containsKey("charger_count")) {
     int cc = doc["charger_count"] | -1;
-    if (cc >= 1 && cc <= 4) {
-      if (xSemaphoreTake(controlMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-        ctrl.chargerCount = (uint8_t)cc;
-        xSemaphoreGive(controlMutex);
-      }
-      preferences.putUChar("charger_count", (uint8_t)cc);
-      LOG("[SETTINGS] Charger count: %d\n", cc);
-    }
+    if (cc >= 1 && cc <= 4) { vCc = (uint8_t)cc; hasCc = true; }
   }
-
-  // Boot defaults.
-  if (doc.containsKey("charging_enabled_default")) {
-    bool ce = doc["charging_enabled_default"] | false;
-    ctrl.defaultEnabled = ce;
-    preferences.putBool("def_chg_en", ce);
-    LOG("[SETTINGS] Boot charging default: %s\n", ce ? "ON" : "OFF");
-  }
+  bool    hasDefEn = doc.containsKey("charging_enabled_default");
+  bool    vDefEn   = hasDefEn ? (doc["charging_enabled_default"] | false) : false;
+  bool    hasDefPwr = false; uint8_t vDefPwr = 0;
   if (doc.containsKey("power_preset_default")) {
     int pi = doc["power_preset_default"] | -1;
-    if (pi >= 0 && pi < MAX_PRESETS_PER_ROW) {
-      ctrl.defaultPowerPresetIdx = (uint8_t)pi;
-      preferences.putUChar("def_pwr_idx", (uint8_t)pi);
-      LOG("[SETTINGS] Boot power preset index: %d\n", pi);
-    }
+    if (pi >= 0 && pi < MAX_PRESETS_PER_ROW) { vDefPwr = (uint8_t)pi; hasDefPwr = true; }
   }
+  bool    hasDefTgt = false; uint16_t vDefTgt = 0;
   if (doc.containsKey("target_volt_default")) {
     int tvd = doc["target_volt_default"] | -1;
     if (tvd >= (int)TARGET_VOLT_PRESETS[0].dv && tvd <= (int)MAX_CHARGE_VOLTAGE_DV) {
-      ctrl.defaultTargetVoltDv = (uint16_t)tvd;
-      preferences.putUShort("def_tgt_dv", (uint16_t)tvd);
-      LOG("[SETTINGS] Boot target volt default: %d dV\n", tvd);
+      vDefTgt = (uint16_t)tvd; hasDefTgt = true;
     }
   }
-
-  // Home WiFi boot defaults.
-  if (doc.containsKey("home_charging_enabled_default")) {
-    bool ce = doc["home_charging_enabled_default"] | false;
-    ctrl.homeDefaultEnabled = ce;
-    preferences.putBool("home_chg_en", ce);
-    LOG("[SETTINGS] Home boot charging default: %s\n", ce ? "ON" : "OFF");
-  }
+  bool    hasHomeEn = doc.containsKey("home_charging_enabled_default");
+  bool    vHomeEn   = hasHomeEn ? (doc["home_charging_enabled_default"] | false) : false;
+  bool    hasHomePwr = false; uint8_t vHomePwr = 0;
   if (doc.containsKey("home_power_preset_default")) {
     int pi = doc["home_power_preset_default"] | -1;
-    if (pi >= 0 && pi < MAX_PRESETS_PER_ROW) {
-      ctrl.homeDefaultPowerPresetIdx = (uint8_t)pi;
-      preferences.putUChar("home_pwr_idx", (uint8_t)pi);
-      LOG("[SETTINGS] Home boot power preset index: %d\n", pi);
-    }
+    if (pi >= 0 && pi < MAX_PRESETS_PER_ROW) { vHomePwr = (uint8_t)pi; hasHomePwr = true; }
   }
+  bool    hasHomeTgt = false; uint16_t vHomeTgt = 0;
   if (doc.containsKey("home_target_volt_default")) {
     int tvd = doc["home_target_volt_default"] | -1;
     if (tvd >= (int)TARGET_VOLT_PRESETS[0].dv && tvd <= (int)MAX_CHARGE_VOLTAGE_DV) {
-      ctrl.homeDefaultTargetVoltDv = (uint16_t)tvd;
-      preferences.putUShort("home_tgt_dv", (uint16_t)tvd);
-      LOG("[SETTINGS] Home boot target volt default: %d dV\n", tvd);
+      vHomeTgt = (uint16_t)tvd; hasHomeTgt = true;
     }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // PASS 2 — commit. Everything below is validated; no path returns an error.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  if (hasWifi) {
+    preferences.putString("ssid", vSsid);
+    preferences.putString("pass", vWifiPass);
+    LOG("[SETTINGS] WiFi credentials saved\n");
+    settingsNeedRestart = true;
+  }
+
+  if (hasApSsid) {
+    preferences.putString("ap_ssid", vApSsid);
+    strncpy(apSSID, vApSsid, sizeof(apSSID) - 1);
+    apSSID[sizeof(apSSID) - 1] = '\0';
+  }
+  if (hasApPass) {
+    preferences.putString("ap_pass", vApPass);
+    strncpy(apPass, vApPass, sizeof(apPass) - 1);
+    apPass[sizeof(apPass) - 1] = '\0';
+  }
+  if (hasApBlock) {
+    LOG("[SETTINGS] AP credentials saved: \"%s\"\n", apSSID);
+  }
+
+  if (hasApStatic) {
+    preferences.putBool("ap_ip_en", vApEn);
+    preferences.putString("ap_ip", vAip);
+    preferences.putString("ap_gw", vAgw);
+    preferences.putString("ap_sn", vAsn);
+    apStaticIpEnabled = vApEn;
+    strncpy(apStaticIp,      vAip, sizeof(apStaticIp) - 1);
+    apStaticIp[sizeof(apStaticIp) - 1] = '\0';
+    strncpy(apStaticGateway, vAgw, sizeof(apStaticGateway) - 1);
+    apStaticGateway[sizeof(apStaticGateway) - 1] = '\0';
+    strncpy(apStaticSubnet,  vAsn, sizeof(apStaticSubnet) - 1);
+    apStaticSubnet[sizeof(apStaticSubnet) - 1] = '\0';
+    LOG("[SETTINGS] AP fixed IP %s: %s gw %s mask %s\n",
+        vApEn ? "enabled" : "disabled", vAip, vAgw, vAsn);
+  }
+
+  if (hasMqttHost) {
+    preferences.putString("mqtt_host", vMqttHost);
+    strncpy(mqttHost, vMqttHost, sizeof(mqttHost) - 1);
+    mqttHost[sizeof(mqttHost) - 1] = '\0';
+    if (hasMqttPort) {
+      preferences.putUShort("mqtt_port", vMqttPort);
+      mqttPort = vMqttPort;
+    }
+    if (hasMqttUser) {
+      preferences.putString("mqtt_user", vMqttUser);
+      strncpy(mqttUser, vMqttUser, sizeof(mqttUser) - 1);
+      mqttUser[sizeof(mqttUser) - 1] = '\0';
+    }
+    if (hasMqttPass) {
+      preferences.putString("mqtt_pass", vMqttPass);
+      strncpy(mqttBrokerPass, vMqttPass, sizeof(mqttBrokerPass) - 1);
+      mqttBrokerPass[sizeof(mqttBrokerPass) - 1] = '\0';
+    }
+    LOG("[SETTINGS] MQTT settings saved: %s:%d\n", mqttHost, mqttPort);
+    mqttReconnectRequested = true;  // mqttTask owns mqttClient — don't touch it here (#7)
+  }
+
+  if (hasCa) {
+    if (vCaClear) {
+      mqttCaCert = "";
+      preferences.remove("mqtt_ca");
+      LOG("[SETTINGS] MQTT CA cert cleared\n");
+    } else {
+      mqttCaCert = vCa;
+      preferences.putString("mqtt_ca", mqttCaCert);
+      LOG("[SETTINGS] MQTT CA cert saved (%u bytes)\n", (unsigned)vCa.length());
+    }
+  }
+  if (hasMqttTls) {
+    mqttTls = vMqttTls;
+    preferences.putBool("mqtt_tls", vMqttTls);
+    LOG("[SETTINGS] MQTT TLS: %s\n", vMqttTls ? "ON" : "off");
+  }
+  if (hasCa || hasMqttTls) mqttReconnectRequested = true;  // consumed by mqttTask (#7)
+
+  if (hasCc) {
+    if (xSemaphoreTake(controlMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+      ctrl.chargerCount = vCc;
+      xSemaphoreGive(controlMutex);
+    }
+    preferences.putUChar("charger_count", vCc);
+    LOG("[SETTINGS] Charger count: %d\n", (int)vCc);
+  }
+
+  // Boot defaults.
+  if (hasDefEn) {
+    ctrl.defaultEnabled = vDefEn;
+    preferences.putBool("def_chg_en", vDefEn);
+    LOG("[SETTINGS] Boot charging default: %s\n", vDefEn ? "ON" : "OFF");
+  }
+  if (hasDefPwr) {
+    ctrl.defaultPowerPresetIdx = vDefPwr;
+    preferences.putUChar("def_pwr_idx", vDefPwr);
+    LOG("[SETTINGS] Boot power preset index: %d\n", (int)vDefPwr);
+  }
+  if (hasDefTgt) {
+    ctrl.defaultTargetVoltDv = vDefTgt;
+    preferences.putUShort("def_tgt_dv", vDefTgt);
+    LOG("[SETTINGS] Boot target volt default: %d dV\n", (int)vDefTgt);
+  }
+
+  // Home WiFi boot defaults.
+  if (hasHomeEn) {
+    ctrl.homeDefaultEnabled = vHomeEn;
+    preferences.putBool("home_chg_en", vHomeEn);
+    LOG("[SETTINGS] Home boot charging default: %s\n", vHomeEn ? "ON" : "OFF");
+  }
+  if (hasHomePwr) {
+    ctrl.homeDefaultPowerPresetIdx = vHomePwr;
+    preferences.putUChar("home_pwr_idx", vHomePwr);
+    LOG("[SETTINGS] Home boot power preset index: %d\n", (int)vHomePwr);
+  }
+  if (hasHomeTgt) {
+    ctrl.homeDefaultTargetVoltDv = vHomeTgt;
+    preferences.putUShort("home_tgt_dv", vHomeTgt);
+    LOG("[SETTINGS] Home boot target volt default: %d dV\n", (int)vHomeTgt);
   }
 
   return "{\"ok\":true}";
@@ -4253,16 +5665,32 @@ void handleApiSettingsPost() {
     server.send(400, "application/json", "{\"ok\":false,\"error\":\"No body\"}");
     return;
   }
-  bool locked = settingsLock();   // serialise vs the HTTPS server task (#8)
+  // NET-12: serialise vs the HTTPS server task (#8). A failed take used to fall
+  // through and apply the body unlocked, which is precisely the race the mutex
+  // exists to stop — answer 503 and let the client retry instead.
+  if (!settingsLock()) {
+    server.send(503, "application/json", "{\"ok\":false,\"error\":\"busy, retry\"}");
+    return;
+  }
   String result = applyApiSettingsBody(g_rawBody);
-  if (locked) settingsUnlock();
+  // B12: snapshot the flag INSIDE the lock. settingsNeedRestart is a plain
+  // file-scope bool shared with the HTTPS handler, and applyApiSettingsBody
+  // clears it on entry — so once the mutex is released, a concurrent TLS-side
+  // save can reset or set it before we read it, and this request would either
+  // miss its own reboot or take someone else's.
+  bool needRestart = settingsNeedRestart;
+  settingsUnlock();
   int code = 200;
   if (result.indexOf("\"ok\":false") >= 0)
     code = (result.indexOf("Payload too large") >= 0) ? 413 : 400;
   server.send(code, "application/json", result);
-  if (settingsNeedRestart) {
+  // NET-4: reboot only on a successful save. applyApiSettingsBody latches the
+  // flag in its commit pass, which a 4xx never reaches — the code check is the
+  // belt to that braces.
+  if (code == 200 && needRestart) {
     LOG("[SETTINGS] Restarting for WiFi changes...\n");
-    delay(1500);
+    // Response already sent; helper's 1.5 s wait replaces the old delay().
+    stopChargerForRestart("settings save");
     ESP.restart();
   }
 }
@@ -4274,7 +5702,7 @@ void handleApiSettingsPost() {
 // credentials and force a reboot, hijacking the controller.
 void handleSave() {
   if (!requireAuth(false)) return;  // legacy HTML form-POST, returns HTML
-  // RAW body mode (rawBodyCollect): parse the urlencoded body ourselves.
+  // RAW body mode (RawBodyHandler): parse the urlencoded body ourselves.
   HttpCtx form;
   parseKVPairs(g_rawBody, form);
   // L1: reject rather than persist WiFi credentials parsed from a form we only
@@ -4288,6 +5716,26 @@ void handleSave() {
   if (form.hasArg("ssid")) {
     String newSSID = form.arg("ssid");
     String newPass = form.arg("pass");
+    // SEC-13: apply the /api/settings length limit, plus a control-character
+    // rejection /api/settings does not have. Both reject rather than truncate:
+    // silently clipping a 70-char SSID stored credentials that can never
+    // associate, and the device reboots straight into them with no way back
+    // except the BOOT button. Control characters cannot be typed into a real
+    // network name and would land raw in the /api/settings JSON.
+    if (newSSID.length() > 64) {
+      server.send(400, "text/plain", "SSID too long (max 64 chars)\n");
+      return;
+    }
+    if (newPass.length() > 64) {
+      server.send(400, "text/plain", "Password too long (max 64 chars)\n");
+      return;
+    }
+    for (unsigned int i = 0; i < newSSID.length(); i++) {
+      if ((uint8_t)newSSID.charAt(i) < 0x20 || (uint8_t)newSSID.charAt(i) == 0x7F) {
+        server.send(400, "text/plain", "SSID contains control characters\n");
+        return;
+      }
+    }
     if (!newSSID.isEmpty()) {
       preferences.putString("ssid", newSSID);
       preferences.putString("pass", newPass);
@@ -4295,7 +5743,10 @@ void handleSave() {
         "<div style='font-family:Arial;text-align:center;padding:40px;"
         "background:#1a1a2e;color:#eee'>"
         "<h2 style='color:#e94560'>Saved!</h2><p>Restarting...</p></div>");
-      delay(2000);
+      // 500 ms for the browser to finish reading the page, then the helper's
+      // 1.5 s STOP window (2 s total — same as the delay this replaces).
+      delay(500);
+      stopChargerForRestart("WiFi creds saved via /save");
       ESP.restart();
       return;
     }
@@ -4307,6 +5758,18 @@ void handleSave() {
 // Auth-gated: pack voltage, SoC and energy figures shouldn't be readable
 // by any device on the LAN. The browser caches the Basic Auth header from
 // the dashboard load and re-uses it on every poll without re-prompting.
+// Format one pack temperature for JSON. A disconnected/shorted thermistor is
+// stored raw as ZERO_TEMP_INVALID (-32768, ZERO.h) so the firmware can tell
+// "no sensor" from a genuine 0 °C; emitting that number would put -32768 °C on
+// the dashboard, so anything absurdly low becomes JSON null instead and the
+// page renders "—". The threshold is TEMP_INVALID_THRESHOLD (ZERO.h) — far
+// below any real pack temperature and far above the sentinel — shared with
+// rampTask's validity test and the MQTT publish macro.
+static void fmtTempJson(char* out, size_t n, short v) {
+  if (v <= TEMP_INVALID_THRESHOLD) snprintf(out, n, "null");
+  else                             snprintf(out, n, "%d", (int)v);
+}
+
 // Build the /api/status JSON string. Called by both HTTP and HTTPS handlers.
 static String buildApiStatusJson() {
   // Snapshot both data structs under their respective mutexes
@@ -4374,6 +5837,14 @@ static String buildApiStatusJson() {
   // 1536 -> 1600 when charge_inhibit was added (worst case ~40 bytes:
   // "charge_inhibit":"pack voltage too low",). The guard below still backs this
   // up, but keep the headroom real rather than relying on the error stub.
+  // Pack temperatures are emitted as a number OR as literal null when the
+  // thermistor is missing — see fmtTempJson() above.
+  char tMonMin[8], tMonMax[8], tPtMin[8], tPtMax[8];
+  fmtTempJson(tMonMin, sizeof(tMonMin), liveSnap.monolithMinTemp);
+  fmtTempJson(tMonMax, sizeof(tMonMax), liveSnap.monolithMaxTemp);
+  fmtTempJson(tPtMin,  sizeof(tPtMin),  liveSnap.powerTankMinTemp);
+  fmtTempJson(tPtMax,  sizeof(tPtMax),  liveSnap.powerTankMaxTemp);
+
   char buf[1600];
   int jsonLen = snprintf(buf, sizeof(buf),
     "{"
@@ -4383,8 +5854,8 @@ static String buildApiStatusJson() {
       "\"monolith_a\":%.0f,"
       "\"monolith_ah\":%.0f,"
       "\"monolith_ah_avail\":%.1f,"
-      "\"monolith_tmin\":%d,"
-      "\"monolith_tmax\":%d,"
+      "\"monolith_tmin\":%s,"
+      "\"monolith_tmax\":%s,"
       "\"monolith_crate\":%.3f,"
       "\"monolith_soc\":%d,"
       "\"monolith_soc_source\":\"%s\","
@@ -4394,8 +5865,8 @@ static String buildApiStatusJson() {
       "\"powertank_a\":%.0f,"
       "\"powertank_ah\":%.0f,"
       "\"powertank_ah_avail\":%.1f,"
-      "\"powertank_tmin\":%d,"
-      "\"powertank_tmax\":%d,"
+      "\"powertank_tmin\":%s,"
+      "\"powertank_tmax\":%s,"
       "\"powertank_crate\":%.3f,"
       "\"session_wh\":%.1f,"
       "\"session_ah\":%.2f,"
@@ -4432,8 +5903,8 @@ static String buildApiStatusJson() {
     (float)liveSnap.monolithAmps,
     (float)liveSnap.monolithAH,
     monolithAhAvail,
-    (int)liveSnap.monolithMinTemp,
-    (int)liveSnap.monolithMaxTemp,
+    tMonMin,
+    tMonMax,
     liveSnap.monolithMaxCRate   / 10.0f,
     monolithSoc,
     monolithSocSource,
@@ -4443,8 +5914,8 @@ static String buildApiStatusJson() {
     (float)liveSnap.powerTankAmps,
     (float)liveSnap.powerTankAH,
     powerTankAhAvail,
-    (int)liveSnap.powerTankMinTemp,
-    (int)liveSnap.powerTankMaxTemp,
+    tPtMin,
+    tPtMax,
     liveSnap.powerTankMaxCRate  / 10.0f,
     sessWh,
     sessAh,
@@ -4550,6 +6021,15 @@ static String applyApiControlBody(const String& body) {
         tw, hasEn ? (en ? "true" : "false") : "(unchanged)", cc, rr, tvd);
     return "{\"ok\":false,\"error\":\"Controller busy, command not applied — retry\"}";
   }
+  // B3: the user is driving the charge now, so the home WiFi profile must not
+  // overwrite it if STA comes up later (slow router → SoftAP session → STA
+  // associates mid-charge). Latching the flag here makes the choice sticky for
+  // the rest of the boot. charger_count and ramp_rate are deliberately NOT
+  // counted — they are configuration, not a charge decision.
+  if (tw >= 0 || hasEn || (tvd >= TARGET_VOLT_PRESETS[0].dv &&
+                           tvd <= (int)MAX_CHARGE_VOLTAGE_DV)) {
+    homeDefaultsApplied = true;
+  }
   if (tw >= 0) ctrl.targetPowerW = (uint16_t)constrain(tw, 0, 13200);
   if (hasEn) {
     ctrl.enabled = en;
@@ -4635,15 +6115,20 @@ static uint8_t otaHmacWin[OTA_HMAC_LEN];
 static size_t  otaHmacWinFill   = 0;     // 0..OTA_HMAC_LEN
 static bool    otaUploadFailed  = false; // sticky: any error bails out the rest
 static size_t  otaImageBytes    = 0;     // bytes actually flashed (image, no HMAC)
+// NET-13 interlock: set at UPLOAD_FILE_START when charging is enabled. Distinct
+// from otaUploadFailed so handleOTAPost can answer 409 + a specific message
+// rather than the generic "signature invalid" 403.
+static bool    otaBlockedCharging = false;
 
 static void otaResetHmacState() {
   if (otaHmacInited) {
     mbedtls_md_free(&otaHmacCtx);
     otaHmacInited = false;
   }
-  otaHmacWinFill  = 0;
-  otaUploadFailed = false;
-  otaImageBytes   = 0;
+  otaHmacWinFill     = 0;
+  otaUploadFailed    = false;
+  otaBlockedCharging = false;
+  otaImageBytes      = 0;
 }
 
 // True if the compiled-in OTA secret is still the all-zero placeholder shipped
@@ -4741,6 +6226,17 @@ void handleOTAGet() {
 // POST /update completion handler
 void handleOTAPost() {
   if (!requireAuth(false)) return;  // browser form-context, return code <-> redirect
+  // NET-13 interlock first: the upload handler refused the image because
+  // charging was enabled. Answer with a specific 409 — the OTA page's
+  // xhr.onload prints xhr.responseText for any non-200, so the user sees this
+  // sentence verbatim instead of the generic signature-failure text.
+  if (otaBlockedCharging) {
+    otaBlockedCharging = false;
+    server.send(409, "text/plain",
+                "Charging is enabled — stop charging before updating firmware.");
+    LOG("[OTA] FAILED: charging enabled (409)\n");
+    return;
+  }
   // Check the HMAC-verification flag before Update.hasError() — the upload
   // handler may have called Update.abort() on a signature mismatch, and
   // hasError() doesn't always reflect an explicit abort.
@@ -4758,6 +6254,7 @@ void handleOTAPost() {
     server.send(200, "text/plain", "OK");
     LOG("[OTA] Success. Restarting...\n");
     delay(500);
+    stopChargerForRestart("OTA complete");
     ESP.restart();
   }
 }
@@ -4775,6 +6272,28 @@ void handleOTAUpload() {
     otaResetHmacState();
     LOG("[OTA] Start: field='%s' file='%s'\n",
                   upload.name.c_str(), upload.filename.c_str());
+
+    // NET-13 interlock — never flash while the chargers are commanded on.
+    // Update.end() reboots into the new image; doing that mid-charge means the
+    // last CAN command the DigiNow units heard was a START, and the flash write
+    // stalls this task long enough that the 1 Hz heartbeat (and with it the
+    // dead-man STOP) is unreliable. Refuse the upload outright instead.
+    // A controlMutex timeout is treated as "enabled" — if we can't prove
+    // charging is off, we don't flash.
+    bool chargingOn = true;
+    if (xSemaphoreTake(controlMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+      chargingOn = ctrl.enabled;
+      xSemaphoreGive(controlMutex);
+    } else {
+      LOG("[OTA] controlMutex timeout — assuming charging is enabled\n");
+    }
+    if (chargingOn) {
+      LOG("[OTA] Rejected: charging is enabled — stop charging first\n");
+      otaBlockedCharging = true;
+      otaUploadFailed    = true;   // makes UPLOAD_FILE_WRITE/END bail out too
+      return;                      // NOT calling Update.begin()
+    }
+
     if (!otaHmacBegin()) {
       LOG("[OTA] HMAC init failed — aborting upload\n");
       otaUploadFailed = true;
@@ -4843,8 +6362,10 @@ void handleOTAUpload() {
 // BOOT button (GPIO 0) handler
 //
 // Polled from loop(). Two recognised hold patterns:
-//   ≥ 5 s   on release  → wipe saved WiFi credentials only, restart into AP
-//                         mode for re-provisioning. Keeps AP/MQTT/charger-count
+//   ≥ 5 s   on release  → wipe saved WiFi credentials AND every login session
+//                         (RAM table + the NVS "auth_sess" blob behind "keep
+//                         me signed in" — SEC-5b), restart into AP mode for
+//                         re-provisioning. Keeps AP/MQTT/charger-count
 //                         settings intact.
 //   ≥ 10 s  on threshold → factory reset: clear the entire "wifi-config" NVS
 //                          namespace and restart. Acts immediately so the
@@ -4876,6 +6397,7 @@ void checkBootButton() {
           (now - bootBtnPressedAt) / 1000UL);
       preferences.clear();   // wipes the entire "wifi-config" namespace
       delay(300);            // give the log line time to flush over serial / SSE
+      stopChargerForRestart("factory reset");
       ESP.restart();
     }
     return;
@@ -4887,11 +6409,17 @@ void checkBootButton() {
     bootBtnPressedAt = 0;
     if (bootBtnFactoryDone) return;  // already restarted; can't actually reach here
     if (heldMs >= BTN_HOLD_AP_RESET_MS) {
-      LOG("[BTN] BOOT held %lus → clearing WiFi creds, restarting into AP mode\n",
-          heldMs / 1000UL);
+      // SEC-5(b): also drop every login session — RAM table and the NVS
+      // "auth_sess" blob that backs "keep me signed in". This hold is the
+      // hand-the-device-on / lost-network recovery gesture, so a previously
+      // remembered browser must not still be authenticated after it.
+      LOG("[BTN] BOOT held %lus → clearing WiFi creds + all login sessions, "
+          "restarting into AP mode\n", heldMs / 1000UL);
       preferences.remove("ssid");
       preferences.remove("pass");
+      sessionsClearAll("BOOT button held 5-10s");
       delay(300);
+      stopChargerForRestart("WiFi creds cleared, AP mode");
       ESP.restart();
     } else if (heldMs >= 3000UL) {
       // 3–5 s window: clear the auth hard-lock for ALL client IPs if any is
@@ -5050,17 +6578,23 @@ void startAPMode() {
   startMdns();
 }
 
-// Attempt connection using SECRET_MQTT_SSID / SECRET_MQTT_PASS.
+// Attempt connection using the compile-time station credentials
+// SECRET_WIFI_SSID / SECRET_WIFI_PASS (the home network).
 // Credentials are intentionally NOT written to preferences here —
 // secrets remain a read-only bootstrap; the /save page is the only
 // path that persists credentials.
 void trySecretsConnect() {
-  const char* ssid = SECRET_MQTT_SSID;
-  const char* pass = SECRET_MQTT_PASS;
+  const char* ssid = SECRET_WIFI_SSID;
+  const char* pass = SECRET_WIFI_PASS;
   if (ssid == nullptr || strlen(ssid) == 0) {
-    LOG("[WIFI] Secrets SSID empty, starting AP mode.\n");
-    startAPMode();
-    currentState = STATE_SETUP_MODE;
+    // No compile-time station SSID. Do NOT drop straight into SETUP_MODE —
+    // this path is also reached after a prefs connect times out (router still
+    // booting after a power cut), and SETUP_MODE never retries, so perfectly
+    // good NVS credentials would sit unused until the next reboot (NET-3).
+    // enterApRetrying() re-reads NVS, keeps retrying in the background, and
+    // falls back to SETUP_MODE itself if there really are no credentials.
+    LOG("[WIFI] Secrets SSID empty — entering AP+STA retry\n");
+    enterApRetrying();
     return;
   }
   LOG("[WIFI] No saved credentials. Trying secrets SSID \"%s\"...\n", ssid);
@@ -5075,14 +6609,14 @@ void trySecretsConnect() {
 }
 
 // Bring up AP+STA mode and start the background STA retry loop.
-// Pulls credentials from NVS first, then SECRET_MQTT_SSID/PASS as fallback.
+// Pulls credentials from NVS first, then SECRET_WIFI_SSID/PASS as fallback.
 // If neither is available there's nothing to retry — drop to AP-only setup mode.
 void enterApRetrying() {
   String s = preferences.getString("ssid", "");
   String p = preferences.getString("pass", "");
-  if (s.length() == 0 && strlen(SECRET_MQTT_SSID) > 0) {
-    s = SECRET_MQTT_SSID;
-    p = SECRET_MQTT_PASS;
+  if (s.length() == 0 && strlen(SECRET_WIFI_SSID) > 0) {
+    s = SECRET_WIFI_SSID;
+    p = SECRET_WIFI_PASS;
   }
   if (s.length() == 0) {
     LOG("[WIFI] No STA creds to retry — staying in AP-only setup mode\n");
@@ -5093,24 +6627,118 @@ void enterApRetrying() {
   s.toCharArray(retryStaSsid, sizeof(retryStaSsid));
   p.toCharArray(retryStaPass, sizeof(retryStaPass));
 
-  // AP+STA: both interfaces share the radio. When STA associates, the SoftAP
-  // is force-moved to the STA's channel (clients on the AP may briefly drop).
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.setSleep(false);  // modem sleep OFF — see comment at the setup() call
-  WiFi.softAPsetHostname(MDNS_HOSTNAME);
-  applyApStaticIp();  // softAPConfig() — must precede softAP()
-  WiFi.softAP(apSSID, apPass);
+  // If the SoftAP is already broadcasting, do NOT tear the radio down and
+  // re-softAP() — that kicks every client joined to the AP and re-registers
+  // mDNS for no gain. Just make sure the STA interface exists and re-kick it
+  // (NET-18c).
+  //
+  // B1: ask the RADIO, not the state machine. This used to be
+  // apIsBroadcasting(), which derives from currentState — and every call site
+  // reaches here from STATE_CONNECTING or STATE_CONNECTED, so it was always
+  // false and the "already up" branch was dead code. WiFi.getMode() reports
+  // what the driver actually has running, which is the fact this decision
+  // needs.
+  //
+  // C7 — to be precise about the branch's reachability: on today's call graph
+  // it still cannot be taken. Every caller is in STATE_CONNECTING or
+  // STATE_CONNECTED, and neither leaves a SoftAP broadcasting, so apAlreadyUp
+  // is false on every path that exists right now. The branch is kept
+  // correct-by-construction for the re-entry the flap limiter is expected to
+  // introduce (returning here from STATE_AP_RETRYING with the AP deliberately
+  // still up), and because sourcing the answer from the radio rather than from
+  // currentState is right regardless of who calls. Do not delete it as dead
+  // code — deleting it would reintroduce the tear-down it prevents the moment
+  // that caller lands.
+  const bool apAlreadyUp = (WiFi.getMode() & WIFI_MODE_AP) != 0;
+  if (!apAlreadyUp) {
+    // AP+STA: both interfaces share the radio. When STA associates, the SoftAP
+    // is force-moved to the STA's channel (clients on the AP may briefly drop).
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.setSleep(false);  // modem sleep OFF — see comment at the setup() call
+    WiFi.softAPsetHostname(MDNS_HOSTNAME);
+    applyApStaticIp();  // softAPConfig() — must precede softAP()
+    WiFi.softAP(apSSID, apPass);
+  } else if (WiFi.getMode() != WIFI_AP_STA) {
+    // Came from AP-only SETUP_MODE — add the STA interface without disturbing
+    // the running SoftAP.
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.setSleep(false);  // modem sleep OFF — see comment at the setup() call
+  }
+  // Deliberately OUTSIDE the branch above: the STA is (re)started with the
+  // credentials on BOTH paths, so the kept-AP path still nudges the station
+  // interface back at the router (B1). Without this, keeping the AP up would
+  // mean never re-issuing the association request.
   WiFi.setHostname(MDNS_HOSTNAME);
   WiFi.setAutoReconnect(true);
   WiFi.persistent(false);
   WiFi.begin(retryStaSsid, retryStaPass);
-  startMdns();
+  if (!apAlreadyUp) startMdns();
   lastStaRetryAt     = millis();
   apStaStableSinceMs = 0;          // grace window starts only after STA is up
+  apRetryLastStaUp   = false;      // fresh edge latch for this AP_RETRYING run
   currentState = STATE_AP_RETRYING;
-  LOG("[WIFI] AP+STA retry mode — AP \"%s\" up at %s, STA → \"%s\"\n",
-      apSSID, WiFi.softAPIP().toString().c_str(), retryStaSsid);
+  LOG("[WIFI] AP+STA retry mode — AP \"%s\" %s at %s, STA → \"%s\"\n",
+      apSSID, apAlreadyUp ? "kept" : "up",
+      WiFi.softAPIP().toString().c_str(), retryStaSsid);
+}
+
+// Work that must run on EVERY path to a usable station link, not just the
+// first one. There are two such edges: CONNECTING → CONNECTED (boot connect
+// succeeded) and the STA false → true edge inside STATE_AP_RETRYING (link came
+// back after a drop). Until NET-5 this lived only on the first edge, so a
+// device that reached the network via AP_RETRYING never started SNTP — every
+// CycleRecord was stamped 1970 — and never applied the home WiFi profile.
+// applyHomeWifiBootDefaults() is idempotent (homeDefaultsApplied), so calling
+// it from both edges is safe.
+//
+// firstConnect: true on the boot-time CONNECTING → CONNECTED edge, false on
+// the AP_RETRYING reconnect edge. The "charge already running" guard below is
+// applied ONLY on the reconnect edge (audit 2026-09, C1): on the first edge
+// ctrl.enabled merely reflects the AP/Road boot profile (rampInit copies
+// def_chg_en into it before loop() runs), not a charge a human started, and
+// treating it as one would permanently skip the Home profile for every user
+// whose road profile has charging ON.
+static void onStaUp(bool firstConnect) {
+  // Kick off NTP sync (non-blocking; result arrives in ~2 s via SNTP task).
+  // Timestamps are used by the cycle data logger (appendCycleRecord).
+  configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
+  setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1); // Europe/Oslo
+  tzset();
+
+  // B3: do not apply the home profile over a charge that is already running.
+  // The AP_RETRYING edge reaches here with homeDefaultsApplied still false
+  // whenever the router was slow to come up — the owner meanwhile joined the
+  // SoftAP and started charging by hand, and applying the profile at that
+  // moment would silently rewrite their target power, target voltage, and
+  // possibly stop the charge outright (home profile default is charging OFF).
+  // The user-command paths also latch homeDefaultsApplied now, so this is a
+  // second line of defence for a charge started before those paths ran (e.g.
+  // the AP/road boot profile had charging enabled).
+  if (firstConnect) {
+    applyHomeWifiBootDefaults();
+    return;
+  }
+  bool charging     = false;
+  bool haveCtrlSnap = false;
+  if (controlMutex != nullptr &&
+      xSemaphoreTake(controlMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    charging     = ctrl.enabled;
+    haveCtrlSnap = true;
+    xSemaphoreGive(controlMutex);
+  }
+  if (!haveCtrlSnap) {
+    // Couldn't read the control state — skip applying rather than guess. The
+    // profile is a convenience; clobbering a live charge is not recoverable.
+    LOG("[WIFI] STA up — controlMutex timeout, home profile not applied\n");
+    return;
+  }
+  if (charging) {
+    homeDefaultsApplied = true;   // don't re-attempt on a later edge either
+    LOG("[WIFI] STA up mid-session — home profile not applied\n");
+    return;
+  }
+  applyHomeWifiBootDefaults();  // apply home WiFi profile once per boot
 }
 
 void monitorWifiStatus() {
@@ -5131,13 +6759,8 @@ void monitorWifiStatus() {
       wifiFastAttempt = false;
       saveWifiFastConnect();  // remember BSSID+channel for next cold boot's fast-connect
       startMdns();
-      // Kick off NTP sync (non-blocking; result arrives in ~2 s via SNTP task).
-      // Timestamps are used by the cycle data logger (appendCycleRecord).
-      configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
-      setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1); // Europe/Oslo
-      tzset();
       currentState = STATE_CONNECTED;
-      applyHomeWifiBootDefaults();  // apply home WiFi profile once, on first STA connect
+      onStaUp(true);   // NTP + TZ + home WiFi profile (first connect: profile applies unconditionally)
       return;
     }
     // Not yet connected — check whether we've exceeded the timeout.
@@ -5155,6 +6778,11 @@ void monitorWifiStatus() {
         String p = preferences.getString("pass", "");
         WiFi.disconnect(true);
         WiFi.mode(WIFI_STA);
+        // Modem sleep OFF — same reason as the setup() call (see the comment
+        // there): WIFI_PS_MIN_MODEM is what caused the "connects then drops"
+        // bug. WiFi.mode() can restore the driver default, so re-assert it on
+        // every bring-up path, this one included (NET-17).
+        WiFi.setSleep(false);
         WiFi.setHostname(MDNS_HOSTNAME);
         WiFi.begin(s.c_str(), p.c_str());
         wifiConnectStartMs = millis();   // restart the timeout for the scan attempt
@@ -5176,6 +6804,25 @@ void monitorWifiStatus() {
     if (WiFi.status() != WL_CONNECTED) {
       // STA dropped after a previously successful connection. Bring up AP so
       // the dashboard stays reachable while the driver works on reconnecting.
+      // Count the flap first (NET-18c) — the limiter, once engaged, keeps the
+      // SoftAP up across the next entries instead of cycling it each time.
+      if (apFlapWindowStart == 0 || (now - apFlapWindowStart) >= AP_FLAP_WINDOW_MS) {
+        apFlapWindowStart    = now;   // start a fresh 10-minute window
+        apFlapCount          = 0;
+        apFlapLimited        = false;
+        apFlapLimitedSinceMs = 0;     // B2: keep the two in step
+      }
+      if (apFlapCount < 255) apFlapCount++;
+      if (apFlapCount > AP_FLAP_MAX && !apFlapLimited) {
+        apFlapLimited        = true;
+        apFlapLimitedSinceMs = now;   // B2: hold is timed from HERE, not from
+                                      // the start of the counting window
+        LOG("[WIFI] Link flapping (%u drops in %lu s) — holding SoftAP up, "
+            "STA retry nudges continue every %lu s\n",
+            (unsigned)apFlapCount,
+            (unsigned long)((now - apFlapWindowStart) / 1000UL),
+            (unsigned long)(staRetryIntervalMs / 1000UL));
+      }
       LOG("[WIFI] STA dropped — switching to AP+STA retry mode\n");
       enterApRetrying();
     }
@@ -5184,10 +6831,9 @@ void monitorWifiStatus() {
     // Track STA up/down transitions; AP keeps serving the dashboard until
     // STA has been stable for AP_GRACE_MS, at which point we drop AP and
     // return to STA-only (STATE_CONNECTED).
-    static bool lastStaUp = false;
     bool staUp = (WiFi.status() == WL_CONNECTED);
 
-    if (staUp && !lastStaUp) {
+    if (staUp && !apRetryLastStaUp) {
       LOG("[WIFI] STA reconnected. IP: %s (AP stays up; grace window started)\n",
           WiFi.localIP().toString().c_str());
       const char* hn = WiFi.getHostname();
@@ -5196,15 +6842,39 @@ void monitorWifiStatus() {
       // Re-bind mDNS — STA-side service registration needs the new IP.
       startMdns();
       saveWifiFastConnect();  // refresh cached BSSID+channel after a reconnect
+      onStaUp(false);         // NTP + TZ + home WiFi profile unless a charge is running (NET-5/B3)
       apStaStableSinceMs = now;    // begin counting toward AP teardown
-    } else if (!staUp && lastStaUp) {
+    } else if (!staUp && apRetryLastStaUp) {
       LOG("[WIFI] STA dropped again — grace timer reset, driver will retry\n");
       apStaStableSinceMs = 0;      // reset: must be continuously up
+    } else if (staUp && apStaStableSinceMs == 0) {
+      // Safety net (NET-18b): STA is up but the grace timer was never armed —
+      // the false→true edge was missed (e.g. the link came up between polls of
+      // a state entry). Without this the SoftAP would stay up forever.
+      LOG("[WIFI] STA up but grace timer unarmed — arming now\n");
+      apStaStableSinceMs = now;
     }
-    lastStaUp = staUp;
+    apRetryLastStaUp = staUp;
+
+    // Flap limiter expiry (NET-18c, corrected in B2): the hold lasts
+    // AP_FLAP_WINDOW_MS from the moment it ENGAGED. Timing it from
+    // apFlapWindowStart was wrong — that variable is only written in the
+    // STATE_CONNECTED drop branch, which never executes again once we are
+    // parked in AP_RETRYING, so it could never advance and the hold expired
+    // almost immediately. Resetting the counter state here too means the next
+    // flap starts a clean window rather than resuming an exhausted one.
+    if (apFlapLimited && (now - apFlapLimitedSinceMs) >= AP_FLAP_WINDOW_MS) {
+      apFlapLimited        = false;
+      apFlapLimitedSinceMs = 0;
+      apFlapCount          = 0;
+      apFlapWindowStart    = 0;
+      LOG("[WIFI] Flap limiter expired — SoftAP teardown re-enabled\n");
+    }
 
     // AP teardown: STA has been continuously up for the full grace window.
-    if (staUp && apStaStableSinceMs != 0 &&
+    // Suppressed while the flap limiter is engaged — on a flapping link the
+    // AP would otherwise be torn down and brought straight back up again.
+    if (staUp && !apFlapLimited && apStaStableSinceMs != 0 &&
         (now - apStaStableSinceMs) >= AP_GRACE_MS) {
       LOG("[WIFI] STA stable for %lu ms — tearing down SoftAP, returning to STA-only\n",
           (unsigned long)(now - apStaStableSinceMs));
@@ -5227,7 +6897,10 @@ void monitorWifiStatus() {
       lastStaRetryAt = now;
     }
   }
-  // STATE_SETUP_MODE: nothing to do — wait for /save to write creds and restart.
+  // STATE_SETUP_MODE: terminal by design, and since NET-3 it is only ever
+  // reached when NO credentials exist anywhere (neither NVS nor compile-time
+  // secrets) — so there is nothing to retry. Wait for /save to write creds and
+  // restart. Any state that still has credentials uses AP_RETRYING instead.
 }
 
 // True whenever the SoftAP is currently broadcasting (covers both the
@@ -5269,7 +6942,7 @@ void handleApiCyclesDelete() {
 //
 // WebBodyGuardHandler — catch-all registered LAST in setup() so it only sees
 // requests no explicit route matched. It (a) reproduces the previous
-// not-found behaviour (404, or the port-80→443 redirect when httpsEnabled),
+// not-found behaviour (404, or the port-80→443 redirect when g_httpsRunning),
 // and (b) declares canRaw so the WebServer streams-and-discards the body of
 // any unmatched POST/PUT/PATCH/DELETE through its fixed ~1.4 KB chunk buffer
 // instead of malloc()ing the whole Content-Length into RAM before any auth
@@ -5282,6 +6955,20 @@ void handleApiCyclesDelete() {
 // a null unique_ptr → LoadProhibited crash. This handler sends multipart
 // bodies to the real upload handler and quietly drains anything else,
 // flagging the attempt so the completion handler answers 403.
+//
+// RawBodyHandler — replaces server.on(uri, method, fn, rawBodyCollect) on
+// every body-consuming route (SEC-1). The mirror image of the /update bug:
+// FunctionRequestHandler uses ONE _ufn for both upload() and raw(), and its
+// canUpload() returns true for any POST once _ufn is set
+// (RequestHandlersImpl.h). A multipart POST carrying a filename part therefore
+// took Parsing.cpp's _parseForm() path → upload() → the collector →
+// server.raw() → *_currentRaw, a unique_ptr that is only reset() on the
+// non-form branch (Parsing.cpp) → null deref → panic, reachable with no
+// credentials on /login, /save, /api/settings, /api/control, /api/tls,
+// /logout and DELETE /api/cycles. RawBodyHandler declares canUpload() false
+// (so the core never routes a multipart part into the collector), keeps
+// canRaw() for the streaming collector, and answers 415 in handle() when the
+// request announced a multipart Content-Type.
 // ---------------------------------------------------------------------------
 
 class WebBodyGuardHandler : public RequestHandler {
@@ -5291,7 +6978,10 @@ public:
   bool canRaw(const String&) override { return true; }
   bool canRaw(WebServer&, const String&) override { return true; }
   bool handle(WebServer& srv, HTTPMethod, const String&) override {
-    if (httpsEnabled) handleHTTPSRedirect();
+    // g_httpsRunning, not httpsEnabled (SEC-15/NET-6): redirect only when a
+    // server is actually listening on 443. httpsEnabled can be true with no
+    // live TLS server (toggle saved but not yet rebooted, or start failed).
+    if (g_httpsRunning) handleHTTPSRedirect();
     else srv.send(404, "text/plain", "Not found");
     return true;
   }
@@ -5326,9 +7016,134 @@ public:
   }
 };
 
+class RawBodyHandler : public RequestHandler {
+public:
+  RawBodyHandler(const char* uri, HTTPMethod method, void (*fn)())
+    : _uri(uri), _method(method), _fn(fn) {}
+
+  bool canHandle(HTTPMethod m, const String& uri) override {
+    return m == _method && uri == _uri;
+  }
+  bool canHandle(WebServer&, HTTPMethod m, const String& uri) override {
+    return m == _method && uri == _uri;
+  }
+  // SEC-1: never claim the multipart upload path — that is the whole point of
+  // this class. Returning false here makes the core stream-and-discard file
+  // parts without ever calling back into us.
+  bool canUpload(const String&) override { return false; }
+  bool canUpload(WebServer&, const String&) override { return false; }
+  // RAW streaming stays on, for the non-multipart bodies these routes expect.
+  bool canRaw(const String& uri) override { return uri == _uri; }
+  bool canRaw(WebServer&, const String& uri) override { return uri == _uri; }
+
+  bool handle(WebServer& srv, HTTPMethod m, const String& uri) override {
+    if (!canHandle(srv, m, uri)) return false;
+    // A multipart body never reached the collector, so g_rawBody holds either
+    // nothing or the previous request's content. Refuse rather than let the
+    // route function act on it. Content-Type is in the collectHeaders() list
+    // set up in setup(); the core keeps no public accessor of its own.
+    if (srv.header("Content-Type").startsWith("multipart/")) {
+      LOG("[WEB] multipart POST to %s — rejected (415)\n", _uri);
+      srv.send(415, "text/plain", "multipart not accepted on this route\n");
+      return true;
+    }
+    _fn();
+    return true;
+  }
+
+  // The capped RAW body collector (was the free function rawBodyCollect()).
+  // See the RAW_BODY_CAP block near the auth globals for the rationale.
+  void raw(WebServer& srv, const String&, HTTPRaw& r) override {
+    switch (r.status) {
+      case RAW_START: {
+        int cl = srv.clientContentLength();
+        g_rawBody     = String();
+        g_rawTooLarge = (cl > (int)RAW_BODY_CAP);
+        if (!g_rawTooLarge && cl > 0) g_rawBody.reserve(cl + 1);
+        break;
+      }
+      case RAW_WRITE:
+        if (!g_rawTooLarge) {
+          if (g_rawBody.length() + r.currentSize > RAW_BODY_CAP) {
+            // Body exceeded the cap despite the Content-Length check (lying
+            // header). Flip to discard mode; chunks keep draining harmlessly.
+            g_rawTooLarge = true;
+            g_rawBody = String();
+          } else {
+            g_rawBody.concat((const char*)r.buf, r.currentSize);
+          }
+        }
+        break;
+      case RAW_END:
+        break;
+      case RAW_ABORTED:
+        g_rawBody     = String();
+        g_rawTooLarge = false;
+        break;
+    }
+  }
+
+private:
+  const char* _uri;
+  HTTPMethod  _method;
+  void      (*_fn)();
+};
+
 // ---------------------------------------------------------------------------
 // Setup & Loop
 // ---------------------------------------------------------------------------
+
+// NET-13: assert a charger STOP before any deliberate reboot.
+//
+// A reboot takes the 1 Hz heartbeat away, and the DigiNow units do eventually
+// self-stop when it goes missing — but only after their own ~5 s timeout, and
+// only if the last frame they saw wasn't a START that the boot sequence then
+// re-issues. Every restart path therefore disables charging at the source
+// (ctrl), raises g_forceStop (which makes sendHeartbeat() transmit STOP
+// unconditionally, no mutex involved), zeroes the command struct best-effort,
+// and then waits long enough for at least one heartbeat to carry that STOP onto
+// the wire before the CPU goes away.
+//
+// Order matters. rampTask keeps running throughout — vTaskDelay() yields rather
+// than spins, which is exactly what has to happen for the STOP to reach the bus
+// — and it ticks once a second, so one or two of its ticks land INSIDE the
+// 1.5 s wait. With charging still enabled in ctrl, such a tick would take
+// chargerMutex, write a fresh START into chargerBus and clear g_forceStop, and
+// the reboot would hand the chargers a START instead of the STOP this function
+// exists to send. Clearing ctrl.enabled first sends those ticks down rampTask's
+// disabled branch (which asserts the STOP itself), and g_shuttingDown stops any
+// tick already past that point from clearing g_forceStop behind us.
+//
+// Safe to call from loopTask (BOOT button) and from the web server tasks alike.
+static void stopChargerForRestart(const char* reason) {
+  // 1. Disable charging at the source, so rampTask's own ticks during the wait
+  //    below command STOP rather than re-asserting the running setpoint.
+  if (controlMutex != nullptr &&
+      xSemaphoreTake(controlMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    ctrl.enabled       = false;
+    ctrl.currentPowerW = 0;
+    xSemaphoreGive(controlMutex);
+  }
+  // 2. Failsafe flags. g_shuttingDown is checked by rampTask at both of its
+  //    "a valid START landed under the mutex" clear sites, so from here on
+  //    nothing can lower g_forceStop again.
+  g_shuttingDown = true;
+  g_forceStop    = true;
+  // 3. chargerMutex is created in chargerBusInit(); a restart requested before
+  //    that point (there is no such path today, but be defensive) just skips the
+  //    struct write — g_forceStop alone already forces STOP in sendHeartbeat().
+  if (chargerMutex != nullptr &&
+      xSemaphoreTake(chargerMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    chargerBus.cmdVoltDv = 0;
+    chargerBus.cmdAmpsDa = 0;
+    chargerBus.cmdStart  = false;
+    xSemaphoreGive(chargerMutex);
+  }
+  LOG("[BOOT] restart (%s) — charger STOP asserted, waiting for heartbeat\n",
+      reason ? reason : "?");
+  // HEARTBEAT_INTERVAL_MS is 1 s, so 1.5 s guarantees at least one STOP frame.
+  vTaskDelay(pdMS_TO_TICKS(1500));
+}
 
 void setup() {
   // logBegin() initialises hardware serial and creates the ring buffer mutex.
@@ -5383,16 +7198,16 @@ void setup() {
     String s = preferences.getString("ap_ssid", "");
     if (s.length() > 0) {
       s.toCharArray(apSSID, sizeof(apSSID));
-    } else if (strlen(SECRET_SSID) > 0) {
-      strncpy(apSSID, SECRET_SSID, sizeof(apSSID) - 1);
+    } else if (strlen(SECRET_AP_SSID) > 0) {
+      strncpy(apSSID, SECRET_AP_SSID, sizeof(apSSID) - 1);
       apSSID[sizeof(apSSID) - 1] = '\0';
     }
     // else keep default "Supercharger"
     String p = preferences.getString("ap_pass", "");
     if (p.length() > 0) {
       p.toCharArray(apPass, sizeof(apPass));
-    } else if (strlen(SECRET_PASS) > 0) {
-      strncpy(apPass, SECRET_PASS, sizeof(apPass) - 1);
+    } else if (strlen(SECRET_AP_PASS) > 0) {
+      strncpy(apPass, SECRET_AP_PASS, sizeof(apPass) - 1);
       apPass[sizeof(apPass) - 1] = '\0';
     }
     LOG("[BOOT] AP: \"%s\"\n", apSSID);
@@ -5483,8 +7298,8 @@ void setup() {
     wifiSource         = WIFI_SRC_PREFS;
     wifiConnectStartMs = millis();
     currentState       = STATE_CONNECTING;
-  } else if (strlen(SECRET_MQTT_SSID) > 0) {
-    // Priority 2: compile-time secrets (not persisted)
+  } else if (strlen(SECRET_WIFI_SSID) > 0) {
+    // Priority 2: compile-time station secrets (not persisted)
     trySecretsConnect();
   } else {
     // Priority 3: no credentials at all — AP setup mode
@@ -5494,54 +7309,72 @@ void setup() {
   }
 
   // Load HTTPS / TLS config from NVS and start the IDF httpd_ssl server.
+  // httpsEnabled is the PERSISTED INTENT; g_httpsRunning is the live fact
+  // (SEC-15/NET-6) and is the only thing the port-80 redirect may consult.
   httpsEnabled = preferences.getBool("https_en", false);
   if (httpsEnabled) {
     String cert = preferences.getString("tls_cert", "");
     String key  = preferences.getString("tls_key",  "");
     if (cert.length() > 0 && key.length() > 0) {
-      if (!startHTTPSServer(cert, key)) {
-        httpsEnabled = false;  // start failed — fall back to HTTP only
+      g_httpsRunning = startHTTPSServer(cert, key);
+      if (!g_httpsRunning) {
+        LOG("[TLS] HTTPS start failed — serving HTTP only this boot\n");
       }
     } else {
-      httpsEnabled = false;
       LOG("[TLS] HTTPS enabled but no cert/key in NVS — falling back to HTTP\n");
     }
   }
 
-  // When HTTPS is active: port 80 only serves redirect; all real routes live
-  // on port 443 (served by the httpd_ssl FreeRTOS task).
-  // When HTTPS is inactive: register all routes on port 80 as normal.
-  // Every body-consuming route gets rawBodyCollect as its "upload" function —
-  // that flips it into capped RAW streaming (audit 2026-07, see rawBodyCollect)
-  // so oversized bodies can't be malloc()ed into RAM before the auth check.
-  // Handlers read g_rawBody instead of server.arg("plain").
-  if (httpsEnabled) {
+  // ── Port-80 route table (SEC-4 / NET-2) ──────────────────────────────────
+  // These routes are registered UNCONDITIONALLY, because they exist only on
+  // port 80 — the IDF httpd_ssl server has no story for multipart OTA upload
+  // or for a long-lived SSE stream, and /save is the legacy setup form:
+  //   /login GET+POST, /logout POST, /update GET + OtaUpdateHandler,
+  //   /log GET, /api/log/stream GET, /save POST, /api/tls POST.
+  // Before this change they were registered ONLY in the HTTPS-off branch, so
+  // turning HTTPS on left /update, /log, /api/log/stream and /save reachable on
+  // NEITHER port — OTA and the log viewer simply disappeared.
+  // /login is registered on 80 for the same reason: the 443 cookie is minted
+  // with the Secure flag and is therefore never sent over HTTP, so the
+  // HTTP-only routes need a login of their own to mint a non-Secure cookie.
+  // /api/tls stays the escape hatch for disabling HTTPS after a bad cert.
+  //
+  // Everything else (/, /settings, /api/status, /api/settings, /api/control,
+  // /api/cycles) is registered on 80 only when HTTPS is NOT running; when it
+  // is, those URIs fall through to WebBodyGuardHandler, which redirects to 443.
+  //
+  // Every body-consuming route is served by RawBodyHandler (SEC-1): capped
+  // RAW streaming so an oversized body can't be malloc()ed into RAM before the
+  // auth check, and multipart bodies are refused with 415 instead of taking
+  // the core's null-deref upload path. Handlers read g_rawBody, never
+  // server.arg("plain").
+  server.on("/login",           HTTP_GET,  handleLoginGet);   // serve the login form
+  server.addHandler(new RawBodyHandler("/login",  HTTP_POST, handleLoginPost));
+  // POST (not GET) so prefetchers can't trigger a logout.
+  server.addHandler(new RawBodyHandler("/logout", HTTP_POST, handleLogout));
+  server.addHandler(new RawBodyHandler("/save",   HTTP_POST, handleSave));
+  server.on("/api/log/stream",  HTTP_GET,  handleLogStream);
+  server.on("/log",             HTTP_GET,  handleLogPage);
+  server.on("/update",          HTTP_GET,  handleOTAGet);
+  // Custom handler: multipart → handleOTAUpload, anything else drained +
+  // rejected (fixes the raw-path server.upload() null-deref, audit 2026-07).
+  server.addHandler(new OtaUpdateHandler());
+  server.addHandler(new RawBodyHandler("/api/tls", HTTP_POST, handleApiTlsPostWS));
+
+  if (g_httpsRunning) {
     // Belt-and-braces only: WebBodyGuardHandler (added below) matches first
     // and issues the redirect itself; onNotFound would only fire if the
     // catch-all were ever removed.
     server.onNotFound(handleHTTPSRedirect);
-    // Also allow /api/tls on HTTP so the user can disable HTTPS if they mess up
-    server.on("/api/tls", HTTP_POST, handleApiTlsPostWS, rawBodyCollect);
   } else {
     server.on("/",                HTTP_GET,  handleRoot);
-    server.on("/login",           HTTP_GET,  handleLoginGet);   // serve the login form
-    server.on("/login",           HTTP_POST, handleLoginPost, rawBodyCollect);
-    server.on("/logout",          HTTP_POST, handleLogout,    rawBodyCollect); // POST so prefetchers can't trigger it
-    server.on("/save",            HTTP_POST, handleSave,      rawBodyCollect);
     server.on("/settings",        HTTP_GET,  handleSettingsPage);
     server.on("/api/settings",    HTTP_GET,  handleApiSettingsGet);
-    server.on("/api/settings",    HTTP_POST, handleApiSettingsPost, rawBodyCollect);
+    server.addHandler(new RawBodyHandler("/api/settings", HTTP_POST, handleApiSettingsPost));
     server.on("/api/status",      HTTP_GET,  handleApiStatus);
-    server.on("/api/control",     HTTP_POST, handleApiControl, rawBodyCollect);
-    server.on("/api/log/stream",  HTTP_GET,  handleLogStream);
-    server.on("/log",             HTTP_GET,  handleLogPage);
-    server.on("/update",          HTTP_GET,  handleOTAGet);
-    // Custom handler: multipart → handleOTAUpload, anything else drained +
-    // rejected (fixes the raw-path server.upload() null-deref, audit 2026-07).
-    server.addHandler(new OtaUpdateHandler());
-    server.on("/api/tls",         HTTP_POST, handleApiTlsPostWS, rawBodyCollect);
+    server.addHandler(new RawBodyHandler("/api/control",  HTTP_POST, handleApiControl));
     server.on("/api/cycles",      HTTP_GET,    handleApiCyclesGet);
-    server.on("/api/cycles",      HTTP_DELETE, handleApiCyclesDelete, rawBodyCollect);
+    server.addHandler(new RawBodyHandler("/api/cycles", HTTP_DELETE, handleApiCyclesDelete));
   }
   // Catch-all — MUST be registered last (handlers match in registration
   // order): 404s / redirects unmatched URIs and stream-discards their bodies.
@@ -5549,10 +7382,14 @@ void setup() {
 
   // Tell WebServer to keep these request headers — by default it discards
   // anything not on this list, so server.header()/hasHeader() return empty.
-  //   - Cookie : needed by sessionTouchOrFail() on every protected route
-  //              to look up the current scs= session token.
-  static const char* collectedHeaders[] = { "Cookie" };
-  server.collectHeaders(collectedHeaders, 1);
+  //   - Cookie       : needed by sessionTouchOrFail() on every protected route
+  //                    to look up the current scs= session token.
+  //   - Content-Type : needed by RawBodyHandler::handle() to spot a multipart
+  //                    POST (SEC-1). The core parses Content-Type internally
+  //                    but exposes no accessor for it, so it has to be
+  //                    collected explicitly.
+  static const char* collectedHeaders[] = { "Cookie", "Content-Type" };
+  server.collectHeaders(collectedHeaders, 2);
 
   // Mount the FFat partition for cycle data logging (and later model storage).
   // true = format partition if blank (first-boot only; no-op on subsequent boots).
@@ -5585,6 +7422,44 @@ void setup() {
 
   // Start MQTT task on Core 1
   mqttInit();
+
+  // ── Task watchdog (STAB-5 / NET-19) ──────────────────────────────────────
+  // The ESP32 core already brings the TWDT up for us (CONFIG_ESP_TASK_WDT_INIT),
+  // so this is a reconfigure, not an init: 10 s timeout (10 rampTask ticks /
+  // 2000 chargerBusTask passes — long enough that a slow NVS write or a flash
+  // cache stall can't false-positive) and trigger_panic so a genuine hang gives
+  // us a panic backtrace and a reboot rather than a silent stall with the
+  // chargers still running.
+  //
+  // idle_core_mask = BIT(0) — keep IDLE0 watched. The stock Arduino-ESP32 TWDT
+  // config watches IDLE0 at a 5 s timeout; passing 0 here (as this code used to)
+  // silently DROPPED that monitoring as a side effect of raising the timeout, so
+  // a Core 0 task spinning without yielding would no longer be caught at all.
+  // The net effect of this block is therefore: IDLE0 stays watched, the timeout
+  // goes 5 s → 10 s, and rampTask + chargerBusTask are added (they subscribe
+  // themselves, at the top of each task).
+  //
+  // IDLE1 stays UNWATCHED deliberately: loopTask runs on Core 1 and OTA flashing
+  // and streamFile() legitimately block it for tens of seconds without yielding,
+  // so watching IDLE1 would panic the device during a perfectly normal firmware
+  // upload.
+  {
+    esp_task_wdt_config_t wdtCfg = {};
+    wdtCfg.timeout_ms     = 10000;
+    wdtCfg.idle_core_mask = (1u << 0);   // IDLE0 only
+    wdtCfg.trigger_panic  = true;
+    esp_err_t werr = esp_task_wdt_reconfigure(&wdtCfg);
+    if (werr == ESP_ERR_INVALID_STATE) {
+      // TWDT not running (a core build with CONFIG_ESP_TASK_WDT_INIT off) —
+      // bring it up ourselves with the same settings.
+      werr = esp_task_wdt_init(&wdtCfg);
+    }
+    if (werr == ESP_OK) {
+      LOG("[WDT] task watchdog 10 s, IDLE0 watched, panic on timeout\n");
+    } else {
+      LOG("[WDT] watchdog config failed (%d) — continuing unwatched\n", (int)werr);
+    }
+  }
 }
 
 void loop() {
@@ -5795,7 +7670,7 @@ void processBikeFrame(const twai_message_t &msg) {
     if (vDv < (long)PACK_V_MIN_DV || vDv > (long)PACK_V_MAX_DV) {
       g_lastBadFrameMs = now;   // raises the dashboard banner for a short window
       static unsigned long lastBadMonoVLog = 0;
-      if (now - lastBadMonoVLog >= 5000) {
+      if (lastBadMonoVLog == 0 || now - lastBadMonoVLog >= 5000) {
         lastBadMonoVLog = now;
         LOG("[CAN] Implausible monolith pack voltage %ld dV (valid %u-%u) — "
             "frame rejected\n", vDv,
@@ -5844,7 +7719,26 @@ void processBikeFrame(const twai_message_t &msg) {
   else if (zeroDecoder.hasMonolithPackConfig(id)) {
     // BMS_PACK_CONFIG (0x288): sagAdjust in bytes 0-1, AH candidate in bytes 5-6
     live.monolithSagAdjDv = zeroDecoder.sagAdjust(len, buf);
-    live.monolithAH       = zeroDecoder.AH(len, buf);
+    // Plausibility-gate the pack capacity (STAB-3), for the same reason the
+    // pack voltage above is gated: packAH is a multiplier, not a display value.
+    // It scales the absolute 1 C current ceiling, every cutback table's power
+    // limit, the CV current figure and the ETA — so a corrupt frame decoding to
+    // e.g. 4000 Ah quietly removes the current ceiling rather than producing an
+    // obviously wrong number. A rejected frame keeps the previous value and
+    // raises the same bad-frame banner the voltage gate uses.
+    {
+      short ah = zeroDecoder.AH(len, buf);
+      if (ah < PACK_AH_PLAUSIBLE_MIN || ah > PACK_AH_PLAUSIBLE_MAX) {
+        g_lastBadFrameMs = now;
+        static unsigned long lastBadMonoAhLog = 0;
+        if (lastBadMonoAhLog == 0 || now - lastBadMonoAhLog >= 5000) {
+          lastBadMonoAhLog = now;
+          LOG("[CAN] BMS Ah %d implausible — ignored\n", (int)ah);
+        }
+      } else {
+        live.monolithAH = ah;
+      }
+    }
   }
   else if (zeroDecoder.hasMonolithMaxCRate(id)) {
     // BMS_PACK_TIME (0x508) — C-rate assumed bytes 4-5; verify via raw log
@@ -5890,7 +7784,7 @@ void processBikeFrame(const twai_message_t &msg) {
     if (ptVDv < (long)PACK_V_MIN_DV || ptVDv > (long)PACK_V_MAX_DV) {
       g_lastBadFrameMs = now;   // raises the dashboard banner for a short window
       static unsigned long lastBadPtVLog = 0;
-      if (now - lastBadPtVLog >= 5000) {
+      if (lastBadPtVLog == 0 || now - lastBadPtVLog >= 5000) {
         lastBadPtVLog = now;
         LOG("[CAN] Implausible PowerTank pack voltage %ld dV (valid %u-%u) — "
             "frame rejected\n", ptVDv,
@@ -5915,7 +7809,20 @@ void processBikeFrame(const twai_message_t &msg) {
   else if (zeroDecoder.hasPowerTankPackConfig(id)) {
     // BMS1_PACK_CONFIG (0x289): sagAdjust bytes 0-1, AH bytes 5-6
     live.powerTankSagAdjDv = zeroDecoder.sagAdjust(len, buf);
-    live.powerTankAH       = zeroDecoder.AH(len, buf);
+    // Same plausibility gate as the monolith Ah above (STAB-3).
+    {
+      short ah = zeroDecoder.AH(len, buf);
+      if (ah < PACK_AH_PLAUSIBLE_MIN || ah > PACK_AH_PLAUSIBLE_MAX) {
+        g_lastBadFrameMs = now;
+        static unsigned long lastBadPtAhLog = 0;
+        if (lastBadPtAhLog == 0 || now - lastBadPtAhLog >= 5000) {
+          lastBadPtAhLog = now;
+          LOG("[CAN] BMS Ah %d implausible — ignored\n", (int)ah);
+        }
+      } else {
+        live.powerTankAH = ah;
+      }
+    }
   }
   else if (zeroDecoder.hasPowerTankMaxCRate(id)) {
     // BMS1_PACK_TIME (0x509) — C-rate assumed bytes 4-5; verify via raw log
@@ -6100,6 +8007,16 @@ void sendHeartbeat() {
     xSemaphoreGive(chargerMutex);
   }
 
+  // Failsafe STOP override (STAB-2). Applies to BOTH branches above — the
+  // successful read and the mutex timeout (which leaves start=false anyway).
+  // rampTask raises g_forceStop before it attempts the mutex write that zeroes
+  // the command, so if that write is lost to contention the stale START in
+  // chargerBus never reaches the bus: this tick transmits a STOP frame with
+  // zero current regardless. No lock needed — a bool is atomic here, and the
+  // whole point is to work when the lock is unavailable. vCmd is left as read
+  // (or 0 on timeout); byte 4 of the frame is what the charger obeys.
+  if (g_forceStop) { start = false; aCmd = 0; }
+
   // Dead-man check (finding #6): rampTask owns the command values and is the
   // only thing that supervises voltage/temperature/phase. If it stops
   // advancing g_rampHeartbeat (mutex wedge, stack-overflow park, crash) the
@@ -6117,7 +8034,7 @@ void sendHeartbeat() {
   if (start && (tn - lastRampHbMs) > RAMP_DEADMAN_MS) {
     vCmd = 0; aCmd = 0; start = false;
     static unsigned long lastDeadmanLog = 0;
-    if (tn - lastDeadmanLog >= 5000UL) {
+    if (lastDeadmanLog == 0 || tn - lastDeadmanLog >= 5000UL) {
       lastDeadmanLog = tn;
       LOG("[MCP] rampTask not advancing (%lus) — forcing charger STOP (dead-man)\n",
           (tn - lastRampHbMs) / 1000UL);
@@ -6142,7 +8059,11 @@ void sendHeartbeat() {
   static uint16_t consecTxErr = 0;
   if (rc != CAN_OK) {
     unsigned long now = millis();
-    if (now - lastErrLogMs >= 5000) {
+    // `lastErrLogMs == 0` is the file's rate-limiter idiom AND what this
+    // limiter's own reset-to-0-on-success (below) has always intended: it is
+    // reset so that the next error after a working period logs immediately,
+    // which `now - 0 >= 5000` does not deliver while millis() is still small.
+    if (lastErrLogMs == 0 || now - lastErrLogMs >= 5000) {
       // Error 6 = TX buffer timeout (no ACK from bus — expected with nothing connected)
       // Error 7 = send msg timeout
       LOG("[MCP] Heartbeat TX error %d (no charger connected?)\n", rc);
@@ -6173,7 +8094,7 @@ void sendHeartbeat() {
     // Bus-off shouldn't occur in listen-only mode — log but don't spam
     if (consecTxErr >= MCP_TX_FAIL_RESET_THRESHOLD) {
       static unsigned long lastBusOffLog = 0;
-      if (millis() - lastBusOffLog >= 10000) {
+      if (lastBusOffLog == 0 || millis() - lastBusOffLog >= 10000) {
         lastBusOffLog = millis();
         LOG("[MCP] Sustained TX failure in listen-only mode — unexpected, "
             "check wiring\n");
@@ -6222,14 +8143,26 @@ void processChargerFrame(uint32_t id, byte len, byte* buf) {
   if (xSemaphoreTake(chargerMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
     ChargerUnit& c = chargerBus.chargers[nibble];
     bool wasPresent = c.present;
-    c.present    = true;
+    // Phantom-charger debounce (audit 2026-09). A single frame whose ID arrived
+    // corrupted — or aliased off another node — used to be enough to declare a
+    // whole extra charger present. That inflates chargerCount, which inflates
+    // rampTask's divisor (so every real unit under-delivers) and trips the
+    // count-mismatch stop against a charger that does not exist. Require
+    // CHARGER_SEEN_MIN_FRAMES status frames within one CHARGER_TIMEOUT_MS
+    // window instead (not strictly consecutive — the count only resets on
+    // staleness decay); a real unit broadcasts at ~1 Hz so it qualifies in
+    // about a second.
+    if (c.seenCount < CHARGER_SEEN_MIN_FRAMES) c.seenCount++;
+    c.present    = (c.seenCount >= CHARGER_SEEN_MIN_FRAMES);
     c.voltDv     = voltDv;
     c.ampsDa     = ampsDa;
     c.status     = status;
     c.lastSeenMs = millis();
 
-    // Recount active chargers whenever a new one appears
-    if (!wasPresent) {
+    // Recount active chargers whenever a new one qualifies. Gated on the
+    // present false→true edge, so the first (not-yet-qualified) frame of a new
+    // unit does not recount and the qualifying frame does exactly once.
+    if (!wasPresent && c.present) {
       uint8_t count = 0;
       for (int i = 0; i < MAX_CHARGERS; i++) {
         if (chargerBus.chargers[i].present) count++;
@@ -6270,6 +8203,13 @@ void chargerBusTask(void* /*pvParameters*/) {
     return;                    // never reached, but keeps compiler happy
   }
 
+  // Subscribe to the task watchdog (STAB-5). Deliberately AFTER the mcpInit()
+  // bail-out above: that path calls vTaskDelete() on ourselves, and a subscribed
+  // task that deletes itself leaves a dangling handle in the TWDT's list.
+  if (esp_task_wdt_add(nullptr) != ESP_OK) {
+    LOG("[WDT] chargerBusTask could not subscribe to the task watchdog\n");
+  }
+
   unsigned long lastHeartbeatMs = 0;
   unsigned long lastDecayMs     = 0;
   // Rate-limit raw frame logging in listen-only mode
@@ -6291,9 +8231,15 @@ void chargerBusTask(void* /*pvParameters*/) {
         uint8_t count = 0;
         for (int i = 0; i < MAX_CHARGERS; i++) {
           ChargerUnit& c = chargerBus.chargers[i];
-          if (c.present && (now - c.lastSeenMs) > CHARGER_TIMEOUT_MS) {
-            c.present = false;
-            LOG("[MCP] Charger %d timed out — marking absent\n", i);
+          // Decay on staleness whatever `present` says. A unit that logged one
+          // qualifying frame and then vanished has to re-earn its place from
+          // zero — otherwise one stray frame now plus another an hour later
+          // would still add up to CHARGER_SEEN_MIN_FRAMES and invent a phantom
+          // charger. seenCount > 0 keeps never-seen slots (lastSeenMs == 0) out.
+          if (c.seenCount > 0 && (now - c.lastSeenMs) > CHARGER_TIMEOUT_MS) {
+            if (c.present) LOG("[MCP] Charger %d timed out — marking absent\n", i);
+            c.present   = false;
+            c.seenCount = 0;
           }
           if (c.present) count++;
         }
@@ -6356,6 +8302,7 @@ void chargerBusTask(void* /*pvParameters*/) {
 #endif
 
     vTaskDelay(pdMS_TO_TICKS(5));
+    esp_task_wdt_reset();   // one feed per 5 ms pass (STAB-5)
   }
 }
 
@@ -6383,23 +8330,39 @@ void chargerBusInit() {
 // ---------------------------------------------------------------------------
 // Power ramp task — Core 1, priority 2
 //
-// Runs every 1 s. Steps currentPowerW toward targetPowerW by at most
-// ctrl.rampStepW (default 50 W) per tick, then computes the voltage/current
-// command and writes it to chargerBus under chargerMutex.
+// Runs every 1 s. Steps ctrl.currentPowerW toward the cutback-limited
+// effectiveTarget by at most ctrl.rampStepW (default DEFAULT_RAMP_STEP_W,
+// 100 W) per tick — up to 2× that, capped at 500 W, when a cutback is pulling
+// the target down, and straight to 0 when a cutback table returns a 0 C-rate.
+// It then computes the voltage/current command and writes it to chargerBus
+// under chargerMutex.
 //
 // Voltage selection:
-//   Commanded voltage = raw monolithVoltageDv + sagAdjDv (sag compensation
-//   from BMS_PACK_CONFIG 0x288 bytes 0-1, in dV). sagAdjDv is the BMS estimate
-//   of how much the voltage is sagging under load — adding it gives the
-//   open-circuit equivalent. PowerTankVoltageDv is added if present.
-//   Result is clamped to the lower of ctrl.targetVoltDv and MAX_CHARGE_VOLTAGE_DV.
+//   Commanded voltage is the CEILING, not the measured pack voltage:
+//     CC   -> voltCeiling = min(ctrl.targetVoltDv, MAX_CHARGE_VOLTAGE_DV)
+//     CV   -> cvTargetDv (the ceiling for a voltage-triggered CV, the pack
+//             voltage at transition for a taper- or plateau-triggered one)
+//     DONE -> 0 with cmdStart false
+//   The pack voltage used for the phase/cutback decisions (rawPackDv) is the
+//   monolith reading plus sagAdjDv when that is positive (BMS_PACK_CONFIG
+//   0x288 bytes 0-1, dV — the BMS's estimate of sag under load). The PowerTank
+//   voltage is NOT added: it sits in parallel with the monolith, so the two
+//   share one rail and summing them would double the reading.
 //
 // Current calculation:
-//   I = P / V  (W / V = A).  Stored as dA (0.1 A units) for the heartbeat.
-//   A floor of 1 dA is applied so the charger doesn't see a zero-current
-//   command while ramping through very low power steps.
+//   I = P / V  (W / V = A), V being the pack voltage clamped to the ceiling.
+//   The total is clamped to CELL_MAX_CHARGE_C × packAH, then divided by
+//   max(configured charger count, detected charger count) to get the
+//   per-charger figure, stored as dA (0.1 A units) for the heartbeat. A floor
+//   of 1 dA is applied so the charger doesn't see a zero-current command while
+//   ramping through very low power steps.
 //
-// Session energy is accumulated each tick: Wh += P_W / 3600,  Ah += I_A / 3600
+// Session energy is accumulated each tick from the MEASURED charger output,
+// not the commanded power: Wh += (I_actual × V_pack) / 3600, Ah += I_actual / 3600.
+//
+// Failsafe: every path that decides the chargers must stop raises g_forceStop
+// BEFORE attempting its chargerMutex write, so a lost write cannot leave a
+// stale START on the bus (see sendHeartbeat()).
 // ---------------------------------------------------------------------------
 
 // Count the number of data rows in /cycles.csv (lines minus the header).
@@ -6454,6 +8417,12 @@ static void appendCycleRecord(const CycleRecord& r) {
               "absorption_min,charger_count,abort_reason");
   }
   char line[180];
+  // total_ah / total_wh stay decimal ("12.34" Ah, "1234.5" Wh) so the column
+  // keeps the meaning the header advertises — the x100/x10 fixed-point is a
+  // storage detail, not the CSV contract. That is also why widening
+  // total_ah_x100 to uint32_t (STAB-11) needed no change here: the /100.0f and
+  // /10.0f divisions convert both fields to double before they reach the
+  // varargs, so %.2f / %.1f are correct for any integer width the struct uses.
   snprintf(line, sizeof(line),
     "%s,%d,%.1f,%.1f,%d,%d,%d,%d,%.2f,%.1f,%d,%d,%d,%d",
     r.timestamp,
@@ -6473,8 +8442,27 @@ static void appendCycleRecord(const CycleRecord& r) {
   LOG("[FAT] Cycle record appended (#%d): %s\n", (int)g_cycleCount, line);
 }
 
+// Narrow a raw pack temperature (short °C) to the int8_t a CycleRecord stores.
+// A plain (int8_t) cast is wrong twice over: ZERO_TEMP_INVALID (-32768) wraps to
+// 0, writing a fabricated "0 °C" into the training data that nothing downstream
+// can tell from a real reading, and any out-of-range value wraps to an arbitrary
+// in-range one. Map "no reading" to -128 — the single reserved sentinel the CSV
+// consumer (and cycle_record.h) treats as missing — and clamp everything else
+// into the representable window so a garbled frame can only ever be recorded as
+// an implausible-but-honest -127 / 127.
+static int8_t cycleTempI8(short v) {
+  if (v <= TEMP_INVALID_THRESHOLD) return -128;   // no usable reading
+  if (v >  127) return  127;
+  if (v < -127) return -127;
+  return (int8_t)v;
+}
+
 void rampTask(void* /*pvParameters*/) {
   LOG("[RAMP] rampTask running on core %d\n", xPortGetCoreID());
+  // Subscribe to the task watchdog (STAB-5) — fed once per 1 s tick below.
+  if (esp_task_wdt_add(nullptr) != ESP_OK) {
+    LOG("[WDT] rampTask could not subscribe to the task watchdog\n");
+  }
   session.startMs = millis();
 
   // CC / CV / DONE state machine — exposed to users as "Bulk / Absorption / Float"
@@ -6492,7 +8480,10 @@ void rampTask(void* /*pvParameters*/) {
   enum RampPhase : uint8_t { PHASE_CC = 0, PHASE_CV = 1, PHASE_DONE = 2 };
   static RampPhase phase      = PHASE_CC;
   static unsigned long cvMs   = 0;   // millis() when CV phase was entered
-  static uint16_t cvAmpsDa    = 0;   // per-charger amps ceiling during CV
+  // TOTAL amps ceiling for CV, in dA, latched at the CC→CV transition. Stored
+  // as a total (not per-charger) so the live divisor and the 1 C ceiling can be
+  // re-applied on every CV tick — see the write in the charger-bus update.
+  static uint16_t cvAmpsTotalDa = 0;
   // CV target voltage — set at CC→CV transition, used by both the charger
   // command and the load-sag (CV→CC) detector. For voltage-triggered CV
   // this is the ceiling. For taper- or plateau-triggered CV this is the
@@ -6521,11 +8512,47 @@ void rampTask(void* /*pvParameters*/) {
   static unsigned long voltPlateauStartMs = 0;
   static long          plateauRefDv       = 0;
 
+  // millis() of the first tick on which a pack temperature sensor stopped
+  // returning a usable reading; 0 = both valid, or the watch has been reset.
+  // Declared at task scope rather than inside the safe-envelope block that uses
+  // it so the disabled branch can clear it with the rest of the per-session
+  // state: a session that ended with a dead sensor otherwise left the timer
+  // armed, and the next session could inherit an immediate INHIBIT_TEMP_UNKNOWN
+  // before any telemetry had a chance to arrive.
+  static unsigned long tempInvalidSinceMs = 0;
+
+  // millis() of the most recent `enabled` false→true edge. Both the charger
+  // fault scan and the overvoltage detector ignore what the chargers report for
+  // CHARGER_FAULT_GRACE_MS after this point: an Elcon that has been idle is
+  // asserting its comm-timeout bit and reporting a starting-state output until
+  // it has seen a few command frames, and reading that as a fault would latch a
+  // stop on every single charge start. 0 = no edge seen yet.
+  static unsigned long enableEdgeMs = 0;
+  const unsigned long  CHARGER_FAULT_GRACE_MS = 5000UL;
+
+  // Rate limiter shared by every "chargerMutex timeout while commanding STOP"
+  // report (STAB-2). One timestamp for all of them: if the mutex is wedged all
+  // four stop paths hit it, and four separate 5 s limiters would just quadruple
+  // the noise without telling us anything more.
+  static unsigned long lastStopMutexLogMs = 0;
+
   // Cycle data logger — record under construction and transition timestamps.
   // All reads/writes are from rampTask only; no mutex needed.
   static CycleRecord   g_cycle    = {};
   static unsigned long ccEntryMs  = 0;   // millis() when current CC phase began
   static unsigned long cvEntryMs  = 0;   // millis() when current CV phase began
+  // STAB-11 / D3: this cycle's own energy counters. The session accumulators
+  // cannot be used for this, not even as a start/end pair: they are
+  // session-to-date, they survive across cycles, and the user can zero them at
+  // any moment with Reset Session (/api/control or the MQTT button). A
+  // start-snapshot-and-subtract scheme under-reports whenever a reset lands
+  // mid-cycle — baseline 5000 Wh, reset to 0, cycle goes on to deliver 6000 Wh,
+  // and the subtraction records 1000. Accumulating independently here is
+  // immune: these two are zeroed at CC entry and incremented alongside every
+  // sessionAddCC() call in the tick, so Reset Session moves the dashboard
+  // counters without touching what this cycle has recorded.
+  static float         cycleWh = 0.0f;   // Wh delivered since this cycle's CC entry
+  static float         cycleAh = 0.0f;   // Ah delivered since this cycle's CC entry
   static RampPhase     lastPhase  = PHASE_DONE; // phase at end of previous tick
 
   const unsigned long CV_HOLD_MS = 60UL * 60UL * 1000UL; // 1 h absorption safety timeout
@@ -6546,6 +8573,13 @@ void rampTask(void* /*pvParameters*/) {
 
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(1000)); // 1 s ramp tick
+    // Feed the task watchdog here, not at the end of the tick: several paths
+    // below `continue` (controlMutex timeout, charging disabled, stale BMS
+    // telemetry), and a feed further down would be skipped by all of them.
+    // This says "the task is still scheduling", which is exactly what the WDT
+    // is for; whether a tick did useful work is the g_rampHeartbeat dead-man's
+    // job (see the bump after the control snapshot).
+    esp_task_wdt_reset();
 
     // ── Control snapshot ──────────────────────────────────────────────────────
     uint16_t target     = 0;
@@ -6607,7 +8641,19 @@ void rampTask(void* /*pvParameters*/) {
     static bool pendingStartEval = false;
     bool justEnabled = enabled && !prevEnabled;
     prevEnabled = enabled;
-    if (justEnabled) pendingStartEval = true;
+    if (justEnabled) {
+      pendingStartEval = true;
+      // Start of the fault/overvoltage grace window — see enableEdgeMs above.
+      enableEdgeMs = millis();
+      // The charger-fault latch (STAB-4) requires a manual re-arm: this off→on
+      // edge IS that re-arm. Clearing it here rather than on the fault going
+      // away means a unit that faults, drops off the bus and reappears cannot
+      // resume charging on its own — the user has to press Stop then Charge.
+      if (g_chargerFault) {
+        LOG("[RAMP] Charge re-enabled — clearing latched charger fault\n");
+        g_chargerFault = false;
+      }
+    }
 
     // Disabled: reset to CC, stop charger, clear all per-session state, skip tick
     if (!enabled) {
@@ -6619,6 +8665,11 @@ void rampTask(void* /*pvParameters*/) {
       // "charging stopped, waiting for bike CAN" would be a false statement.
       g_bmsStale         = false;
       g_currentClamped   = false;
+      // Recomputed every tick from the live charger count while charging, so it
+      // would otherwise stay raised after a switch-off. g_chargerFault is
+      // deliberately NOT cleared here — it is latched until the next enable
+      // edge, and its banner is exactly what the user needs to see meanwhile.
+      g_chargerCountMismatch = false;
       // Switching off abandons any pending start evaluation — the next enable
       // edge will raise a fresh one.
       pendingStartEval   = false;
@@ -6626,6 +8677,28 @@ void rampTask(void* /*pvParameters*/) {
       voltPlateauStartMs = 0;
       plateauRefDv       = 0;
       cvTargetDv         = 0;
+      // D1 — the cycle logger's two transition variables have to be reset here
+      // as well, and lastPhase specifically must be dragged along with the
+      // `phase = PHASE_CC` above. lastPhase is only assigned at the BOTTOM of
+      // the tick, and this branch `continue`s past that point, so a Stop
+      // pressed during absorption left lastPhase stuck at PHASE_CV with
+      // cvEntryMs still set. The next enable whose start evaluation decided
+      // "nothing to charge" went straight to PHASE_DONE, and the DONE hook —
+      // which trusts lastPhase == PHASE_CV to mean "a real absorption phase
+      // just ended" — appended a fabricated row: the previous cycle's start
+      // values, an absorption_min that counted all the off-time in between,
+      // and abort_reason 0 (current_taper) for a cycle that never ran.
+      // Setting lastPhase here keeps it honest about the phase this branch
+      // just forced, which is the same thing the bottom-of-tick assignment
+      // would have done had it been reached.
+      cvEntryMs          = 0;
+      lastPhase          = PHASE_CC;
+      // Per-session too: with charging off there is nothing to inhibit, so the
+      // "how long have the sensors been dark" timer must not keep running.
+      // Leaving it armed across a switch-off meant the next session could be
+      // inhibited for INHIBIT_TEMP_UNKNOWN on its very first tick, crediting it
+      // with invalidity that accumulated while the charger was idle.
+      tempInvalidSinceMs = 0;
       // Zero the commanded power. The ramp task owns currentPowerW, so its
       // disabled branch is the authoritative place to clear it — this covers
       // EVERY disable path (dashboard button, MQTT, auto-disable when the
@@ -6637,11 +8710,20 @@ void rampTask(void* /*pvParameters*/) {
         ctrl.currentPowerW = 0;
         xSemaphoreGive(controlMutex);
       }
+      // Assert the failsafe BEFORE the (best-effort) mutex write, so a lost
+      // write still results in a STOP frame on the bus (STAB-2).
+      g_forceStop = true;
       if (xSemaphoreTake(chargerMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
         chargerBus.cmdVoltDv = 0;
         chargerBus.cmdAmpsDa = 0;
         chargerBus.cmdStart  = false;
         xSemaphoreGive(chargerMutex);
+      } else {
+        unsigned long tms = millis();
+        if (lastStopMutexLogMs == 0 || tms - lastStopMutexLogMs >= 5000UL) {
+          lastStopMutexLogMs = tms;
+          LOG("[RAMP] chargerMutex timeout on STOP — forceStop asserted\n");
+        }
       }
       continue;
     }
@@ -6652,10 +8734,16 @@ void rampTask(void* /*pvParameters*/) {
     long  ptDv       = 0;
     bool  ptPresent  = false;
     short monolithAH = 114; // nominal fallback
-    short maxTemp    = -127;
-    short minTemp    = -127; // coldest thermocouple — drives COLD_CUTBACK
-    short ptMaxTemp  = -127; // PowerTank hottest thermocouple (finding #4)
-    short ptMinTemp  = -127; // PowerTank coldest thermocouple (finding #4)
+    // Defaults are the INVALID sentinel, not -127: if the liveMutex take below
+    // times out these locals are what the rest of the tick sees, and -127 is
+    // only "obviously wrong" by convention — it still passes as a number to
+    // anything that does not know to look for it. ZERO_TEMP_INVALID is the one
+    // value every consumer here already tests for (TEMP_INVALID_THRESHOLD), so
+    // a missed snapshot degrades to "no reading" rather than "absurdly cold".
+    short maxTemp    = ZERO_TEMP_INVALID;
+    short minTemp    = ZERO_TEMP_INVALID; // coldest thermocouple — drives COLD_CUTBACK
+    short ptMaxTemp  = ZERO_TEMP_INVALID; // PowerTank hottest thermocouple (finding #4)
+    short ptMinTemp  = ZERO_TEMP_INVALID; // PowerTank coldest thermocouple (finding #4)
     unsigned long bmsLastMs = 0; // last monolith voltage frame (staleness, #3)
 
     if (xSemaphoreTake(liveMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -6690,8 +8778,9 @@ void rampTask(void* /*pvParameters*/) {
     // the CC accumulator added energy at the COMMANDED rate, which kept
     // counting Wh/Ah even when the chargers reported 0 A — exactly the
     // pathology Bug 3 in [project_charging_bugs_2026-04-26.md] describes.
-    unsigned long now0     = millis();
-    float         actualA  = 0.0f;
+    unsigned long now0             = millis();
+    float         actualA          = 0.0f;
+    uint8_t       detectedChargers = 0;
     if (xSemaphoreTake(chargerMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
       for (int i = 0; i < MAX_CHARGERS; i++) {
         if (chargerBus.chargers[i].present &&
@@ -6699,7 +8788,44 @@ void rampTask(void* /*pvParameters*/) {
           actualA += chargerBus.chargers[i].ampsDa / 10.0f;
         }
       }
+      // Count of units actually answering, maintained (and clamped to
+      // MAX_ACTIVE_CHARGERS) by chargerBusTask. 0 while nothing has been seen.
+      detectedChargers = chargerBus.chargerCount;
       xSemaphoreGive(chargerMutex);
+    }
+
+    // ── Per-charger current divisor (STAB-1) ─────────────────────────────────
+    // The divisor used to be ctrl.chargerCount alone — the number the user
+    // picked in the UI — while the detected count was only ever tested as a
+    // bool ("any charger present?"). All units share one CAN ID and therefore
+    // one broadcast command, so each of them delivers the per-charger figure:
+    // commanding total/2 with three units on the bus puts 1.5× the intended
+    // current into the pack. Dividing by whichever count is LARGER is the
+    // fail-safe direction — it can only ever under-deliver.
+    //
+    // This is a limit on how much damage a wrong setting can do, not a licence
+    // to run with one: a detected count above the configured one also raises
+    // g_chargerCountMismatch below and stops charging until they agree.
+    uint8_t divisor = (detectedChargers > nChargers) ? detectedChargers : nChargers;
+    if (divisor < 1) divisor = 1;
+
+    // Detected more units than the user says are installed. Both counts are
+    // already clamped to MAX_ACTIVE_CHARGERS, so this is specifically a
+    // setting-vs-reality disagreement, not the >4 wiring fault
+    // (g_chargerCountClamped) — that one keeps its own banner.
+    bool chargerCountMismatch = (detectedChargers > nChargers);
+    g_chargerCountMismatch = chargerCountMismatch;
+    if (chargerCountMismatch) {
+      static unsigned long lastMismatchLogMs = 0;
+      // `last == 0 ||` is the file's rate-limiter idiom: without it a first
+      // event inside the first N ms of uptime is silently swallowed, because
+      // `now - 0 >= N` is false while millis() is still small. That is exactly
+      // when a boot-time charger-count mismatch would occur.
+      if (lastMismatchLogMs == 0 || now0 - lastMismatchLogMs >= 10000UL) {
+        lastMismatchLogMs = now0;
+        LOG("[RAMP] %u chargers detected but %u configured — STOP until the "
+            "setting matches\n", (unsigned)detectedChargers, (unsigned)nChargers);
+      }
     }
 
     // ── Bike BMS staleness guard (finding #3) ─────────────────────────────────
@@ -6735,14 +8861,19 @@ void rampTask(void* /*pvParameters*/) {
         ctrl.currentPowerW = 0;
         xSemaphoreGive(controlMutex);
       }
+      // Failsafe first, mutex write second (STAB-2).
+      g_forceStop = true;
       if (xSemaphoreTake(chargerMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
         chargerBus.cmdVoltDv = 0;
         chargerBus.cmdAmpsDa = 0;
         chargerBus.cmdStart  = false;
         xSemaphoreGive(chargerMutex);
+      } else if (lastStopMutexLogMs == 0 || now0 - lastStopMutexLogMs >= 5000UL) {
+        lastStopMutexLogMs = now0;
+        LOG("[RAMP] chargerMutex timeout on STOP — forceStop asserted\n");
       }
       static unsigned long lastStaleLogMs = 0;
-      if (now0 - lastStaleLogMs >= 5000UL) {
+      if (lastStaleLogMs == 0 || now0 - lastStaleLogMs >= 5000UL) {
         lastStaleLogMs = now0;
         LOG("[RAMP] Bike BMS data stale (%lus since last frame) — charger STOP, "
             "waiting for bike CAN\n", (now0 - bmsLastMs) / 1000UL);
@@ -6755,16 +8886,37 @@ void rampTask(void* /*pvParameters*/) {
     // sit further down with the cutback calculations. When a PowerTank is
     // present and live (reporting voltage — the same "PT is really here" gate
     // the voltage sum uses), fold its hottest / coldest thermocouple in so the
-    // hot and cold limits track whichever pack is nearest its limit. Boot
-    // caveat (as for the monolith): a present pack momentarily reading 0 °C
-    // before its first temp frame is benign because the ramp is far slower than
-    // the ~3 s it takes real telemetry to arrive.
+    // hot and cold limits track whichever pack is nearest its limit.
+    //
+    // Each PowerTank reading is validity-checked before it is folded in. The
+    // cold side is why this matters: ZERO_TEMP_INVALID is -32768, so an
+    // unguarded `if (ptMinTemp < coldTemp)` adopted the sentinel as the coldest
+    // cell the moment a PowerTank was detected but had not yet sent a temp
+    // frame (or had a dead thermistor). That poisons coldTemp for the whole
+    // tick — COLD_CUTBACK would see an impossibly cold pack. Folding in only
+    // valid readings means a PowerTank with no usable temperature simply does
+    // not contribute; the monolith's own reading still governs, and if BOTH
+    // packs are dark the per-sensor validity test below catches it.
     short hotTemp  = maxTemp;
     short coldTemp = minTemp;
     if (ptPresent && ptDv > 0) {
-      if (ptMaxTemp > hotTemp)  hotTemp  = ptMaxTemp;
-      if (ptMinTemp < coldTemp) coldTemp = ptMinTemp;
+      bool ptHotValid  = (ptMaxTemp > TEMP_INVALID_THRESHOLD);
+      bool ptColdValid = (ptMinTemp > TEMP_INVALID_THRESHOLD);
+      // A monolith reading that is itself invalid must not win the comparison
+      // either, so take the PowerTank value outright in that case.
+      if (ptHotValid  && (hotTemp  <= TEMP_INVALID_THRESHOLD || ptMaxTemp > hotTemp))
+        hotTemp  = ptMaxTemp;
+      if (ptColdValid && (coldTemp <= TEMP_INVALID_THRESHOLD || ptMinTemp < coldTemp))
+        coldTemp = ptMinTemp;
     }
+
+    // Per-sensor validity of the merged worst-case readings. Computed here, at
+    // tick scope, because two places need it: the safe-envelope gate just below
+    // and the HOT_CUTBACK / COLD_CUTBACK lookups further down. Each limit is
+    // applied on the strength of its OWN sensor — one dead thermistor must not
+    // disable the other's protection.
+    bool coldValid = (coldTemp > TEMP_INVALID_THRESHOLD);
+    bool hotValid  = (hotTemp  > TEMP_INVALID_THRESHOLD);
 
     // ── Cell safe-charging-envelope gate ─────────────────────────────────────
     // Farasis IMP06160230P25A: charging permitted only 0-45 °C, and never below
@@ -6798,19 +8950,50 @@ void rampTask(void* /*pvParameters*/) {
                           ? (short)(CHARGE_TEMP_MAX_C - CHARGE_TEMP_HYSTERESIS_C)
                           : CHARGE_TEMP_MAX_C;
 
-      // coldTemp/hotTemp default to -127 when no temperature frame has arrived
-      // yet. Treating that as "too cold" would refuse to charge for the first
-      // few seconds after every power-on, so an uninitialised sentinel is
-      // ignored here; the ramp is far slower than the ~3 s until real telemetry
-      // arrives, and the cutback tables still apply in the meantime.
-      bool tempsValid = (coldTemp > -100) && (hotTemp > -100);
+      // Validity is per SENSOR, not a single combined flag (audit 2026-09).
+      // coldTemp/hotTemp carry ZERO_TEMP_INVALID until a temperature frame has
+      // arrived, and the decoder returns it for a disconnected sensor or a short
+      // frame. The old code required BOTH to be valid before applying EITHER
+      // limit, so one dead thermistor disabled the other sensor's protection for
+      // the whole 10 s grace window: a genuinely 50 °C pack reported by a working
+      // hot sensor was ignored because the cold sensor had failed. Each limit now
+      // stands on its own reading. coldValid / hotValid are computed just above
+      // this block, at tick scope, because the cutback lookups need them too.
 
-      if (tempsValid && coldTemp < coldLimit)      inhibit = INHIBIT_TOO_COLD;
-      else if (tempsValid && hotTemp  > hotLimit)  inhibit = INHIBIT_TOO_HOT;
+      // ...but "no usable temperature" cannot simply be ignored either (STAB-10).
+      // Before ZERO_TEMP_INVALID a dead thermistor decoded as 0 °C, which reads
+      // as a healthy pack: the hot cutback stopped limiting and the 45 °C
+      // inhibit could never fire. Allow TEMP_INVALID_INHIBIT_MS of continuous
+      // invalidity to cover boot and the odd dropped frame, then inhibit.
+      // EITHER sensor being dark arms the timer — see INHIBIT_TEMP_UNKNOWN.
+      // tempInvalidSinceMs is declared at task scope so the disabled branch can
+      // clear it between sessions.
+      const unsigned long TEMP_INVALID_INHIBIT_MS = 10000UL;
+      bool bothValid = coldValid && hotValid;
+      if (bothValid)                       tempInvalidSinceMs = 0;
+      else if (tempInvalidSinceMs == 0)    tempInvalidSinceMs = now0;
+      bool tempUnknown = !bothValid && tempInvalidSinceMs != 0 &&
+                         (now0 - tempInvalidSinceMs) >= TEMP_INVALID_INHIBIT_MS;
+
+      // If the sensor that raised an inhibit goes dark, HOLD that inhibit rather
+      // than clearing it (audit 2026-09, B1). Otherwise a hot thermistor failing
+      // at 46 °C would drop the TOO_HOT stop on the very next tick and, with the
+      // hot cutback also skipped for an invalid sensor, permit full power until
+      // INHIBIT_TEMP_UNKNOWN arms 10 s later. Re-evaluation resumes when the
+      // sensor reports again.
+      if (prev == INHIBIT_TOO_HOT && !hotValid)          inhibit = INHIBIT_TOO_HOT;
+      else if (prev == INHIBIT_TOO_COLD && !coldValid)   inhibit = INHIBIT_TOO_COLD;
+      else if (coldValid && coldTemp < coldLimit)        inhibit = INHIBIT_TOO_COLD;
+      else if (hotValid && hotTemp  > hotLimit)          inhibit = INHIBIT_TOO_HOT;
       // Voltage floor needs no hysteresis: charging raises pack voltage, so it
       // moves monotonically away from the limit once current starts flowing.
       else if (rawPackDv > 0 && rawPackDv < (long)PACK_V_CHARGE_FLOOR_DV)
         inhibit = INHIBIT_PACK_LOW;
+      // Ranked last of the four only because the three above are specific
+      // diagnoses and this one is "we cannot tell" — all four stop charging
+      // outright, so the ordering is about which message the user sees.
+      // No hysteresis: the moment both sensors report again, charging resumes.
+      else if (tempUnknown) inhibit = INHIBIT_TEMP_UNKNOWN;
 
       g_chargeInhibit = inhibit;
 
@@ -6825,11 +9008,26 @@ void rampTask(void* /*pvParameters*/) {
           ctrl.currentPowerW = 0;
           xSemaphoreGive(controlMutex);
         }
+        // Failsafe first, mutex write second (STAB-2).
+        g_forceStop = true;
         if (xSemaphoreTake(chargerMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
           chargerBus.cmdVoltDv = 0;
           chargerBus.cmdAmpsDa = 0;
           chargerBus.cmdStart  = false;
           xSemaphoreGive(chargerMutex);
+        } else if (lastStopMutexLogMs == 0 || now0 - lastStopMutexLogMs >= 5000UL) {
+          lastStopMutexLogMs = now0;
+          LOG("[RAMP] chargerMutex timeout on STOP — forceStop asserted\n");
+        }
+        // Dedicated message for the "no temperature at all" case — the generic
+        // line below would print two sentinel values and no elapsed time.
+        if (inhibit == INHIBIT_TEMP_UNKNOWN) {
+          static unsigned long lastTempUnknownLogMs = 0;
+          if (lastTempUnknownLogMs == 0 || now0 - lastTempUnknownLogMs >= 10000UL) {
+            lastTempUnknownLogMs = now0;
+            LOG("[RAMP] Pack temperature unknown for %lus — charging inhibited\n",
+                (now0 - tempInvalidSinceMs) / 1000UL);
+          }
         }
         // Log the transition immediately, then rate-limit the repeat.
         static unsigned long lastInhibitLogMs = 0;
@@ -6908,6 +9106,15 @@ void rampTask(void* /*pvParameters*/) {
       LOG("[RAMP] Pack %ld dV is above target %d dV by more than %ld dV — "
           "nothing to charge, %s→FLOAT\n",
           rawPackDv, voltCeiling, hyst, (phase == PHASE_CV) ? "ABSORPTION" : "BULK");
+      // D2 — a CV→DONE exit through here IS logged as a cycle (the DONE hook
+      // only requires lastPhase == PHASE_CV), but it did not end the way the
+      // default abort_reason claims. 0 means "current tapered to the finish
+      // line"; this is the opposite — absorption was cut short because the
+      // target moved below the pack, or the pack was lifted above it from
+      // outside. Mark it 2 (above_target) so Stage 2 training can tell a
+      // naturally-terminated absorption from an administratively-ended one.
+      // Only meaningful on the CV arm: from CC the record is not written at all.
+      if (phase == PHASE_CV) g_cycle.abort_reason = 2;
       phase      = PHASE_DONE;
       cvTargetDv = 0;
     }
@@ -7001,7 +9208,12 @@ void rampTask(void* /*pvParameters*/) {
     // than the user's raw target. Without this, VcbON causes current to be
     // clamped (e.g. 657 W) while target stays at 9900 W, making atRamp
     // permanently FALSE and the taper watch never starts.
+    // packAH scales the 1 C current ceiling, every cutback power limit, the CV
+    // current figure and the ETA. It is gated on ingestion (STAB-3), but clamp
+    // it again here: this is the single place all of those read it, and the
+    // cost of the clamp is nil next to the cost of a bad value getting through.
     float packAH = (monolithAH > 0) ? (float)monolithAH : 114.0f;
+    if (packAH > PACK_AH_MAX) packAH = PACK_AH_MAX;
     float voltV  = (rawPackDv > 0) ? rawPackDv / 10.0f : voltCeiling / 10.0f;
 
     uint32_t voltCbK  = find_cutback((int)rawPackDv, CUTBACK_AT_OR_ABOVE, VOLTAGE_CUTBACK);
@@ -7011,7 +9223,19 @@ void rampTask(void* /*pvParameters*/) {
     // hotTemp / coldTemp (worst case across both packs, finding #4) are now
     // computed further up — the safe-charging-envelope gate needs them before
     // this point. Values are unchanged.
-    uint32_t hotCbK   = find_cutback((int)hotTemp,  CUTBACK_AT_OR_ABOVE, HOT_CUTBACK);
+    //
+    // An INVALID reading is never fed to a cutback table. Feeding the sentinel
+    // in produces a confidently wrong answer in both directions: -32768 °C sits
+    // below every HOT_CUTBACK threshold (AT_OR_ABOVE → no limit, which is what
+    // we want but for the wrong reason) and below every COLD_CUTBACK threshold
+    // (AT_OR_BELOW → the harshest cold limit in the table, which would throttle
+    // a perfectly warm pack to a crawl on a single dropped frame). Skipping the
+    // lookup makes "no reading" mean "no limit from this table" explicitly. It
+    // is not a safety hole: a sensor that stays dark for TEMP_INVALID_INHIBIT_MS
+    // stops the charge outright via INHIBIT_TEMP_UNKNOWN above.
+    uint32_t hotCbK   = hotValid
+                       ? find_cutback((int)hotTemp,  CUTBACK_AT_OR_ABOVE, HOT_CUTBACK)
+                       : UINT32_MAX;
     uint32_t hotPwrW  = (hotCbK  == UINT32_MAX) ? UINT32_MAX
                        : (uint32_t)(hotCbK  / 1000.0f * packAH * voltV);
 
@@ -7021,7 +9245,12 @@ void rampTask(void* /*pvParameters*/) {
     // CUTBACK_AT_OR_BELOW semantics: colder pack → lower allowed C-rate. The
     // table tops out at 40 °C / 3 C, well above the system's ~1 C ceiling, so
     // it only actually constrains power once a pack is genuinely cold.
-    uint32_t coldCbK  = find_cutback((int)coldTemp, CUTBACK_AT_OR_BELOW, COLD_CUTBACK);
+    // Skipped when the cold sensor has no usable reading — see the note on the
+    // hot lookup above; this is the direction where feeding the sentinel in
+    // would actively misbehave (AT_OR_BELOW returns the harshest entry).
+    uint32_t coldCbK  = coldValid
+                       ? find_cutback((int)coldTemp, CUTBACK_AT_OR_BELOW, COLD_CUTBACK)
+                       : UINT32_MAX;
     uint32_t coldPwrW = (coldCbK == UINT32_MAX) ? UINT32_MAX
                        : (uint32_t)(coldCbK / 1000.0f * packAH * voltV);
 
@@ -7131,27 +9360,35 @@ void rampTask(void* /*pvParameters*/) {
     if (ccTriggerVoltage || ccTriggerTaper || ccTriggerPlateau) {
       phase = PHASE_CV;
       cvMs  = millis();
-      // CV amps limit, per charger. This is a LIMIT the Elcon regulates under,
-      // not a demand: in CV the charger holds voltage and the pack draws
-      // whatever it accepts, so a looser figure here does not force current in.
+      // CV amps limit, as a TOTAL across all chargers (STAB-6). This is a LIMIT
+      // the Elcon regulates under, not a demand: in CV the charger holds voltage
+      // and the pack draws whatever it accepts, so a looser figure here does not
+      // force current in.
+      //
+      // Latched as a total, not per-charger, and deliberately so: the value is
+      // captured once at this transition but the command is rebuilt from it on
+      // every CV tick, where the live divisor and the 1 C ceiling are applied.
+      // Latching a per-charger figure meant the transition-time charger count
+      // was frozen into an absorption phase that can last an hour, and the
+      // write bypassed the 1 C clamp entirely.
       //
       // NOTE (audit 2026-07): the max() below makes C/5 a FLOOR, not a cap — the
       // earlier comment here said "cap at C/5 per charger", which the code has
-      // never done. Whichever of ccAmpsPerCh / cvMaxPerCh is LARGER wins, so
+      // never done. Whichever of ccAmpsTotal / cvMaxTotal is LARGER wins, so
       // entering CV from a tapering CC can raise the limit (e.g. CC tapering at
-      // 2 A/charger → CV limit 7.6 A/charger on a 114 Ah pack across 3 units).
+      // 6 A total → CV limit 22.8 A total on a 114 Ah pack).
       // Deliberately left as-is: changing it to min() would tighten the CV
       // current limit and could shift absorption duration and when the
       // CV→DONE taper fires, which is tuned by bench observation. The absolute
-      // 1.0 C ceiling in the amp calculation below backstops it either way.
+      // 1.0 C ceiling applied at command time backstops it either way.
       // Revisit together with CV tuning, not in isolation.
       long   clampedDv    = min(rawPackDv, (long)voltCeiling);
       float  packV        = clampedDv / 10.0f;
-      float  ccAmpsPerCh  = (current > 0 && packV > 0 && nChargers > 0)
-                              ? (current / packV / nChargers) : 0.0f;
-      float  cvMaxPerCh   = (float)monolithAH * 0.2f / nChargers; // C/5
-      cvAmpsDa = (uint16_t)(max(ccAmpsPerCh, cvMaxPerCh) * 10.0f);
-      cvAmpsDa = max(cvAmpsDa, (uint16_t)10); // floor 1 A/charger
+      float  ccAmpsTotal  = (current > 0 && packV > 0) ? (current / packV) : 0.0f;
+      float  cvMaxTotal   = packAH * 0.2f;   // C/5 of the (clamped) pack Ah
+      float  cvTotalDaF   = max(ccAmpsTotal, cvMaxTotal) * 10.0f;
+      if (cvTotalDaF > 65535.0f) cvTotalDaF = 65535.0f;
+      cvAmpsTotalDa = (uint16_t)cvTotalDaF;
       // CV target voltage:
       //   - voltage trigger: pack reached the ceiling → hold at the ceiling
       //   - taper / plateau:  pack saturated below ceiling under VCB →
@@ -7166,21 +9403,21 @@ void rampTask(void* /*pvParameters*/) {
       }
       if (ccTriggerVoltage) {
         LOG("[RAMP] CC→CV (voltage) @ %ld dV (ceil %d dV), "
-            "cvTarget=%u dV, cvAmpsDa=%d/ch\n",
-            rawPackDv, voltCeiling, (unsigned)cvTargetDv, (int)cvAmpsDa);
+            "cvTarget=%u dV, cvAmpsTotalDa=%d\n",
+            rawPackDv, voltCeiling, (unsigned)cvTargetDv, (int)cvAmpsTotalDa);
       } else if (ccTriggerTaper) {
         LOG("[RAMP] CC→CV (current taper): %lus of %.2fA actual at %dW "
             "commanded, pack at %ld dV (ceil %d dV), "
-            "cvTarget=%u dV, cvAmpsDa=%d/ch\n",
+            "cvTarget=%u dV, cvAmpsTotalDa=%d\n",
             (now0 - ccTaperStartMs) / 1000UL,
             actualA, current, rawPackDv, voltCeiling,
-            (unsigned)cvTargetDv, (int)cvAmpsDa);
+            (unsigned)cvTargetDv, (int)cvAmpsTotalDa);
       } else {
         LOG("[RAMP] CC→CV (VCB plateau): pack %ld dV stable %lus "
-            "(ceil %d dV, cutback→%u W), cvTarget=%u dV, cvAmpsDa=%d/ch\n",
+            "(ceil %d dV, cutback→%u W), cvTarget=%u dV, cvAmpsTotalDa=%d\n",
             rawPackDv, (now0 - voltPlateauStartMs) / 1000UL,
             voltCeiling, (unsigned)effectiveTarget,
-            (unsigned)cvTargetDv, (int)cvAmpsDa);
+            (unsigned)cvTargetDv, (int)cvAmpsTotalDa);
       }
       ccTaperStartMs     = 0;
       voltPlateauStartMs = 0;
@@ -7197,10 +9434,34 @@ void rampTask(void* /*pvParameters*/) {
     // entirely on the enable edge here — and justEnabled could be consumed by an
     // early return before reaching this point, leaving the new cycle's record
     // carrying the previous cycle's start voltage, SoC and temperature.
+    //
+    // D15 — what "a cycle" means, and it is narrower than "a plug-in": this
+    // hook re-fires, and therefore starts a NEW record, on every fresh entry
+    // into CC. A CV→CC load-sag excursion, a Stop followed by Charge, and a
+    // top-up after the pack has sagged out of Float all reset the record in
+    // progress, energy counters included. One plug-in can therefore produce
+    // several rows, each covering one bulk→absorption→float leg, and the
+    // partial leg that a sag excursion interrupts is simply discarded rather
+    // than written. This is deliberate — a leg is the unit the charge
+    // algorithm actually reasons about — but it means cycles.csv rows must not
+    // be summed to get "energy delivered per plug-in". Documented for users in
+    // the manual's cycle-log section.
     if ((phase == PHASE_CC && lastPhase != PHASE_CC) ||
         (startEvalRan && phase == PHASE_CC)) {
       ccEntryMs = millis();
+      // Whole-struct value-init: this is what stops a field that is only
+      // written at a later transition — bulk_min (CC→CV) and abort_reason
+      // (CV→DONE) — from leaking the previous cycle's value into this one
+      // (STAB-12). cvEntryMs lives outside the struct, so it has to be cleared
+      // by hand here; leaving it set made absorption_min on a cycle that never
+      // reached CV count from the *previous* cycle's CV entry.
       g_cycle   = CycleRecord{};
+      cvEntryMs = 0;
+      // D3: this cycle's energy counters start from zero here, at the same
+      // instant as start_v_dv / start_soc, so what they total at DONE covers
+      // exactly the span the record's start_* and end_* fields bracket.
+      cycleWh   = 0.0f;
+      cycleAh   = 0.0f;
       struct tm ti;
       if (getLocalTime(&ti, 100))
         strftime(g_cycle.timestamp, sizeof(g_cycle.timestamp),
@@ -7208,7 +9469,7 @@ void rampTask(void* /*pvParameters*/) {
       if (xSemaphoreTake(liveMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
         g_cycle.start_v_dv = (uint16_t)live.monolithVoltageDv;
         g_cycle.start_soc  = live.monolithBmsSoc;   // 255 if no BMS frame yet
-        g_cycle.start_temp = (int8_t)live.monolithMaxTemp;
+        g_cycle.start_temp = cycleTempI8(live.monolithMaxTemp);
         xSemaphoreGive(liveMutex);
       }
       // Match target voltage to the nearest named preset percentage
@@ -7288,7 +9549,7 @@ void rampTask(void* /*pvParameters*/) {
       if (totalAmpsA > maxTotalA) {
         g_currentClamped = true;
         static unsigned long lastAmpClampLog = 0;
-        if (now0 - lastAmpClampLog >= 10000UL) {
+        if (lastAmpClampLog == 0 || now0 - lastAmpClampLog >= 10000UL) {
           lastAmpClampLog = now0;
           LOG("[RAMP] Total current clamped %.1fA -> %.1fA (%.2fC ceiling on "
               "%.0fAh pack)\n", totalAmpsA, maxTotalA, CELL_MAX_CHARGE_C, packAH);
@@ -7296,11 +9557,13 @@ void rampTask(void* /*pvParameters*/) {
         totalAmpsA = maxTotalA;
       }
 
-      // Per-charger share. The uint16_t cast is now unreachable-by-overflow:
-      // maxTotalA is bounded by pack Ah (~125 A worst case), so perCh * 10
-      // cannot approach 65535. The explicit clamp documents that invariant
-      // rather than relying on it.
-      float perChDa = (totalAmpsA / nChargers) * 10.0f;
+      // Per-charger share. `divisor` is max(configured, detected) — see its
+      // derivation above; using the configured count alone let an unannounced
+      // extra unit multiply the delivered current. The uint16_t cast is
+      // unreachable-by-overflow: maxTotalA is bounded by pack Ah (PACK_AH_MAX
+      // worst case), so perCh * 10 cannot approach 65535. The explicit clamp
+      // documents that invariant rather than relying on it.
+      float perChDa = (totalAmpsA / divisor) * 10.0f;
       if (perChDa > 6553.0f) perChDa = 6553.0f;   // uint16_t dA headroom
       cmdAmpsDa = (uint16_t)max(1.0f, perChDa);
     }
@@ -7315,13 +9578,158 @@ void rampTask(void* /*pvParameters*/) {
     // and chargers both reported 0 A — fixed here by mirroring the CV
     // branch's "actualA × packV" accounting.
     if (phase == PHASE_CC && packDv > 0 && actualA > 0.0f) {
-      float actualW = actualA * (packDv / 10.0f);
-      sessionAddCC(actualW / 3600.0f, actualA / 3600.0f);
+      float actualW  = actualA * (packDv / 10.0f);
+      float whDelta  = actualW / 3600.0f;
+      float ahDelta  = actualA / 3600.0f;
+      sessionAddCC(whDelta, ahDelta);
+      // D3: the cycle record's own counters take the same increment. Kept
+      // adjacent to the sessionAddCC call deliberately — the two must never
+      // drift apart, and the only way to guarantee that is for the same two
+      // values to feed both.
+      cycleWh += whDelta;
+      cycleAh += ahDelta;
     }
 
     // ── Charger bus update + CV phase management ──────────────────────────────
+    // Everything already known to force a stop is asserted BEFORE the mutex is
+    // taken, so a failed acquisition cannot drop it (STAB-2). A fault first
+    // detected inside the critical section asserts it there instead — still
+    // ahead of the command write it guards.
+    //
+    // `intendStop` is the WHOLE stop intent for this tick, computed here rather
+    // than piecemeal inside the critical section (audit 2026-09). It used to be
+    // just fault|mismatch, which left three ways for a tick that had decided not
+    // to charge to end with the previous START still on the wire: PHASE_DONE, a
+    // pack voltage of 0 (no telemetry), and CC with the ramp at 0 W all produce
+    // a zeroed command INSIDE the mutex, so if the mutex take failed on that
+    // exact tick nothing was written and nothing had raised the failsafe either.
+    // Raising it up here means the intent survives a lost mutex; the timeout
+    // fallback below now keys off the same flag.
+    bool intendStop = g_chargerFault || chargerCountMismatch ||
+                      (phase == PHASE_DONE) || (packDv <= 0) ||
+                      (phase == PHASE_CC && current == 0);
+    if (intendStop) g_forceStop = true;
+
+    // What this tick actually wrote into chargerBus, for the status log at the
+    // bottom of the tick. The log used to print the locally COMPUTED cmdVoltDv /
+    // cmdAmpsDa, which are what we would have sent had nothing blocked us — so a
+    // tick that wrote a zeroed STOP (ccStart false) or lost the mutex entirely
+    // still printed a confident "cmd 1100dV/95dA" line. Defaults describe the
+    // lost-mutex case: nothing written at all.
+    bool     cmdWritten  = false;
+    bool     wroteStart  = false;
+    uint16_t wroteVoltDv = 0;
+    uint16_t wroteAmpsDa = 0;
+
     if (xSemaphoreTake(chargerMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      cmdWritten = true;
       bool chargersPresent = (chargerBus.chargerCount > 0);
+
+      // ── Charger self-reported fault scan (STAB-4) ──────────────────────────
+      // The status bitfield (byte 4 of 0x18FF50Ex — see the bit table in the
+      // charger-protocol comment block at the top of this file) has been decoded
+      // and displayed since the first version, but was long not acted on: a unit
+      // could report a hardware failure or an overtemperature and we carried on
+      // commanding it at full current.
+      //
+      // MASK IS 0x03 — hardware failure | over-temperature — and nothing else
+      // (audit 2026-09; it was 0x1B). Per the Elcon TC protocol document the two
+      // bits that used to be in the mask are not faults at all:
+      //   * 0x10 is "communication receive timeout", which the charger asserts
+      //     BY DESIGN after ~5 s without a command frame. Every idle unit on the
+      //     bus has it set, so the old mask latched a charger fault against
+      //     perfectly healthy hardware as soon as a scan ran.
+      //   * 0x08 is "battery not detected / starting state", true for the first
+      //     moments of every session before the output closes.
+      // 0x04 (AC input out of range) stays excluded for the original reason: it
+      // asserts transiently on any mains dip and self-clears, so latching a stop
+      // on it would turn a flicker into a manual re-arm. All three remain
+      // decoded and visible on the dashboard — display only, never a stop.
+      //
+      // Two further guards keep this from firing on noise:
+      //   (a) a 3-consecutive-tick debounce (3 s at the 1 Hz tick) before the
+      //       latch closes, so one corrupted status byte cannot end a charge
+      //       that then needs a manual re-arm;
+      //   (b) a CHARGER_FAULT_GRACE_MS window after the enable edge in which
+      //       both the fault bits and the overvoltage test are ignored outright,
+      //       because a just-woken Elcon is still reporting its starting state.
+      //
+      // Only units with a fresh frame are considered: a unit that has gone
+      // quiet is handled by the CHARGER_TIMEOUT_MS presence decay, and its last
+      // status word is stale by definition.
+      bool     wasCommanding = chargerBus.cmdStart;
+      bool     faultGraceOver = (enableEdgeMs == 0) ||
+                                ((now0 - enableEdgeMs) >= CHARGER_FAULT_GRACE_MS);
+      uint8_t  faultBits     = 0;
+      uint16_t overVoltDv    = 0;
+
+      // Overvoltage reference. Compare against whichever is higher, the ceiling
+      // we asked for or the pack's own measured voltage, plus 6.0 V (audit
+      // 2026-09; it was ceiling + 3.0 V). Two reasons the old test misfired:
+      // a charger legitimately reads a little above the pack it is pushing into,
+      // and the ceiling can drop below the pack voltage the instant the user
+      // lowers the target — at which point a correctly-regulating unit sat 30+
+      // dV "above" the new ceiling and latched a runaway fault. 60 dV is wider
+      // than the widest gap between two presets (40 dV), so a target change can
+      // never manufacture one.
+      long ovLimit = max((long)voltCeiling, rawPackDv) + 60;  // 6.0 V
+      bool ovThisTick = false;
+
+      for (int i = 0; i < MAX_CHARGERS; i++) {
+        ChargerUnit& c = chargerBus.chargers[i];
+        if (!c.present || (now0 - c.lastSeenMs) >= CHARGER_TIMEOUT_MS) continue;
+        if (!faultGraceOver) continue;
+        faultBits |= (uint8_t)(c.status & 0x03);
+        // Output well above anything we could have asked for means the unit is
+        // no longer regulating to the command — a genuine runaway, not ripple.
+        // Only meaningful while we are actually commanding START, and never in
+        // DONE (where the command is zero and a unit winding down can still be
+        // reporting its last output voltage).
+        if (wasCommanding && phase != PHASE_DONE && (long)c.voltDv > ovLimit) {
+          ovThisTick = true;
+          overVoltDv = c.voltDv;
+        }
+      }
+
+      // Per-tick debounce — both detectors must agree with themselves for
+      // FAULT_DEBOUNCE_TICKS consecutive ticks before the latch closes. A clean
+      // tick resets the counter, so only a sustained condition latches.
+      const uint8_t FAULT_DEBOUNCE_TICKS = 3;
+      static uint8_t faultTicks = 0;
+      static uint8_t ovTicks    = 0;
+      if (faultBits != 0) { if (faultTicks < 255) faultTicks++; } else faultTicks = 0;
+      if (ovThisTick)     { if (ovTicks    < 255) ovTicks++;    } else { ovTicks = 0; overVoltDv = 0; }
+
+      bool faultLatch = (faultTicks >= FAULT_DEBOUNCE_TICKS);
+      bool ovLatch    = (ovTicks    >= FAULT_DEBOUNCE_TICKS);
+      if (faultLatch || ovLatch) {
+        g_chargerFault = true;   // latched until the next enable edge
+        static unsigned long lastChargerFaultLogMs = 0;
+        if (lastChargerFaultLogMs == 0 || now0 - lastChargerFaultLogMs >= 10000UL) {
+          lastChargerFaultLogMs = now0;
+          if (faultLatch)
+            LOG("[RAMP] Charger fault — status bits 0x%02X "
+                "(0x01 hardware failure / 0x02 over-temperature) for %u ticks. "
+                "STOP; switch charging off and on again to re-arm\n",
+                (unsigned)faultBits, (unsigned)faultTicks);
+          if (ovLatch)
+            LOG("[RAMP] Charger overvoltage — unit reports %u dV against a "
+                "%ld dV limit (ceil %d dV, pack %ld dV) for %u ticks. STOP; "
+                "switch charging off and on again to re-arm\n",
+                (unsigned)overVoltDv, ovLimit, voltCeiling, rawPackDv,
+                (unsigned)ovTicks);
+        }
+      }
+
+      // Any reason this tick must not command START. `intendStop` was computed
+      // before the mutex was taken and already covers DONE / no pack voltage /
+      // zero commanded power; OR in the fault latch, which may have closed only
+      // a few lines above (inside this critical section) and so could not have
+      // been part of it. g_forceStop makes the STOP unconditional in
+      // sendHeartbeat() even if this very mutex write is the one that gets lost
+      // next tick.
+      bool stopNow = intendStop || g_chargerFault;
+      if (stopNow) g_forceStop = true;
 
       if (phase == PHASE_CV) {
         // Use the same `actualA` snapshot taken at the top of this tick — no
@@ -7345,8 +9753,12 @@ void rampTask(void* /*pvParameters*/) {
           }
         }
         if (!terminating && packDv > 0 && actualA > 0.0f) {
-          float cvPwrW = actualA * (packDv / 10.0f);
-          sessionAddCC(cvPwrW / 3600.0f, actualA / 3600.0f);
+          float cvPwrW  = actualA * (packDv / 10.0f);
+          float whDelta = cvPwrW  / 3600.0f;
+          float ahDelta = actualA / 3600.0f;
+          sessionAddCC(whDelta, ahDelta);
+          cycleWh += whDelta;   // D3 — same increment, same values (see CC arm)
+          cycleAh += ahDelta;
         }
 
         // Keep charger alive in CV mode. Command cvTargetDv (the achievable
@@ -7354,12 +9766,35 @@ void rampTask(void* /*pvParameters*/) {
         // triggered CV) — NOT voltCeiling unconditionally. Commanding an
         // unreachable voltage and immediately bouncing back to CC is what the
         // 100 %-preset oscillation looked like prior to v202605171800.
-        if (phase == PHASE_CV && chargersPresent && packDv > 0) {
+        if (phase == PHASE_CV && chargersPresent && packDv > 0 && !stopNow) {
+          // Rebuild the per-charger CV limit from the latched TOTAL every tick
+          // (STAB-6). cvAmpsTotalDa was captured at the CC→CV transition; the
+          // divisor and the 1 C ceiling are applied HERE so that a charger
+          // appearing mid-absorption, or a pack Ah that only arrived after the
+          // transition, are both honoured. The old code wrote the latched
+          // per-charger figure straight out, bypassing the 1 C clamp entirely.
+          float cvTotalA    = cvAmpsTotalDa / 10.0f;
+          float cvMaxTotalA = CELL_MAX_CHARGE_C * packAH;
+          if (cvTotalA > cvMaxTotalA) cvTotalA = cvMaxTotalA;
+          float cvPerChDa = (cvTotalA / divisor) * 10.0f;
+          if (cvPerChDa > 6553.0f) cvPerChDa = 6553.0f;  // uint16_t dA headroom
           chargerBus.cmdVoltDv = (cvTargetDv > 0) ? cvTargetDv : voltCeiling;
-          chargerBus.cmdAmpsDa = cvAmpsDa;
+          chargerBus.cmdAmpsDa = (uint16_t)max(10.0f, cvPerChDa); // floor 1 A/ch
           chargerBus.cmdStart  = true;
+          wroteStart  = true;
+          wroteVoltDv = chargerBus.cmdVoltDv;
+          wroteAmpsDa = chargerBus.cmdAmpsDa;
+          // A valid START landed under the mutex — but never lower the failsafe
+          // during a shutdown wait (stopChargerForRestart), or this tick would
+          // hand the chargers a START on the way to a reboot.
+          if (!g_shuttingDown) g_forceStop = false;
         } else {
-          // Just transitioned to DONE this tick — send STOP immediately
+          // Just transitioned to DONE this tick, chargers absent, no pack
+          // voltage, or a fault/mismatch forced the stop — send STOP either way.
+          // Raise the failsafe alongside the write: this arm is a stop decision
+          // just as much as the pre-mutex ones are, and if the NEXT tick loses
+          // the mutex the flag is all that keeps the STOP on the wire.
+          g_forceStop = true;
           chargerBus.cmdVoltDv = 0;
           chargerBus.cmdAmpsDa = 0;
           chargerBus.cmdStart  = false;
@@ -7368,34 +9803,78 @@ void rampTask(void* /*pvParameters*/) {
         }
       } else {
         // CC phase: start when current > 0 and pack is known; DONE: current == 0 stops it
-        chargerBus.cmdVoltDv = cmdVoltDv;
-        chargerBus.cmdAmpsDa = cmdAmpsDa;
-        chargerBus.cmdStart  = (current > 0) && chargersPresent && (packDv > 0);
+        bool ccStart = (current > 0) && chargersPresent && (packDv > 0) && !stopNow;
+        chargerBus.cmdVoltDv = ccStart ? cmdVoltDv : 0;
+        chargerBus.cmdAmpsDa = ccStart ? cmdAmpsDa : 0;
+        chargerBus.cmdStart  = ccStart;
+        wroteStart  = ccStart;
+        wroteVoltDv = chargerBus.cmdVoltDv;
+        wroteAmpsDa = chargerBus.cmdAmpsDa;
+        if (ccStart) {
+          // See the CV arm — g_shuttingDown wins over a fresh START.
+          if (!g_shuttingDown) g_forceStop = false;
+        } else {
+          // Zeroed command written: same reasoning as the CV else-arm above.
+          g_forceStop = true;
+        }
       }
 
       xSemaphoreGive(chargerMutex);
+    } else if (intendStop) {
+      // The command update is the one chargerMutex write that can also be a
+      // STOP decision. If it was lost AND this tick had decided to stop, the
+      // failsafe has to stand on its own. `intendStop` (not fault|mismatch) is
+      // the test because it carries the full stop intent — DONE, no pack
+      // voltage and a zero ramp all end in a zeroed write we never got to make.
+      //
+      // Note: with the mutex lost the fault scan above did not run this tick, so
+      // a NEW charger fault goes undetected until the next tick that gets the
+      // lock. That is accepted: detection is deferred, the stop is not — the
+      // failsafe below puts a STOP on the wire within one heartbeat regardless.
+      g_forceStop = true;
+      if (lastStopMutexLogMs == 0 || now0 - lastStopMutexLogMs >= 5000UL) {
+        lastStopMutexLogMs = now0;
+        LOG("[RAMP] chargerMutex timeout on STOP — forceStop asserted\n");
+      }
     }
 
     // ── Cycle data logger — DONE entry hook ───────────────────────────────────
     // Fires in the same tick that CV→DONE was set (abort_reason already set
     // inside the charger mutex block above). Snapshots end-of-cycle values and
     // writes one CSV row to /cycles.csv.
+    //
+    // STAB-12: only a CV→DONE entry is a completed charge cycle. DONE is also
+    // entered straight from CC — the above-target backstop and the start
+    // evaluation's "nothing to charge" path — and those never ran an absorption
+    // phase. Recording them produced a row whose absorption_min was measured
+    // from the *previous* cycle's cvEntryMs, with that cycle's bulk_min and
+    // abort_reason alongside it: fabricated training data, not a short cycle.
+    // Skip the append and clear cvEntryMs so nothing downstream can reuse it.
     if (phase == PHASE_DONE && lastPhase != PHASE_DONE) {
-      if (xSemaphoreTake(liveMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-        g_cycle.end_v_dv = (uint16_t)live.monolithVoltageDv;
-        g_cycle.end_soc  = live.monolithBmsSoc;
-        g_cycle.end_temp = (int8_t)live.monolithMaxTemp;
-        xSemaphoreGive(liveMutex);
+      if (lastPhase != PHASE_CV) {
+        cvEntryMs = 0;
+        LOG("[AI] DONE without absorption — no cycle record\n");
+      } else {
+        if (xSemaphoreTake(liveMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+          g_cycle.end_v_dv = (uint16_t)live.monolithVoltageDv;
+          g_cycle.end_soc  = live.monolithBmsSoc;
+          g_cycle.end_temp = cycleTempI8(live.monolithMaxTemp);
+          xSemaphoreGive(liveMutex);
+        }
+        // STAB-11 / D3: this cycle's own accumulators, totalled tick by tick
+        // since CC entry. Nothing is subtracted and nothing is read from the
+        // session counters, so a Reset Session anywhere inside the cycle
+        // leaves these figures untouched. Both are non-negative by
+        // construction (every increment is a positive delta gated on
+        // actualA > 0), so the casts need no clamp.
+        g_cycle.total_ah_x100 = (uint32_t)(cycleAh * 100.0f);
+        g_cycle.total_wh_x10  = (uint32_t)(cycleWh * 10.0f);
+        g_cycle.absorption_min = (cvEntryMs > 0)
+          ? (uint16_t)((millis() - cvEntryMs) / 60000UL)
+          : 0;
+        appendCycleRecord(g_cycle);
+        cvEntryMs = 0;      // consumed — the next cycle sets its own
       }
-      if (xSemaphoreTake(sessionMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-        g_cycle.total_ah_x100 = (uint16_t)(session.chargeAh * 100.0f);
-        g_cycle.total_wh_x10  = (uint32_t)(session.energyWh * 10.0f);
-        xSemaphoreGive(sessionMutex);
-      }
-      g_cycle.absorption_min = (cvEntryMs > 0)
-        ? (uint16_t)((millis() - cvEntryMs) / 60000UL)
-        : 0;
-      appendCycleRecord(g_cycle);
     }
 
     // Track previous phase for next tick's transition hooks.
@@ -7441,7 +9920,13 @@ void rampTask(void* /*pvParameters*/) {
       int   nowSoc    = (bmsSoc <= 100)        ? (int)bmsSoc
                        : (rawPackDv > 0)       ? calcSocFromVoltage(rawPackDv)
                                                : 0;
-      float ahNeeded  = (float)(targetSoc - nowSoc) / 100.0f * (float)monolithAH;
+      // packAH, not the raw monolithAH: packAH is the same figure re-clamped to
+      // PACK_AH_MAX just above, and it is what every other capacity calculation
+      // in this tick uses. Reading monolithAH here meant one absurd 0x288 frame
+      // that slipped the ingestion gate could stretch the ETA to the 24 h cap
+      // while the current ceiling and cutbacks were all working off the clamped
+      // value — two different pack sizes inside one tick.
+      float ahNeeded  = (float)(targetSoc - nowSoc) / 100.0f * packAH;
       // Use the same actualA snapshot taken at the top of the tick — already
       // includes only chargers with a fresh frame within CHARGER_TIMEOUT_MS.
       float ampsNow   = actualA;
@@ -7472,14 +9957,33 @@ void rampTask(void* /*pvParameters*/) {
                   : (phase==PHASE_CV) ? "ABSORPTION"
                                       : "FLOAT";
     if (phase == PHASE_CV) {
-      LOG("[RAMP] %s +%lus | %ddV %ddA/ch | raw %lddV ceil %ddV\n",
-          ps, (millis()-cvMs)/1000UL, voltCeiling, (int)cvAmpsDa, rawPackDv, voltCeiling);
+      // Commanded voltage in CV is cvTargetDv, NOT voltCeiling — this line used
+      // to print the ceiling twice and label the latched amps "/ch" when they
+      // are now a total. cvAmpsTotalDa is the LATCHED total; the per-charger
+      // figure actually written is that divided by `divisor` and 1 C-clamped.
+      LOG("[RAMP] %s +%lus | cmd %ddV, limit %ddA total /%u ch | raw %lddV ceil %ddV\n",
+          ps, (millis()-cvMs)/1000UL,
+          (int)((cvTargetDv > 0) ? cvTargetDv : voltCeiling),
+          (int)cvAmpsTotalDa, (unsigned)divisor, rawPackDv, voltCeiling);
     } else if (current > 0 || phase == PHASE_DONE) {
       // COLD_CUTBACK returns a value at nearly any temperature (table runs up
       // to 40 °C), so flag it only when it actually limits power below target —
       // unlike HOT, where a non-MAX result already means "genuinely hot".
-      LOG("[RAMP] %s %dW(eff) tgt%dW cmd %ddV/%ddA raw %lddV%s%s%s\n",
-          ps, current, target, cmdVoltDv, cmdAmpsDa, rawPackDv,
+      //
+      // "cmd" is what was actually WRITTEN to chargerBus this tick, not the
+      // locally computed cmdVoltDv/cmdAmpsDa: a tick that decided to stop wrote
+      // zeros, and a tick that lost chargerMutex wrote nothing at all. Printing
+      // the computed values made a STOP tick read exactly like a charging one.
+      char cmdStr[40];
+      if (!cmdWritten)
+        snprintf(cmdStr, sizeof(cmdStr), "(mutex lost, not written)");
+      else if (!wroteStart)
+        snprintf(cmdStr, sizeof(cmdStr), "STOP 0dV/0dA");
+      else
+        snprintf(cmdStr, sizeof(cmdStr), "%udV/%udA",
+                 (unsigned)wroteVoltDv, (unsigned)wroteAmpsDa);
+      LOG("[RAMP] %s %dW(eff) tgt%dW cmd %s raw %lddV%s%s%s\n",
+          ps, current, target, cmdStr, rawPackDv,
           voltCbK != UINT32_MAX ? " VcbON" : "",
           hotCbK  != UINT32_MAX ? " HOT"   : "",
           (coldPwrW != UINT32_MAX && coldPwrW < (uint32_t)target) ? " COLD" : "");
@@ -7489,8 +9993,16 @@ void rampTask(void* /*pvParameters*/) {
 
 // Called once when home WiFi (STA) first connects successfully. Overrides the
 // AP/road boot defaults that rampInit() loaded with the home WiFi profile.
-// Guarded by homeDefaultsApplied so mid-session reconnects don't clobber an
-// in-progress charge session that the user may have already adjusted.
+//
+// Guarded by homeDefaultsApplied, which is latched by three things (B3):
+//   1. this function itself, so mid-session reconnects can't re-apply;
+//   2. any user command that changes enabled / target power / target voltage —
+//      /api/control and the MQTT command handler — because once the owner has
+//      touched the charge, the profile must not overrule them;
+//   3. onStaUp() when it finds a charge already running.
+// Between them, the profile can only ever land on an untouched, idle charger,
+// which is the only situation it was designed for. The caller (onStaUp) also
+// checks ctrl.enabled before calling, so this function does not re-check.
 void applyHomeWifiBootDefaults() {
   if (homeDefaultsApplied) return;
   homeDefaultsApplied = true;
@@ -8127,11 +10639,26 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   // charging_enabled=false. Each branch now reports which of the two happened,
   // and the NVS write is skipped when the RAM write didn't land so the two
   // can't diverge.
+  // B3: commands that change the charge itself (enabled / target power /
+  // target voltage, including the preset buttons) latch homeDefaultsApplied,
+  // so a later STA bring-up can't have the home WiFi profile overrule what the
+  // user — or a Home Assistant automation — just asked for. charger_count and
+  // ramp_rate_wps are configuration rather than charge decisions and are left
+  // out, matching /api/control.
+  //
+  // C2: the latch happens INSIDE the successful-take branch, next to the write
+  // it is claiming credit for. It used to sit above the take and fire even when
+  // the mutex timed out — i.e. the flag said "the user has taken control of the
+  // charge" on the strength of a command that was then dropped, and the home
+  // profile it suppressed never got another chance this boot. /api/control
+  // latches only after its take succeeds (it returns early on a timeout); these
+  // branches now match it, which is what the sentence above assumes.
   if (strcmp(cmd, "target_power_w") == 0) {
     int tw = atoi(val);
     bool ok = (xSemaphoreTake(controlMutex, pdMS_TO_TICKS(20)) == pdTRUE);
     if (ok) {
       ctrl.targetPowerW = (uint16_t)constrain(tw, 0, 13200);
+      homeDefaultsApplied = true;   // C2 — only when the write actually landed
       xSemaphoreGive(controlMutex);
     }
     LOG("[MQTT] cmd target_power_w = %d W%s\n",
@@ -8144,6 +10671,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     if (ok) {
       ctrl.enabled = en;
       if (!en) ctrl.currentPowerW = 0;
+      homeDefaultsApplied = true;   // B3, C2
       xSemaphoreGive(controlMutex);
     }
     LOG("[MQTT] cmd charging_enabled = %s%s\n", en ? "true" : "false",
@@ -8183,6 +10711,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       bool ok = (xSemaphoreTake(controlMutex, pdMS_TO_TICKS(20)) == pdTRUE);
       if (ok) {
         ctrl.targetVoltDv = (uint16_t)tvd;
+        homeDefaultsApplied = true;   // B3, C2
         xSemaphoreGive(controlMutex);
         preferences.putUShort("target_volt_dv", (uint16_t)tvd);
       }
@@ -8200,6 +10729,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         bool ok = (xSemaphoreTake(controlMutex, pdMS_TO_TICKS(20)) == pdTRUE);
         if (ok) {
           ctrl.targetVoltDv = dv;
+          homeDefaultsApplied = true;   // B3, C2
           xSemaphoreGive(controlMutex);
           preferences.putUShort("target_volt_dv", dv);
         }
@@ -8236,6 +10766,10 @@ static bool mqttConnect() {
   static uint16_t s_port = 1883;
   static bool     s_tls  = false;
   {
+    // NET-12: best-effort by design — on a lock timeout we snapshot anyway and
+    // risk one torn broker field, because failing here would stall the MQTT
+    // task's reconnect loop entirely. A bad snapshot costs one failed connect
+    // attempt; the next pass re-reads. The mutating web paths answer 503.
     bool locked = settingsLock();
     strncpy(s_host, mqttHost, sizeof(s_host)); s_host[sizeof(s_host) - 1] = '\0';
     strncpy(s_user, mqttUser, sizeof(s_user)); s_user[sizeof(s_user) - 1] = '\0';
@@ -8335,11 +10869,19 @@ static bool mqttPublishChanges() {
       mqttLast.field = (val); published = true; \
     }
 
+  // Pack temperature variant. A disconnected thermistor is stored raw as
+  // ZERO_TEMP_INVALID (-32768); publishing that would write -32768 °C into the
+  // HA recorder and wreck every temperature graph. Skip the publish entirely —
+  // the retained previous value stays on the broker, mqttLast is left untouched,
+  // and the sensor republishes by itself on the first tick with a real reading.
+  #define PUB_IF_CHANGED_T(field, mqttName, val) \
+    if ((val) > TEMP_INVALID_THRESHOLD) { PUB_IF_CHANGED_I(field, mqttName, val) }
+
   // Monolith pack
   PUB_IF_CHANGED_F(monolithVoltageDv, "monolith_v",    ls.monolithVoltageDv / 10.0f, 1)
   PUB_IF_CHANGED_I(monolithAmps,      "monolith_a",    ls.monolithAmps)
-  PUB_IF_CHANGED_I(monolithMinTemp,   "monolith_tmin", ls.monolithMinTemp)
-  PUB_IF_CHANGED_I(monolithMaxTemp,   "monolith_tmax", ls.monolithMaxTemp)
+  PUB_IF_CHANGED_T(monolithMinTemp,   "monolith_tmin", ls.monolithMinTemp)
+  PUB_IF_CHANGED_T(monolithMaxTemp,   "monolith_tmax", ls.monolithMaxTemp)
   // Prefer the BMS-reported SoC (0x188 byte 0) — same source as the bike's
   // dashboard. Fall back to the voltage-curve estimate only until the first
   // 0x188 frame arrives.
@@ -8359,8 +10901,8 @@ static bool mqttPublishChanges() {
   if (ls.powerTankPresent || mqttLast.powerTankPresent) {
     PUB_IF_CHANGED_F(powerTankVoltageDv, "powertank_v",    ls.powerTankVoltageDv / 10.0f, 1)
     PUB_IF_CHANGED_I(powerTankAmps,      "powertank_a",    ls.powerTankAmps)
-    PUB_IF_CHANGED_I(powerTankMinTemp,   "powertank_tmin", ls.powerTankMinTemp)
-    PUB_IF_CHANGED_I(powerTankMaxTemp,   "powertank_tmax", ls.powerTankMaxTemp)
+    PUB_IF_CHANGED_T(powerTankMinTemp,   "powertank_tmin", ls.powerTankMinTemp)
+    PUB_IF_CHANGED_T(powerTankMaxTemp,   "powertank_tmax", ls.powerTankMaxTemp)
     mqttLast.powerTankPresent = ls.powerTankPresent;
   }
 
@@ -8507,6 +11049,7 @@ static bool mqttPublishChanges() {
   }
 
   #undef PUB_IF_CHANGED_F
+  #undef PUB_IF_CHANGED_T
   #undef PUB_IF_CHANGED_I
 
   return published;
@@ -8587,9 +11130,18 @@ void mqttInit() {
 }
 
 // FreeRTOS stack overflow hook — called when a task overflows its stack.
-// Logs the offending task name then halts. Requires configCHECK_FOR_STACK_OVERFLOW >= 1
-// in FreeRTOSConfig.h (enabled by default in ESP32 Arduino core).
+// Requires configCHECK_FOR_STACK_OVERFLOW >= 1 (CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY
+// is set in the ESP32 Arduino core's sdkconfig, so this is live).
+//
+// STAB-5: this runs from the scheduler with a corrupt stack under it, so it must
+// not allocate, take a mutex or block — LOG() does all three (logMutex +
+// vsnprintf + Serial.write), and the old `while (true) vTaskDelay(...)` halt left
+// the device wedged forever with whatever the chargers were last commanded to do.
+// ets_printf() writes straight to the ROM UART with no locking and no heap, then
+// we reboot. Rebooting is the safe outcome here: it stops the 1 Hz charger
+// heartbeat, and the DigiNow units self-stop within ~5 s of losing it, so the
+// pack is never left charging unsupervised.
 void vApplicationStackOverflowHook(TaskHandle_t xTask, char* pcTaskName) {
-  LOG("[FATAL] Stack overflow in task: %s — halting\n", pcTaskName);
-  while (true) { vTaskDelay(pdMS_TO_TICKS(1000)); }
+  ets_printf("[FATAL] stack overflow in %s — restarting\n", pcTaskName);
+  esp_restart();
 }

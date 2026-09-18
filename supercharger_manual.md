@@ -8,6 +8,20 @@ The chargers can be powered from any AC source — a standard home outlet, a ded
 
 ---
 
+## What changed in 2026-09
+
+If you have used an earlier version, these are the differences you will notice:
+
+- **Charge, Stop and Reset Session now ask first.** A small confirmation box appears in the page (not the browser's own pop-up) before charging starts or stops, before the session counters are zeroed, and before anything that reboots the controller — "Save WiFi & Restart" and the HTTPS toggle.
+- **Buttons tell you the truth.** They grey out while the controller is answering, and if it could not do what you asked you get a message instead of silence: *"Controller busy — try again"* when it was mid-tick and applied nothing, and a jump to the login page when your session has expired. Previously the button just changed colour whether or not the command landed.
+- **Log and OTA pages when HTTPS is on.** These two stay on plain HTTP by design. Their links now point at `http://...` automatically, so you no longer have to turn HTTPS off to update firmware or read the log.
+- **"Keep me signed in" now has a 30-day limit.** A remembered login still survives reboots, but it is forgotten 30 days after you signed in. (If the controller has never had internet time — AP-only use — it has no clock to measure that against and the session keeps working.)
+- **The 5–10 second BOOT hold now also signs out every device.** It still clears the saved WiFi network and restarts into AP mode; it additionally drops all logins, including remembered ones. Use it when handing the controller to someone else.
+- Two new status banners — **Pack temperature unknown** and **Charger count mismatch** — plus a latched **Charger fault**. See [Status Banners](#status-banners).
+- The cycle log's `total_ah` / `total_wh` columns are now per-cycle rather than running session totals — see [The cycle log](#the-cycle-log-cyclescsv).
+
+---
+
 ## What You'll Need
 
 - Supercharger 2.5 controller (LilyGo T-2CAN, ESP32-S3 based)
@@ -68,8 +82,8 @@ If you want to watch it boot, connect a USB-C cable to the controller and open a
 
 On first boot, or any time the controller can't find a known network, it creates its own WiFi network for setup.
 
-1. On your phone or laptop, scan for WiFi networks. Look for **Supercharger** (or whatever the builder set as `SECRET_SSID` — see the arduino_secrets.h section below).
-2. Connect to it. The default password is **12345678** (or `SECRET_PASS` if the builder set one).
+1. On your phone or laptop, scan for WiFi networks. Look for **Supercharger** (or whatever the builder set as `SECRET_AP_SSID` — see the arduino_secrets.h section below).
+2. Connect to it. The default password is **12345678** (or `SECRET_AP_PASS` if the builder set one).
 3. Your phone will probably warn you there's no internet. That's fine, ignore it.
 4. Open a browser and go to **http://192.168.4.1** or **http://supercharger.local**.
 5. You'll see a WiFi Setup page. Enter your home WiFi name (SSID) and password.
@@ -131,7 +145,7 @@ This is the one to remember. Four hold patterns are recognised:
 | **< 1 s** | Nothing | Ignored — prevents accidental triggers from packaging knocks. |
 | **1 – 3 s** | Nothing (logged) | Logged to serial/SSE but no action taken. |
 | **3 – 5 s** | Clear auth lock | If the dashboard login is locked (5 failed password attempts from one device, or the device-wide 15-failures-per-minute backstop), this clears all locks and fail counters so the login page becomes responsive again. Has no effect if no lock is currently active. |
-| **5 – 10 s** | Clear WiFi & restart into AP mode | Wipes saved WiFi SSID/password only. AP credentials, MQTT settings, charger count, ramp rate, target voltage, and boot defaults all stay intact. Use this when you need to switch the controller to a new network. |
+| **5 – 10 s** | Clear WiFi + sign out all devices, restart into AP mode | Wipes the saved WiFi SSID/password **and every login session**, including "keep me signed in" logins saved to flash — so a browser that was remembered has to log in again. AP credentials, MQTT settings, charger count, ramp rate, target voltage, and boot defaults all stay intact. Use this when you need to switch the controller to a new network, or when handing it to someone else. |
 | **10 s+** | Factory reset | Wipes the entire NVS configuration namespace — WiFi credentials, AP credentials, MQTT settings, charger count, ramp rate, target voltage, and boot defaults. The controller reboots immediately when the 10 s threshold is hit (you don't need to release), so you'll feel the reset rather than wonder if it took. Use this when re-homing the controller to another bike or troubleshooting a stuck configuration. |
 
 The BOOT button still doubles as the chip's bootloader entry button if you happen to hold it while pressing RST — that puts the ESP32-S3 into USB download mode, which only matters if you're flashing over USB.
@@ -236,7 +250,7 @@ A coloured banner across the top of the dashboard tells you when something needs
 | **Amber** | Charging continues, but at reduced power. |
 | **Blue** | Advisory only. Charging is unaffected. |
 
-Only one banner shows at a time — the most serious condition wins, so you never get two messages that contradict each other. Each one clears itself as soon as the condition passes; none of them need acknowledging.
+Only one banner shows at a time — the most serious condition wins, so you never get two messages that contradict each other. Each one clears itself as soon as the condition passes and needs no acknowledging — with one exception: **Charger fault** is latched, and only clears when you switch charging off and on again.
 
 Separately from these, a red **"No WiFi"** banner means the controller can't reach your home WiFi and is running its own AP. Reach the dashboard via `http://<ap-ip>` or `http://supercharger.local`. It reconnects automatically when home WiFi comes back.
 
@@ -249,7 +263,10 @@ Separately from these, a red **"No WiFi"** banner means the controller can't rea
 | **Pack too cold** | Pack is below **0 °C**. Charging a cold lithium cell plates metallic lithium onto the anode, which permanently reduces capacity and can eventually short the cell. This is the one limit you should never work around. | Nothing. Charging resumes on its own once the pack warms past 2 °C. Riding the bike, or moving it somewhere warmer, is the quickest way. |
 | **Pack too hot** | Pack is above **45 °C**, the cell manufacturer's charging limit. | Nothing. Resumes on its own below 43 °C. If it happens without hard riding beforehand, check for blocked airflow around the pack. |
 | **Pack voltage too low** | Pack is below **70 V** (2.5 V per cell). Below this level the copper current collector inside the cells starts to dissolve, and charging normally can create an internal short. | **Do not force it.** This should never happen in normal use — the bike's own BMS cuts out well above this. Have the pack checked by a technician. |
+| **Pack temperature unknown** | The BMS is not reporting a valid pack temperature — the sensor is reading as disconnected, or the frame carrying it has stopped arriving. Without a temperature the hot cutback and the 45 °C limit have nothing to work from, so the controller will not charge. | Nothing, if it's brief — charging resumes as soon as valid temperature data returns. If it persists, the pack's temperature sensor or its wiring needs checking. |
 | **No data from bike** | The controller has lost contact with the bike's BMS, so it can't see pack voltage or temperature. It will not charge blind. | Check the charge connector is fully seated and the bike is powered on. Charging resumes within a second of data returning. |
+| **Charger fault** | A charger is reporting a **hardware fault or an over-temperature**, or its output voltage has run well above the voltage asked for. (The other things an Elcon reports — AC input out of range, "no battery yet", comms timeout — are shown on the charger card but deliberately do *not* stop a charge: they come and go on their own.) A fault has to persist for three seconds before it counts, and the first five seconds after you press Charge are ignored, because a charger that has been sitting idle reports its starting state until it has seen a few commands. | Find and fix the cause (see the charger's own status card), then press **Stop** and **Charge** again. This one does *not* clear itself: it stays latched until charging is switched off and back on, so a unit that faults and then drops off the bus can't quietly resume. |
+| **Charger count mismatch** | More chargers are answering on the CAN bus than the charger-count setting says are installed. Since all units get the same broadcast command, each extra one delivers a full share on top of what was asked for. | Set the charger count in Settings to match what's actually connected. Charging resumes as soon as the two agree. |
 | **Too many chargers** | More than four chargers are answering on the CAN bus. The controller divides commanded current between the chargers it knows about, so an extra unit would make every charger deliver more than intended. | Disconnect the extra charger, or give the chargers distinct CAN instance IDs, before charging. |
 
 #### Amber and blue — charging continues
@@ -392,6 +409,25 @@ Two things worth understanding about how these interact with the cutback tables 
 
 At the bottom: uptime, WiFi signal, firmware version, CPU load per core, free heap, and the number of charge cycles logged to the on-device data file. Useful when you're debugging.
 
+#### The cycle log (`/cycles.csv`)
+
+One row is appended per **completed** charge cycle — that is, a cycle that actually ran an absorption phase and finished in Float. A charge that never entered absorption (for example, the pack was already above the target when you pressed Charge) is not recorded. Download it with **⬇ Cycles** on the dashboard.
+
+**A row is one bulk → absorption → float leg, not one plug-in.** Anything that sends the controller back to Bulk starts a fresh row: pressing Stop and then Charge again, a top-up after the pack has sagged out of Float, or the pack briefly sagging under load during absorption. So a single evening on the charger can produce several rows, and a leg that gets interrupted before reaching Float is simply not written. Don't add the rows up to get "energy delivered this plug-in" — they are per-leg figures.
+
+The columns are: `timestamp, preset_pct, start_v, end_v, start_soc, end_soc, start_temp, end_temp, total_ah, total_wh, bulk_min, absorption_min, charger_count, abort_reason`.
+
+`abort_reason` says how absorption ended:
+
+| Value | Meaning |
+|---|---|
+| `0` | `current_taper` — absorption ran to completion, charge current tapered to the finish threshold. This is the normal, healthy ending |
+| `1` | `cv_timeout` — absorption hit its one-hour safety limit and was stopped. The cells may not have finished balancing |
+| `2` | `above_target` — absorption was cut short because the pack ended up above the target voltage: either you lowered the charge limit mid-charge, or the pack was lifted above it from outside (charged elsewhere, or regen) |
+
+> **Changed in this version — `total_ah` and `total_wh` are now per-cycle.**
+> They record the amp-hours and watt-hours delivered **by that leg alone**, accumulated tick by tick from the moment bulk charging started. Pressing **Reset Session** in the middle of a charge no longer affects them — that button zeroes the dashboard's session counters only, and the figures written to the cycle log are kept separately. In earlier firmware these two columns carried the running *session* totals instead, so any cycle that followed another one without a session reset in between reported everything accumulated since the reset, not just its own charge. Rows written by older firmware are still in the file and still session-to-date — if you are analysing a mixed file, treat rows older than this firmware's first entry accordingly. `total_ah` also no longer wraps above 655.35 Ah.
+
 ### Log Viewer
 
 Click the Log link, or go to **/log**. Live serial log in your browser, updated in real time. Good for diagnosing CAN bus issues without needing a USB cable.
@@ -479,7 +515,7 @@ The controller can serve the dashboard over HTTPS (port 443) with a TLS certific
 
 - First browser visit to `https://<ip>/` will show a security warning for a self-signed cert. Accept it once (add a permanent exception). After that the browser connects silently.
 - To disable HTTPS: untick **Enable HTTPS** in Settings (or POST `{"enabled": false}` to `/api/tls`) and reboot. The controller falls back to plain HTTP on port 80.
-- `/update` (OTA), the live log stream (`/api/log/stream`), and the log viewer page (`/log`) remain HTTP-only even when HTTPS is active — disable HTTPS temporarily if you need them. The cycle-data download (**⬇ Cycles** on the dashboard) works over HTTPS.
+- `/update` (OTA), the live log stream (`/api/log/stream`), the log viewer page (`/log`) and the old `/save` setup form stay on **plain HTTP port 80** even when HTTPS is active — there is no TLS story for a multipart firmware upload or a long-lived log stream. You do **not** need to disable HTTPS to reach them: the dashboard's **Log** and **OTA** links switch themselves to `http://<address>/...` when the page was loaded over HTTPS, so they just work. The login page is also served on port 80 for the same reason, so these pages can sign you in on their own. The cycle-data download (**⬇ Cycles** on the dashboard) works over HTTPS.
 - The HTTPS server runs in its own FreeRTOS task. No extra polling is needed; the plain HTTP port 80 also stays up to serve the redirect.
 - Cert and key are stored in NVS under keys `tls_cert`, `tls_key`, and `https_en`. A factory reset (10 s BOOT hold) clears them along with all other settings.
 
@@ -554,11 +590,13 @@ This firmware has been developed and tested against recent versions of the Espre
 If you're compiling this yourself, you have to set credentials in `arduino_secrets.h` before flashing. You must create your own values. Don't ship with the defaults.
 
 ```
-#define SECRET_SSID             "Supercharger"     // AP fallback name (optional override)
-#define SECRET_PASS             "12345678"         // AP fallback password (optional override, min 8)
+#define SECRET_AP_SSID          "Supercharger"     // this device's own access point name (optional override)
+#define SECRET_AP_PASS          "12345678"         // its password (optional override, min 8)
+// Legacy names SECRET_SSID / SECRET_PASS still work: the sketch maps them to the AP pair.
 
-#define SECRET_MQTT_SSID        "your-home-wifi"
-#define SECRET_MQTT_PASS        "your-wifi-password"
+#define SECRET_WIFI_SSID        "your-home-wifi"    // the home network the controller joins as a station
+#define SECRET_WIFI_PASS        "your-wifi-password"
+// Legacy names SECRET_MQTT_SSID / SECRET_MQTT_PASS still work: the sketch maps them to the WiFi pair.
 #define SECRET_MQTT_HOST        "192.168.1.100"   // broker IP or hostname
 #define SECRET_MQTT_USER        "your-mqtt-user"
 #define SECRET_MQTT_BROKER_PASS "your-mqtt-password"
@@ -578,21 +616,21 @@ These three `SECRET_AP_*` lines are optional — if your copy of `arduino_secret
 - **WiFi password must be at least 8 characters**. This is an ESP32 limitation, not mine.
 - **OTA user and pass are required**. They protect the `/update` endpoint, as well as charge control, so random people on your network can't reflash or set insane charge values, on/with your controller. Pick something you'll remember but isn't trivial. During creation, this was tested with 32+ characters, so should not be a limiting factor.
 - **MQTT credentials are optional**. If you don't use Home Assistant, leave them as empty strings. The MQTT client will keep trying, fail quietly, and not affect anything else.
-- **`SECRET_MQTT_SSID` can be blank**. If it is, the controller goes straight to AP mode on first boot. You can still set up WiFi through the setup page. If you set up a WiFi network here, it will automatically set this up and try to connect to it.
+- **`SECRET_WIFI_SSID` (legacy name `SECRET_MQTT_SSID`) can be blank**. If it is, the controller goes straight to AP mode on first boot. You can still set up WiFi through the setup page. If you set up a WiFi network here, it will automatically set this up and try to connect to it.
 
-### Compile-time AP Defaults (`SECRET_SSID` / `SECRET_PASS`)
+### Compile-time AP Defaults (`SECRET_AP_SSID` / `SECRET_AP_PASS`, legacy `SECRET_SSID` / `SECRET_PASS`)
 
-`SECRET_SSID` and `SECRET_PASS` set the **default AP name and password** the controller falls back to when no home WiFi is reachable. They override the built-in defaults of `Supercharger` / `12345678`.
+`SECRET_AP_SSID` and `SECRET_AP_PASS` (older secrets files: `SECRET_SSID` / `SECRET_PASS`) set the **default AP name and password** the controller falls back to when no home WiFi is reachable. They override the built-in defaults of `Supercharger` / `12345678`.
 
 The full priority order for the AP credentials is:
 
 1. **NVS** — whatever was last saved via the **Settings** page (highest priority).
-2. **`SECRET_SSID` / `SECRET_PASS`** — compile-time defaults from `arduino_secrets.h`.
+2. **`SECRET_AP_SSID` / `SECRET_AP_PASS`** — compile-time defaults from `arduino_secrets.h`.
 3. **Built-in defaults** — `Supercharger` / `12345678` (used only if both above are blank).
 
-The point is to let a builder ship a unit with a stronger out-of-the-box AP password than `12345678`, without having to walk a new owner through the Settings page on first boot. If you don't care, just leave `SECRET_SSID` blank and you'll get the built-in defaults.
+The point is to let a builder ship a unit with a stronger out-of-the-box AP password than `12345678`, without having to walk a new owner through the Settings page on first boot. If you don't care, just leave `SECRET_AP_SSID` blank and you'll get the built-in defaults.
 
-The same 8-character minimum applies to `SECRET_PASS` as to any WiFi password — that's an ESP32 limitation.
+The same 8-character minimum applies to `SECRET_AP_PASS` as to any WiFi password — that's an ESP32 limitation.
 
 ### Compile-time Fixed AP IP (`SECRET_AP_IP` / `SECRET_AP_GATEWAY` / `SECRET_AP_SUBNET`)
 
@@ -697,7 +735,7 @@ The controller is sending heartbeat frames but nothing is acking them. Usually m
 Check the bike CAN wiring (GPIO 6 RX, GPIO 7 TX on the ESP32-S3). The bike bus runs at 500 kbps with standard 11 bit IDs. The controller needs at least one BMS0 frame before it shows pack data.
 
 **Can't connect to the Supercharger AP**
-Default password is exactly `12345678`, eight characters (or whatever the builder set in `SECRET_PASS`). Some phones cache old passwords, so forget the network and reconnect. The AP broadcasts on 2.4 GHz only.
+Default password is exactly `12345678`, eight characters (or whatever the builder set in `SECRET_AP_PASS`). Some phones cache old passwords, so forget the network and reconnect. The AP broadcasts on 2.4 GHz only.
 
 **Lost WiFi during use**
 The controller switches into **AP+STA** mode automatically: it brings up the **Supercharger** AP so the dashboard stays reachable, *and* keeps trying to reconnect to the home network in the background. No power cycle needed. When the home WiFi comes back, STA reassociates on its own and MQTT/Home Assistant resumes. The AP stays up for the rest of the session so you can always reach the unit even if the home network is flaky — power cycle (or the RST button) to drop the AP and go back to STA-only.
@@ -711,7 +749,7 @@ Try **http://supercharger.local** first — that's mDNS and works on most modern
 Reload the page. If that doesn't help, check `/log` for errors. You can also power cycle the controller by cutting the 12 V from the chargers.
 
 **Charging is on but nothing is happening — and a red banner is showing**
-That's the controller refusing on purpose. See [Status Banners](#status-banners) for what each one means. The short version: too cold, too hot, pack voltage too low, no bike data, or too many chargers on the bus. Four of the five clear themselves.
+That's the controller refusing on purpose. See [Status Banners](#status-banners) for what each one means. The short version: too cold, too hot, pack voltage too low, pack temperature unknown, no bike data, a charger reporting a fault, more chargers on the bus than configured, or more than four chargers on the bus. All of them clear themselves once the condition passes — except **Charger fault**, which needs you to press Stop and then Charge again.
 
 **Charging is on, no banner, but the phase says Float**
 The pack is already at or above your chosen % preset, so there's nothing to do. Check the % preset row — if the bike is at 84 % and the preset is 80 %, that's expected. Raise the preset and it will start charging within a second. The serial log shows the decision at the point charging was enabled (`no charge needed` vs `BULK`).
@@ -737,7 +775,7 @@ Fixed in current firmware — the OTA page was missing its character-set declara
 **Boot-time STA priority:**
 
 1. Saved credentials (set via the setup page, stored in NVS)
-2. Compile-time secrets (`SECRET_MQTT_SSID` / `SECRET_MQTT_PASS`)
+2. Compile-time secrets (`SECRET_WIFI_SSID` / `SECRET_WIFI_PASS`, legacy `SECRET_MQTT_SSID` / `SECRET_MQTT_PASS`)
 
 Each attempt has a 15 second timeout before falling through.
 
@@ -745,7 +783,7 @@ Each attempt has a 15 second timeout before falling through.
 
 **AP teardown:** once the STA reconnects and stays up for **90 s continuously**, the controller drops the SoftAP and returns to STA-only (`STATE_CONNECTED`). The "No WiFi" banner clears at that point. If the STA drops again inside the 90 s grace window, the timer resets and the AP keeps serving until the next stable window. This prevents the AP from staying broadcast forever after a brief outage, while still giving you a window to finish whatever you were doing on the hotspot.
 
-**If no STA credentials exist anywhere** (fresh unit, no NVS, blank `SECRET_MQTT_SSID`): the controller goes straight to AP-only setup mode. There's nothing to retry until you provide credentials via the setup page.
+**If no STA credentials exist anywhere** (fresh unit, no NVS, blank `SECRET_WIFI_SSID`): the controller goes straight to AP-only setup mode. There's nothing to retry until you provide credentials via the setup page.
 
 **Worst-case time to a usable AP:** about 30 seconds on first boot (prefs fail → secrets fail → AP+STA comes up). Subsequent retries happen in the background without blocking the dashboard.
 

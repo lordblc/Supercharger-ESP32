@@ -5,6 +5,24 @@
 #include "ZeroNetwork.h"
 #include "unions.h"
 
+// Sentinel returned by highestTemp() / lowestTemp() when the frame carries no
+// usable reading — either the BMS "sensor disconnected" marker (0x7F) or a
+// frame too short to contain the byte. It must sit far outside any physical
+// temperature so callers can test for "no data" rather than silently treating
+// a dead thermistor as 0 °C: 0 °C reads as a perfectly normal pack and removes
+// both the hot cutback and the 45 °C charge inhibit. Callers in the firmware
+// use the TEMP_INVALID_THRESHOLD test below, which this value fails by design.
+#define ZERO_TEMP_INVALID (-32768)
+
+// Single validity threshold for every pack-temperature consumer. A reading is
+// usable only if it is STRICTLY GREATER than this value. -1000 is far below any
+// physically possible pack temperature and far above ZERO_TEMP_INVALID, so it
+// catches the sentinel (and any other absurd decode) without ever rejecting a
+// real thermistor. Previously the same test was open-coded as `> -100` in
+// rampTask and `<= -1000` in fmtTempJson / the MQTT publish macro — three
+// literals that could drift apart. Use this macro everywhere instead.
+#define TEMP_INVALID_THRESHOLD (-1000)
+
 
 class Zero {
   public:
